@@ -4,6 +4,7 @@ checkpoints*/
 
 # Logs
 *.log
+slurm-*.out
 gen_*.log
 pipeline_*.log
 preprocess_*.log

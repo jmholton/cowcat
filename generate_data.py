@@ -24,13 +24,13 @@ Usage:
 """
 
 import argparse
-import concurrent.futures
 import json
 import logging
-import random
+import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import gemmi
@@ -326,6 +326,110 @@ def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=No
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SLURM helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_array_spec(indices):
+    """Convert a list of ints to a compact SLURM array spec, e.g. '0-9,15,20-29'."""
+    if not indices:
+        return ''
+    s = sorted(set(indices))
+    parts = []
+    start = end = s[0]
+    for n in s[1:]:
+        if n == end + 1:
+            end = n
+        else:
+            parts.append(f'{start}-{end}' if end > start else str(start))
+            start = end = n
+    parts.append(f'{start}-{end}' if end > start else str(start))
+    return ','.join(parts)
+
+
+def _pending_indices(outdir, all_indices):
+    """Return indices whose output directory is not yet complete."""
+    pending = []
+    for i in all_indices:
+        d = Path(outdir) / f'sample_{i:05d}'
+        try:
+            done = d.exists() and REQUIRED_FILES.issubset({f.name for f in d.iterdir()})
+        except OSError:
+            done = False
+        if not done:
+            pending.append(i)
+    return pending
+
+
+def _sbatch_array(script_path, outdir_abs, pending, partition, max_array,
+                  natoms, nmissing, cell_size, verbose):
+    """Submit a sbatch array job; return the SLURM job-id string."""
+    array_spec = _make_array_spec(pending)
+    if max_array and max_array > 0:
+        array_spec += f'%{max_array}'
+
+    extra = []
+    if natoms   is not None: extra += [f'--natoms {natoms}']
+    if nmissing is not None: extra += [f'--nmissing {nmissing}']
+    if cell_size != 40.0:    extra += [f'--cell-size {cell_size}']
+    if verbose:              extra += ['--verbose']
+    extra_str = ' '.join(extra)
+
+    lines = [
+        '#!/bin/bash',
+        '#SBATCH --job-name=cnn_gen',
+        '#SBATCH --ntasks=1',
+        '#SBATCH --cpus-per-task=1',
+        '#SBATCH --export=ALL',
+    ]
+    if partition:
+        lines.append(f'#SBATCH --partition={partition}')
+    lines += [
+        '',
+        f'exec ccp4-python {script_path} \\',
+        f'    --nsamples 1 --start $SLURM_ARRAY_TASK_ID \\',
+        f'    --outdir {outdir_abs} {extra_str}',
+    ]
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False,
+                                     prefix='cnn_gen_', dir='/tmp') as f:
+        f.write('\n'.join(lines) + '\n')
+        script_file = f.name
+
+    try:
+        result = subprocess.run(
+            ['sbatch', f'--array={array_spec}', script_file],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            sys.exit('sbatch failed:\n' + result.stderr.decode(errors='replace'))
+        return result.stdout.decode().strip().split()[-1]
+    finally:
+        os.unlink(script_file)
+
+
+def _wait_for_job(job_id, total, log_interval=30):
+    """Poll squeue until the array job is gone; log progress periodically."""
+    last_log = 0.0
+    while True:
+        sq = subprocess.run(
+            ['squeue', '-j', job_id, '-h', '-o', '%T'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        states = sq.stdout.decode().split()
+        if not states:
+            break
+        now = time.time()
+        if now - last_log >= log_interval:
+            n_run  = states.count('RUNNING')
+            n_pend = states.count('PENDING')
+            done   = total - len(states)
+            log.info('Job %s: %d/%d done  running=%d  pending=%d',
+                     job_id, done, total, n_run, n_pend)
+            last_log = now
+        time.sleep(10)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -333,23 +437,23 @@ def main():
     parser = argparse.ArgumentParser(
         description='Generate CNN training data: 4 CCP4 map files per sample.'
     )
-    parser.add_argument('--nsamples', type=int, default=10,
+    parser.add_argument('--nsamples',    type=int, default=10,
                         help='Number of training samples to generate (default: 10)')
-    parser.add_argument('--outdir',   default='./data',
+    parser.add_argument('--outdir',      default='./data',
                         help='Root output directory (default: ./data)')
-    parser.add_argument('--workers',   type=int, default=1,
-                        help='Max concurrent srun jobs (default: 1 = run locally without srun)')
-    parser.add_argument('--partition', default=None,
-                        help='SLURM partition name for srun jobs (default: none)')
-    parser.add_argument('--start',    type=int, default=0,
-                        help='Starting sample index, useful for resuming (default: 0)')
-    parser.add_argument('--natoms',   type=int, default=None,
+    parser.add_argument('--partition',   default=None,
+                        help='SLURM partition for sbatch array jobs')
+    parser.add_argument('--max-array',   type=int, default=0,
+                        help='Max simultaneous array tasks (0 = unlimited, default: 0)')
+    parser.add_argument('--start',       type=int, default=0,
+                        help='Starting sample index (default: 0)')
+    parser.add_argument('--natoms',      type=int, default=None,
                         help='Fix number of atoms via -N (default: use -Vm)')
-    parser.add_argument('--nmissing', type=int, default=None,
+    parser.add_argument('--nmissing',    type=int, default=None,
                         help='Fix number of deleted atoms (default: DELETE_FRAC * n_atoms)')
-    parser.add_argument('--cell-size', type=float, default=40.0,
+    parser.add_argument('--cell-size',   type=float, default=40.0,
                         help='Cubic cell edge in Å (default: 40)')
-    parser.add_argument('--verbose',  action='store_true',
+    parser.add_argument('--verbose',     action='store_true',
                         help='Enable debug logging')
     args = parser.parse_args()
 
@@ -358,7 +462,7 @@ def main():
         format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    cs = str(int(args.cell_size)) if args.cell_size == int(args.cell_size) else str(args.cell_size)
+    cs   = str(int(args.cell_size)) if args.cell_size == int(args.cell_size) else str(args.cell_size)
     cell = (cs, cs, cs, '90', '90', '90')
 
     if not RANDOMPDB.exists():
@@ -370,51 +474,48 @@ def main():
     except ImportError:
         sys.exit('ERROR: gemmi Python package not found (pip install gemmi)')
 
-    outdir  = Path(args.outdir)
+    outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    indices = range(args.start, args.start + args.nsamples)
 
-    if args.workers > 1:
-        srun_extra = ['--partition=' + args.partition] if args.partition else []
+    # ── Single-sample mode: run directly (called by sbatch array tasks) ───────
+    if args.nsamples == 1:
+        i = args.start
+        try:
+            generate_sample(i, outdir_root=outdir, natoms=args.natoms,
+                            cell=cell, nmissing=args.nmissing)
+            log.info('Done. ok=1  errors=0')
+        except Exception as exc:
+            log.error('Sample %05d FAILED: %s', i, exc)
+            sys.exit(1)
+        return
 
-        def submit_one(i):
-            cmd = (
-                ['srun', '--ntasks=1', '--export=ALL'] + srun_extra
-                + ['ccp4-python', str(Path(__file__).resolve()),
-                   '--nsamples', '1',
-                   '--start',    str(i),
-                   '--outdir',   str(outdir)]
-                + (['--natoms', str(args.natoms)] if args.natoms is not None else [])
-                + (['--nmissing', str(args.nmissing)] if args.nmissing is not None else [])
-                + (['--cell-size', str(args.cell_size)] if args.cell_size != 40.0 else [])
-                + (['--verbose'] if args.verbose else [])
-            )
-            log.info('Submitting sample %05d via srun ...', i)
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout or b'').decode(errors='replace')
-                log.error('Sample %05d FAILED (srun exit %d):\n%s',
-                          i, result.returncode, err)
-            else:
-                if args.verbose and result.stdout:
-                    for line in result.stdout.decode(errors='replace').splitlines():
-                        log.debug('[srun %05d] %s', i, line)
-                log.info('Sample %05d done', i)
+    # ── Multi-sample mode: submit sbatch array ────────────────────────────────
+    all_indices = list(range(args.start, args.start + args.nsamples))
+    pending     = _pending_indices(outdir, all_indices)
+    skipped     = len(all_indices) - len(pending)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futures = {ex.submit(submit_one, i): i for i in indices}
-            for fut in concurrent.futures.as_completed(futures):
-                i = futures[fut]
-                try:
-                    fut.result()
-                except Exception as exc:
-                    log.error('Sample %05d FAILED: %s', i, exc)
-    else:
-        for i in indices:
-            try:
-                generate_sample(i, outdir, natoms=args.natoms, cell=cell, nmissing=args.nmissing)
-            except Exception as exc:
-                log.error('Sample %05d FAILED: %s', i, exc)
+    if skipped:
+        log.info('Skipping %d already-complete samples; %d to generate', skipped, len(pending))
+
+    if not pending:
+        log.info('All %d samples already complete.', len(all_indices))
+        return
+
+    script_path = str(Path(__file__).resolve())
+    outdir_abs  = str(outdir.resolve())
+
+    job_id = _sbatch_array(
+        script_path, outdir_abs, pending, args.partition, args.max_array,
+        args.natoms, args.nmissing, args.cell_size, args.verbose,
+    )
+    log.info('Submitted SLURM array job %s  (%d tasks)', job_id, len(pending))
+
+    _wait_for_job(job_id, len(pending))
+
+    ok     = sum(1 for i in pending
+                 if (outdir / f'sample_{i:05d}' / 'metadata.json').exists())
+    errors = len(pending) - ok
+    log.info('Done. ok=%d  skipped=%d  errors=%d', ok, skipped, errors)
 
 
 if __name__ == '__main__':
