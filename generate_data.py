@@ -225,6 +225,11 @@ def step5_6_delete_and_refine(tmpdir, nmissing=None):
     rng     = np.random.default_rng()
     removed = _write_partial(st_full, tmpdir, n_remove, rng)
 
+    (tmpdir / 'refmac_opts.txt').write_text(
+        'VDWREST 0\n'
+        'BFACTOR 1\n'
+        'KLDIV 0.1 0.15 0.2 4000\n'
+    )
     run([CONVERGE, 'starthere.pdb', 'refme.mtz', 'NCYC=5', 'noconverge'], tmpdir)
 
     rwork = parse_rwork(str(tmpdir / 'refmacout.pdb'))
