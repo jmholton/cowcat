@@ -1,0 +1,19 @@
+# Data directories
+data*/
+checkpoints*/
+
+# Logs
+*.log
+gen_*.log
+pipeline_*.log
+preprocess_*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Numpy packed arrays
+X.npy
+Y.npy
+crossp.npy
