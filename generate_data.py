@@ -6,13 +6,17 @@ For each sample:
   1. randompdb.com places random O atoms in a P1 40×40×40 Å cell
   2. B factors are randomised (log-normal, 5–120 Å²)
   3. gemmi sfcalc computes structure factors for the FULL model  →  truth.mtz
-  4. refme.mtz is built with F=|FC_truth|, SIGF=2%*|FC_truth|
-  5. Binary search on deletion fraction → refmac 5 cycles → Rwork ≈ 20%
-  6. Maps exported as CCP4 .map files:
+  4. A random subset of atoms is deleted                         →  partial.pdb
+  5. gemmi sfcalc computes structure factors for partial model   →  partial.mtz
+  6. Unweighted map coefficients computed directly (no refmac):
+       FWT    = 2|Fo| - |Fc|   (Fo = |FC_truth|)
+       DELFWT = |Fo| - |Fc|
+       phases = PHIC_partial
+  7. Maps exported as CCP4 .map files:
        truth.map   – ground-truth Fo density (FC/PHIC of full model)
-       2fofc.map   – 2Fo-Fc from refmac    (FWT/PHWT)
-       fofc.map    – Fo-Fc difference map  (DELFWT/PHDELWT)
-       fc.map      – Fc density            (FC/PHIC of partial model)
+       2fofc.map   – unweighted 2Fo-Fc  (FWT/PHWT)
+       fofc.map    – Fo-Fc difference   (DELFWT/PHDELWT)
+       fc.map      – Fc density         (FC/PHIC of partial model)
        metadata.json
 
 Usage:
@@ -23,9 +27,7 @@ import argparse
 import concurrent.futures
 import json
 import logging
-import os
 import random
-import re
 import subprocess
 import sys
 import tempfile
@@ -37,10 +39,8 @@ import numpy as np
 # ── paths ──────────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent.resolve()
 RANDOMPDB  = SCRIPT_DIR / 'randompdb.com'
-CONVERGE   = SCRIPT_DIR / 'converge_refmac.com'
 
 # ── fixed crystallographic parameters ─────────────────────────────────────────
-# CELL is set from --cell-size argument; default 40 Å cubic P1
 SG          = 'P1'
 DMIN        = 2.0    # resolution cutoff (Å)
 MIND        = 0      # minimum inter-atom distance; 0 = no constraint (fast)
@@ -48,13 +48,13 @@ VM          = 2.4    # Matthews coefficient
 SAMPLE_RATE = 3.0    # map oversampling; at 2 Å → ~0.67 Å/voxel
 
 # ── B factor distribution (log-normal, matches protein atom statistics) ────────
-BFAC_MU    = np.log(20.0)   # mean of ln(B)
+BFAC_MU    = np.log(20.0)
 BFAC_SIGMA = 0.7
 BFAC_MIN   = 5.0
 BFAC_MAX   = 120.0
 
 # ── deletion fraction ──────────────────────────────────────────────────────────
-DELETE_FRAC = 0.20   # fraction of atoms to remove before refinement
+DELETE_FRAC = 0.20   # fraction of atoms to remove
 
 log = logging.getLogger(__name__)
 
@@ -79,17 +79,6 @@ def run(cmd, cwd):
                 ' '.join(str(c) for c in cmd), stdout, stderr)
         )
     return result
-
-
-def parse_rwork(pdb_path):
-    """Extract Rwork from REMARK records written by refmac in refmacout.pdb."""
-    with open(pdb_path) as f:
-        for line in f:
-            if 'R VALUE' in line and 'WORKING' in line:
-                m = re.search(r'(\d+\.\d+)\s*$', line)
-                if m:
-                    return float(m.group(1))
-    return None
 
 
 def col_array(mtz, label):
@@ -117,8 +106,7 @@ def find_fc_phi_labels(mtz):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def step1_random_atoms(tmpdir, natoms=None, cell=None):
-    """Run randompdb.com → random.pdb (all B=20, to be randomised next).
-    If natoms is given, use -N to fix the atom count; otherwise use -Vm."""
+    """Run randompdb.com → random.pdb (all B=20, to be randomised next)."""
     if cell is None:
         cell = ('40', '40', '40', '90', '90', '90')
     if natoms is not None:
@@ -144,132 +132,154 @@ def step2_randomise_bfac(tmpdir):
     st.write_pdb(str(tmpdir / 'truth_full.pdb'))
 
 
-def step3_sfcalc(tmpdir):
-    """
-    gemmi sfcalc → truth.mtz with FC/PHIC columns.
-    These are the 'observed' |Fo| in this simulation (we computed them from
-    the full model, so we also know the true phases).
-    """
+def step3_sfcalc_full(tmpdir):
+    """gemmi sfcalc on full model → truth.mtz with FC/PHIC columns."""
     run(['gemmi', 'sfcalc', f'--dmin={DMIN}', '--to-mtz=truth.mtz', 'truth_full.pdb'],
         tmpdir)
     if not (tmpdir / 'truth.mtz').exists():
         raise RuntimeError('gemmi sfcalc did not produce truth.mtz')
 
 
-def step4_build_refme_mtz(tmpdir):
+def step4_delete_atoms(tmpdir, nmissing=None):
     """
-    Build refme.mtz for refmac input:
-      F    = |FC_truth|   (the simulated 'observed' amplitudes)
-      SIGF = 0.02 * |FC_truth|  (flat 2% uncertainty)
+    Delete nmissing atoms at random from truth_full.pdb → partial.pdb.
+    Returns (removed_indices, n_atoms_total).
     """
-    mtz = gemmi.read_mtz_file(str(tmpdir / 'truth.mtz'))
-    f_lbl, _ = find_fc_phi_labels(mtz)
+    st_full = gemmi.read_structure(str(tmpdir / 'truth_full.pdb'))
+    chain = st_full[0][0]
+    n_atoms = len(chain)
 
-    H    = col_array(mtz, 'H').astype(np.float32)
-    K    = col_array(mtz, 'K').astype(np.float32)
-    L    = col_array(mtz, 'L').astype(np.float32)
-    FC   = col_array(mtz, f_lbl)
-    SIGF = np.maximum(0.02 * FC, 0.001)
+    if nmissing is not None:
+        n_remove = min(int(nmissing), n_atoms - 1)
+    else:
+        n_remove = max(1, round(n_atoms * DELETE_FRAC))
 
+    rng = np.random.default_rng()
+    removed = sorted(int(i) for i in rng.choice(n_atoms, size=n_remove, replace=False))
+    for idx in reversed(removed):
+        del chain[idx]
+    st_full.write_pdb(str(tmpdir / 'partial.pdb'))
+    return removed, n_atoms
+
+
+def step5_sfcalc_partial(tmpdir):
+    """gemmi sfcalc on partial model → partial.mtz with FC/PHIC columns."""
+    run(['gemmi', 'sfcalc', f'--dmin={DMIN}', '--to-mtz=partial.mtz', 'partial.pdb'],
+        tmpdir)
+    if not (tmpdir / 'partial.mtz').exists():
+        raise RuntimeError('gemmi sfcalc did not produce partial.mtz')
+
+
+def step6_build_maps(tmpdir, outdir):
+    """
+    Compute unweighted map coefficients and cross-Patterson directly (no refmac).
+
+    Fo     = |FC_truth|  (simulated observed amplitudes from the full model)
+    Fc     = |FC_partial|
+    PHIc   = PHIC_partial
+
+    2FoFc = 2*Fo - Fc   (negative F = phase flip, not clamped)
+    FoFc  = Fo - Fc
+    all three use PHIc (phases of the partial model)
+
+    Cross-Patterson = IFFT[ FFT(FoFc_map) * conj(FFT(Fc_map)) ]
+    Saved as crossp.npy alongside the CCP4 maps.
+
+    Returns grid shape tuple.
+    """
+    mtz_t = gemmi.read_mtz_file(str(tmpdir / 'truth.mtz'))
+    mtz_p = gemmi.read_mtz_file(str(tmpdir / 'partial.mtz'))
+
+    fc_lbl_t, phi_lbl_t = find_fc_phi_labels(mtz_t)
+    fc_lbl_p, phi_lbl_p = find_fc_phi_labels(mtz_p)
+
+    def hkl_index(mtz):
+        H = col_array(mtz, 'H').astype(np.int32)
+        K = col_array(mtz, 'K').astype(np.int32)
+        L = col_array(mtz, 'L').astype(np.int32)
+        return H, K, L
+
+    H_t, K_t, L_t = hkl_index(mtz_t)
+    H_p, K_p, L_p = hkl_index(mtz_p)
+
+    Fo   = col_array(mtz_t, fc_lbl_t)
+    Fc   = col_array(mtz_p, fc_lbl_p)
+    PHIc = col_array(mtz_p, phi_lbl_p)
+
+    # In P1 with the same cell and dmin, both sfcalc runs yield the same HKL
+    # set in the same order. Assert this rather than silently misaligning.
+    if not (np.array_equal(H_t, H_p) and
+            np.array_equal(K_t, K_p) and
+            np.array_equal(L_t, L_p)):
+        raise RuntimeError(
+            'HKL mismatch between truth.mtz and partial.mtz — '
+            f'truth has {len(H_t)} reflections, partial has {len(H_p)}'
+        )
+
+    # Build combined MTZ
     mtz_out = gemmi.Mtz()
-    mtz_out.cell       = mtz.cell
-    mtz_out.spacegroup = mtz.spacegroup
+    mtz_out.cell       = mtz_p.cell
+    mtz_out.spacegroup = mtz_p.spacegroup
 
     ds0 = mtz_out.add_dataset('HKL_base')
     ds0.wavelength = 0.0
     ds1 = mtz_out.add_dataset('data')
     ds1.wavelength = 1.0
 
-    mtz_out.add_column('H',    'H', dataset_id=0)
-    mtz_out.add_column('K',    'H', dataset_id=0)
-    mtz_out.add_column('L',    'H', dataset_id=0)
-    mtz_out.add_column('F',    'F', dataset_id=1)
-    mtz_out.add_column('SIGF', 'Q', dataset_id=1)
+    for lbl in ('H', 'K', 'L'):
+        mtz_out.add_column(lbl, 'H', dataset_id=0)
+    mtz_out.add_column('2FoFc', 'F', dataset_id=1)
+    mtz_out.add_column('FoFc',  'F', dataset_id=1)
+    mtz_out.add_column('FC',    'F', dataset_id=1)
+    mtz_out.add_column('PHIc',  'P', dataset_id=1)
 
-    data = np.column_stack([H, K, L, FC, SIGF]).astype(np.float32)
+    data = np.column_stack([
+        H_p, K_p, L_p,
+        2.0 * Fo - Fc, Fo - Fc, Fc, PHIc,
+    ]).astype(np.float32)
     mtz_out.set_data(data)
-    mtz_out.write_to_file(str(tmpdir / 'refme.mtz'))
 
+    # Compute all grids in memory
+    grid_2fofc = mtz_out.transform_f_phi_to_map('2FoFc', 'PHIc', sample_rate=SAMPLE_RATE)
+    grid_fofc  = mtz_out.transform_f_phi_to_map('FoFc',  'PHIc', sample_rate=SAMPLE_RATE)
+    grid_fc    = mtz_out.transform_f_phi_to_map('FC',    'PHIc', sample_rate=SAMPLE_RATE)
+    grid_truth = mtz_t.transform_f_phi_to_map(fc_lbl_t, phi_lbl_t, sample_rate=SAMPLE_RATE)
 
-def _write_partial(st_full, tmpdir, n_remove, rng):
-    """
-    Delete n_remove random residues (WAT atoms) from a clone of st_full.
-    Write starthere.pdb. Returns the list of removed residue indices (sorted).
-    """
-    st = st_full.clone()
-    chain = st[0][0]
-    n_total = len(chain)
-    n_remove = min(n_remove, n_total - 1)   # keep at least 1 atom
-    removed = sorted(
-        int(i) for i in rng.choice(n_total, size=n_remove, replace=False)
-    )
-    for idx in reversed(removed):           # delete high-index first
-        del chain[idx]
-    st.write_pdb(str(tmpdir / 'starthere.pdb'))
-    return removed
+    arr_fofc = np.array(grid_fofc, copy=False)
+    arr_fc   = np.array(grid_fc,   copy=False)
+    F_fofc   = np.fft.rfftn(arr_fofc)
+    F_fc     = np.fft.rfftn(arr_fc)
 
+    # Cross-Patterson: IFFT[ FFT(FoFc) * conj(FFT(Fc)) ]
+    crossp = np.fft.irfftn(
+        F_fofc * np.conj(F_fc), s=arr_fofc.shape,
+    ).real.astype(np.float32)
+    np.save(str(outdir / 'crossp.npy'), crossp)
 
-def step5_6_delete_and_refine(tmpdir, nmissing=None):
-    """
-    Delete nmissing atoms at random (or DELETE_FRAC of total if nmissing is None),
-    then run 5 cycles of refmac.
-    Returns (removed_indices, rwork, n_atoms_total).
-    """
-    st_full = gemmi.read_structure(str(tmpdir / 'truth_full.pdb'))
-    n_atoms = sum(1 for chain in st_full[0] for res in chain for _ in res)
-    if nmissing is not None:
-        n_remove = min(int(nmissing), n_atoms - 1)
-    else:
-        n_remove = max(1, round(n_atoms * DELETE_FRAC))
+    # Difference Patterson: IFFT[ |FFT(FoFc)|^2 ] — autocorrelation of FoFc map
+    diffp = np.fft.irfftn(
+        np.abs(F_fofc) ** 2, s=arr_fofc.shape,
+    ).real.astype(np.float32)
+    np.save(str(outdir / 'diffp.npy'), diffp)
 
-    rng     = np.random.default_rng()
-    removed = _write_partial(st_full, tmpdir, n_remove, rng)
-
-    (tmpdir / 'refmac_opts.txt').write_text(
-        'VDWREST 0\n'
-        'BFACTOR 1\n'
-        'KLDIV 0.1 0.15 0.2 4000\n'
-    )
-    run([CONVERGE, 'starthere.pdb', 'refme.mtz', 'NCYC=5', 'noconverge'], tmpdir)
-
-    rwork = parse_rwork(str(tmpdir / 'refmacout.pdb'))
-    if rwork is None:
-        raise RuntimeError('Could not parse Rwork from refmacout.pdb')
-
-    return removed, rwork, n_atoms
-
-
-def step7_maps_to_ccp4(tmpdir, outdir):
-    """
-    Write four CCP4 map files from refmacout.mtz and truth.mtz.
-    Returns the grid shape (tuple) for the metadata.
-    """
-    def write_map(mtz_path, f_lbl, phi_lbl, out_path):
-        mtz  = gemmi.read_mtz_file(str(mtz_path))
-        grid = mtz.transform_f_phi_to_map(f_lbl, phi_lbl, sample_rate=SAMPLE_RATE)
+    def write_map(grid, out_path):
         ccp4 = gemmi.Ccp4Map()
         ccp4.grid = grid
         ccp4.update_ccp4_header()
         ccp4.write_ccp4_map(str(out_path))
-        return grid.shape
 
-    refmac_mtz = tmpdir / 'refmacout.mtz'
-    truth_mtz  = tmpdir / 'truth.mtz'
-    mtz_truth  = gemmi.read_mtz_file(str(truth_mtz))
-    fc_lbl, phi_lbl = find_fc_phi_labels(mtz_truth)
-
-    shape = write_map(refmac_mtz, 'FWT',    'PHWT',    outdir / '2fofc.map')
-    write_map(refmac_mtz, 'DELFWT', 'PHDELWT', outdir / 'fofc.map')
-    write_map(refmac_mtz, 'FC',     'PHIC',    outdir / 'fc.map')
-    write_map(truth_mtz,  fc_lbl,   phi_lbl,   outdir / 'truth.map')
-    return shape
+    write_map(grid_2fofc, outdir / '2fofc.map')
+    write_map(grid_fofc,  outdir / 'fofc.map')
+    write_map(grid_fc,    outdir / 'fc.map')
+    write_map(grid_truth, outdir / 'truth.map')
+    return grid_2fofc.shape
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Full sample pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
-REQUIRED_FILES = {'truth.map', '2fofc.map', 'fofc.map', 'fc.map', 'metadata.json'}
+REQUIRED_FILES = {'truth.map', '2fofc.map', 'fofc.map', 'fc.map', 'crossp.npy', 'diffp.npy', 'metadata.json'}
 
 def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=None):
     outdir = Path(outdir_root) / f'sample_{sample_idx:05d}'
@@ -281,37 +291,30 @@ def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=No
     with tempfile.TemporaryDirectory(prefix=f'cnn_{sample_idx:05d}_') as tmp:
         tmpdir = Path(tmp)
 
-        log.info('[%05d] step 1/7 generating random atoms ...', sample_idx)
+        log.info('[%05d] step 1/6 generating random atoms ...', sample_idx)
         step1_random_atoms(tmpdir, natoms=natoms, cell=cell)
 
-        log.info('[%05d] step 2/7 randomising B factors ...', sample_idx)
+        log.info('[%05d] step 2/6 randomising B factors ...', sample_idx)
         step2_randomise_bfac(tmpdir)
 
-        log.info('[%05d] step 3/7 computing truth structure factors ...', sample_idx)
-        step3_sfcalc(tmpdir)
+        log.info('[%05d] step 3/6 sfcalc full model ...', sample_idx)
+        step3_sfcalc_full(tmpdir)
 
-        log.info('[%05d] step 4/7 building refme.mtz ...', sample_idx)
-        step4_build_refme_mtz(tmpdir)
-
-        if nmissing is not None:
-            log.info('[%05d] steps 5+6 deleting %d atom(s), running refmac ...', sample_idx, nmissing)
-        else:
-            log.info('[%05d] steps 5+6 deleting %.0f%% of atoms, running refmac ...',
-                     sample_idx, DELETE_FRAC * 100)
-        removed, rwork, n_atoms = step5_6_delete_and_refine(tmpdir, nmissing=nmissing)
+        log.info('[%05d] step 4/6 deleting atoms ...', sample_idx)
+        removed, n_atoms = step4_delete_atoms(tmpdir, nmissing=nmissing)
         n_partial = n_atoms - len(removed)
+        log.info('[%05d] atoms full=%d partial=%d', sample_idx, n_atoms, n_partial)
 
-        log.info('[%05d] Rwork=%.3f  atoms full=%d partial=%d',
-                 sample_idx, rwork, n_atoms, n_partial)
+        log.info('[%05d] step 5/6 sfcalc partial model ...', sample_idx)
+        step5_sfcalc_partial(tmpdir)
 
-        log.info('[%05d] step 7/7 writing CCP4 maps ...', sample_idx)
-        grid_shape = step7_maps_to_ccp4(tmpdir, outdir)
+        log.info('[%05d] step 6/6 building maps ...', sample_idx)
+        grid_shape = step6_build_maps(tmpdir, outdir)
 
     meta = {
         'n_atoms_full':         n_atoms,
         'n_atoms_partial':      n_partial,
         'deletion_fraction':    round(len(removed) / n_atoms, 4),
-        'rwork':                round(rwork, 4),
         'removed_atom_indices': removed,
         'cell':                 [float(v) for v in (cell or ('40','40','40','90','90','90'))],
         'dmin':                 DMIN,
@@ -358,11 +361,9 @@ def main():
     cs = str(int(args.cell_size)) if args.cell_size == int(args.cell_size) else str(args.cell_size)
     cell = (cs, cs, cs, '90', '90', '90')
 
-    for script in (RANDOMPDB, CONVERGE):
-        if not script.exists():
-            sys.exit(f'ERROR: required script not found: {script}')
+    if not RANDOMPDB.exists():
+        sys.exit(f'ERROR: required script not found: {RANDOMPDB}')
 
-    # Smoke-test gemmi and key CCP4 programs
     try:
         import gemmi as _g
         log.debug('gemmi version: %s', _g.__version__)
@@ -377,7 +378,6 @@ def main():
         srun_extra = ['--partition=' + args.partition] if args.partition else []
 
         def submit_one(i):
-            """Submit a single-sample job via srun and wait for it to finish."""
             cmd = (
                 ['srun', '--ntasks=1', '--export=ALL'] + srun_extra
                 + ['ccp4-python', str(Path(__file__).resolve()),
@@ -396,15 +396,11 @@ def main():
                 log.error('Sample %05d FAILED (srun exit %d):\n%s',
                           i, result.returncode, err)
             else:
-                # Echo the worker's log output at debug level
                 if args.verbose and result.stdout:
                     for line in result.stdout.decode(errors='replace').splitlines():
                         log.debug('[srun %05d] %s', i, line)
                 log.info('Sample %05d done', i)
 
-        # ThreadPoolExecutor: each thread blocks on one srun call.
-        # SLURM queues any excess submissions, so --workers controls how many
-        # srun processes are alive at once (not just submitted).
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = {ex.submit(submit_one, i): i for i in indices}
             for fut in concurrent.futures.as_completed(futures):
