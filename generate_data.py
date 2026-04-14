@@ -681,15 +681,22 @@ def main():
 
     _wait_for_job(job_id, len(pending))
 
-    # NFS async: flush attribute cache by stat-ing each path before counting.
-    for i in pending:
-        try:
-            os.stat(outdir / f'sample_{i:05d}' / 'metadata.json')
-        except OSError:
-            pass
-
-    ok     = sum(1 for i in pending
+    # NFS async: the compute nodes' kernel writeback may still be in-flight
+    # after the job exits squeue.  Poll until all metadata.json files appear
+    # (or 60 s elapses), flushing the login node's attribute cache each round.
+    deadline = time.time() + 60
+    while True:
+        for i in pending:
+            try:
+                os.stat(outdir / f'sample_{i:05d}' / 'metadata.json')
+            except OSError:
+                pass
+        ok = sum(1 for i in pending
                  if (outdir / f'sample_{i:05d}' / 'metadata.json').exists())
+        if ok == len(pending) or time.time() > deadline:
+            break
+        time.sleep(3)
+
     errors = len(pending) - ok
     log.info('Done. ok=%d  skipped=%d  errors=%d', ok, skipped, errors)
 
