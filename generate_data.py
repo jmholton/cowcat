@@ -8,11 +8,12 @@ For each sample:
   3. gemmi sfcalc computes structure factors for the FULL model  →  truth.mtz
   4. A random subset of atoms is deleted                         →  partial.pdb
   5. gemmi sfcalc computes structure factors for partial model   →  partial.mtz
-  6. Unweighted map coefficients computed directly (no refmac):
-       FWT    = 2|Fo| - |Fc|   (Fo = |FC_truth|)
+  6. scaleit scales FC_truth to FC_partial → Fobs_scaled, scale_k, scale_B
+  7. Unweighted map coefficients computed directly (no refmac):
+       FWT    = 2|Fo| - |Fc|   (Fo = Fobs_scaled)
        DELFWT = |Fo| - |Fc|
        phases = PHIC_partial
-  7. Maps exported as CCP4 .map files:
+  8. Maps exported as CCP4 .map files:
        truth.map   – ground-truth Fo density (FC/PHIC of full model)
        2fofc.map   – unweighted 2Fo-Fc  (FWT/PHWT)
        fofc.map    – Fo-Fc difference   (DELFWT/PHDELWT)
@@ -27,6 +28,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -199,11 +201,117 @@ def step5_sfcalc_partial(tmpdir):
         raise RuntimeError('gemmi sfcalc did not produce partial.mtz')
 
 
-def step6_build_maps(tmpdir, outdir):
+def step5b_scale_ftrue(tmpdir):
+    """
+    Scale FC_truth to FC_partial using scaleit (isotropic B refinement).
+
+    In real crystallography the overall scale and temperature factor of the
+    observed data relative to Fcalc are unknown.  Here we simulate this by
+    finding k and B such that:
+
+        Fobs_scaled(hkl) = k * exp(-B / (4 * d(hkl)^2)) * FC_truth(hkl)
+
+    best matches FC_partial in a least-squares sense.  The scaled amplitudes
+    are returned as the simulated Fobs, and k / B are stored as metadata so
+    the CNN can be trained to predict them.
+
+    Writes scaleit_input.mtz and scaleit_output.mtz to tmpdir.
+    Returns (Fobs_scaled_array, scale_k, scale_B).
+    """
+    mtz_t = gemmi.read_mtz_file(str(tmpdir / 'truth.mtz'))
+    mtz_p = gemmi.read_mtz_file(str(tmpdir / 'partial.mtz'))
+    fc_lbl_t, _ = find_fc_phi_labels(mtz_t)
+    fc_lbl_p, _ = find_fc_phi_labels(mtz_p)
+
+    H  = col_array(mtz_p, 'H').astype(np.int32)
+    K  = col_array(mtz_p, 'K').astype(np.int32)
+    L  = col_array(mtz_p, 'L').astype(np.int32)
+    Fc = col_array(mtz_p, fc_lbl_p)   # FC_partial  → FP  (reference, not scaled)
+    Ft = col_array(mtz_t, fc_lbl_t)   # FC_truth    → FPH1 (scaled to match Fc)
+
+    # Build combined MTZ for scaleit: FP=Fcalc, FPH1=Ftrue, synthetic SIGF=F/30
+    mtz_cad = gemmi.Mtz()
+    mtz_cad.cell       = mtz_p.cell
+    mtz_cad.spacegroup = mtz_p.spacegroup
+    ds0 = mtz_cad.add_dataset('HKL_base'); ds0.wavelength = 0.0
+    ds1 = mtz_cad.add_dataset('data');     ds1.wavelength = 1.0
+    for lbl in ('H', 'K', 'L'):
+        mtz_cad.add_column(lbl, 'H', dataset_id=0)
+    mtz_cad.add_column('Fcalc',    'F', dataset_id=1)
+    mtz_cad.add_column('SIGFcalc', 'Q', dataset_id=1)
+    mtz_cad.add_column('Ftrue',    'F', dataset_id=1)
+    mtz_cad.add_column('SIGFtrue', 'Q', dataset_id=1)
+    mtz_cad.set_data(np.column_stack([
+        H, K, L,
+        Fc, np.maximum(Fc / 30.0, 1e-6),
+        Ft, np.maximum(Ft / 30.0, 1e-6),
+    ]).astype(np.float32))
+
+    cad_path = tmpdir / 'scaleit_input.mtz'
+    out_path  = tmpdir / 'scaleit_output.mtz'
+    mtz_cad.write_to_file(str(cad_path))
+
+    scaleit_stdin = (
+        'TITLE Scale Ftrue to Fcalc\n'
+        f'RESO {DMIN}\n'
+        'NOWT\n'
+        'refine isotropic\n'
+        'LABIN FP=Fcalc SIGFP=SIGFcalc FPH1=Ftrue SIGFPH1=SIGFtrue\n'
+        'CONV ABS 0.0001 TOLR 0.000000001 NCYC 4\n'
+        'END\n'
+    )
+    result = subprocess.run(
+        ['scaleit', 'HKLIN', str(cad_path), 'HKLOUT', str(out_path)],
+        input=scaleit_stdin.encode(),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cwd=str(tmpdir),
+    )
+    log_text = result.stdout.decode(errors='replace')
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'scaleit failed:\n{log_text}\n'
+            + result.stderr.decode(errors='replace')
+        )
+
+    # Parse scale (k) and isotropic B from scaleit log — mirrors diff.com awk patterns:
+    #   scale: awk '$1=="Derivative" && !/itle/{print $3}' → field 3 of last Derivative line
+    #   B:     awk '/equivalent iso/{print $NF}'           → last field of equiv-iso line
+    scale_k_raw = None
+    scale_B_raw = None
+    for line in log_text.splitlines():
+        fields = line.split()
+        if fields and fields[0] == 'Derivative' and 'itle' not in line and len(fields) >= 3:
+            scale_k_raw = fields[2]           # $3 in awk (0-indexed: fields[2])
+        if 'equivalent iso' in line and fields:
+            scale_B_raw = fields[-1]          # $NF
+    scale_m = scale_k_raw is not None
+    b_m     = scale_B_raw is not None
+    if not scale_m or not b_m:
+        # log the output so we can diagnose parsing mismatch later
+        (tmpdir / 'scaleit.log').write_text(log_text)
+        raise RuntimeError(
+            f'Could not parse scale/B from scaleit output '
+            f'(written to {tmpdir}/scaleit.log):\n{log_text[:3000]}'
+        )
+    scale_k = float(scale_k_raw)
+    scale_B = float(scale_B_raw)
+
+    # Apply the fitted scale to Ftrue: Fobs_scaled = k * exp(-B / (4*d^2)) * Ftrue
+    # scaleit convention: derivative_scaled = k * exp(-B * (sin θ/λ)^2) * derivative
+    #                     sin θ/λ = 1/(2d)  →  (sin θ/λ)^2 = 1/(4d^2)
+    cell = mtz_p.cell
+    d_vals = np.array([cell.calculate_d([int(h), int(k), int(l)]) for h, k, l in zip(H, K, L)],
+                      dtype=np.float32)
+    Fobs_scaled = (scale_k * np.exp(-scale_B / (4.0 * d_vals**2)) * Ft).astype(np.float32)
+
+    return Fobs_scaled, scale_k, scale_B
+
+
+def step6_build_maps(tmpdir, outdir, Fo_scaled=None):
     """
     Compute unweighted map coefficients and cross-Patterson directly (no refmac).
 
-    Fo     = |FC_truth|  (simulated observed amplitudes from the full model)
+    Fo     = Fo_scaled if provided, else |FC_truth| (raw, unscaled)
     Fc     = |FC_partial|
     PHIc   = PHIC_partial
 
@@ -231,7 +339,7 @@ def step6_build_maps(tmpdir, outdir):
     H_t, K_t, L_t = hkl_index(mtz_t)
     H_p, K_p, L_p = hkl_index(mtz_p)
 
-    Fo   = col_array(mtz_t, fc_lbl_t)
+    Fo   = Fo_scaled if Fo_scaled is not None else col_array(mtz_t, fc_lbl_t)
     Fc   = col_array(mtz_p, fc_lbl_p)
     PHIc = col_array(mtz_p, phi_lbl_p)
 
@@ -343,19 +451,26 @@ def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=No
         log.info('[%05d] step 5/6 sfcalc partial model ...', sample_idx)
         step5_sfcalc_partial(tmpdir)
 
-        log.info('[%05d] step 6/6 building maps ...', sample_idx)
-        grid_shape = step6_build_maps(tmpdir, outdir)
+        log.info('[%05d] step 5b/6 scaling Ftrue to Fcalc with scaleit ...', sample_idx)
+        Fobs_scaled, scale_k, scale_B = step5b_scale_ftrue(tmpdir)
+        log.info('[%05d] scale_k=%.6f  scale_B=%.4f', sample_idx, scale_k, scale_B)
 
+        log.info('[%05d] step 6/6 building maps ...', sample_idx)
+        grid_shape = step6_build_maps(tmpdir, outdir, Fo_scaled=Fobs_scaled)
+
+    cell_list = [float(v) for v in (cell or ('40','40','40','90','90','90'))]
     if partial_occ:
         meta = {
-            'n_atoms_full':            n_atoms,
-            'n_atoms_partial':         n_partial,
-            'partial_occ_mode':        True,
+            'n_atoms_full':             n_atoms,
+            'n_atoms_partial':          n_partial,
+            'partial_occ_mode':         True,
             'partial_occ_atom_indices': selected,
-            'partial_occ_values':      occs,
-            'cell':                    [float(v) for v in (cell or ('40','40','40','90','90','90'))],
-            'dmin':                    DMIN,
-            'grid_shape':              list(grid_shape),
+            'partial_occ_values':       occs,
+            'scale_k':                  round(float(scale_k), 6),
+            'scale_B':                  round(float(scale_B), 4),
+            'cell':                     cell_list,
+            'dmin':                     DMIN,
+            'grid_shape':               list(grid_shape),
         }
     else:
         meta = {
@@ -363,7 +478,9 @@ def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=No
             'n_atoms_partial':      n_partial,
             'deletion_fraction':    round(len(removed) / n_atoms, 4),
             'removed_atom_indices': removed,
-            'cell':                 [float(v) for v in (cell or ('40','40','40','90','90','90'))],
+            'scale_k':              round(float(scale_k), 6),
+            'scale_B':              round(float(scale_B), 4),
+            'cell':                 cell_list,
             'dmin':                 DMIN,
             'grid_shape':           list(grid_shape),
         }
