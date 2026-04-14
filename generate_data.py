@@ -162,6 +162,35 @@ def step4_delete_atoms(tmpdir, nmissing=None):
     return removed, n_atoms
 
 
+def step4_partial_occupancy(tmpdir, nmissing=None):
+    """
+    Set nmissing atoms to random occupancies drawn from Uniform(0, 1); write partial.pdb.
+    All atoms are retained; the selected atoms have reduced occupancy so their
+    contribution to Fc is fractional.  Returns (selected_indices, occ_values, n_atoms_total).
+    """
+    st_full = gemmi.read_structure(str(tmpdir / 'truth_full.pdb'))
+    chain = st_full[0][0]
+    n_atoms = len(chain)
+
+    if nmissing is not None:
+        n_partial = min(int(nmissing), n_atoms)
+    else:
+        n_partial = max(1, round(n_atoms * DELETE_FRAC))
+
+    rng = np.random.default_rng()
+    selected = sorted(int(i) for i in rng.choice(n_atoms, size=n_partial, replace=False))
+    occs = rng.uniform(0.0, 1.0, size=n_partial).tolist()
+
+    occ_map = {idx: occ for idx, occ in zip(selected, occs)}
+    for res_idx, residue in enumerate(chain):
+        if res_idx in occ_map:
+            for atom in residue:
+                atom.occ = float(occ_map[res_idx])
+
+    st_full.write_pdb(str(tmpdir / 'partial.pdb'))
+    return selected, [round(o, 4) for o in occs], n_atoms
+
+
 def step5_sfcalc_partial(tmpdir):
     """gemmi sfcalc on partial model → partial.mtz with FC/PHIC columns."""
     run(['gemmi', 'sfcalc', f'--dmin={DMIN}', '--to-mtz=partial.mtz', 'partial.pdb'],
@@ -281,7 +310,7 @@ def step6_build_maps(tmpdir, outdir):
 
 REQUIRED_FILES = {'truth.map', '2fofc.map', 'fofc.map', 'fc.map', 'crossp.npy', 'diffp.npy', 'metadata.json'}
 
-def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=None):
+def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=None, partial_occ=False):
     outdir = Path(outdir_root) / f'sample_{sample_idx:05d}'
     if outdir.exists() and REQUIRED_FILES.issubset({f.name for f in outdir.iterdir()}):
         log.info('[%05d] already complete, skipping', sample_idx)
@@ -300,10 +329,16 @@ def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=No
         log.info('[%05d] step 3/6 sfcalc full model ...', sample_idx)
         step3_sfcalc_full(tmpdir)
 
-        log.info('[%05d] step 4/6 deleting atoms ...', sample_idx)
-        removed, n_atoms = step4_delete_atoms(tmpdir, nmissing=nmissing)
-        n_partial = n_atoms - len(removed)
-        log.info('[%05d] atoms full=%d partial=%d', sample_idx, n_atoms, n_partial)
+        if partial_occ:
+            log.info('[%05d] step 4/6 setting partial occupancies ...', sample_idx)
+            selected, occs, n_atoms = step4_partial_occupancy(tmpdir, nmissing=nmissing)
+            n_partial = n_atoms
+            log.info('[%05d] atoms full=%d  partial-occ=%d', sample_idx, n_atoms, len(selected))
+        else:
+            log.info('[%05d] step 4/6 deleting atoms ...', sample_idx)
+            removed, n_atoms = step4_delete_atoms(tmpdir, nmissing=nmissing)
+            n_partial = n_atoms - len(removed)
+            log.info('[%05d] atoms full=%d partial=%d', sample_idx, n_atoms, n_partial)
 
         log.info('[%05d] step 5/6 sfcalc partial model ...', sample_idx)
         step5_sfcalc_partial(tmpdir)
@@ -311,15 +346,27 @@ def generate_sample(sample_idx, outdir_root, natoms=None, cell=None, nmissing=No
         log.info('[%05d] step 6/6 building maps ...', sample_idx)
         grid_shape = step6_build_maps(tmpdir, outdir)
 
-    meta = {
-        'n_atoms_full':         n_atoms,
-        'n_atoms_partial':      n_partial,
-        'deletion_fraction':    round(len(removed) / n_atoms, 4),
-        'removed_atom_indices': removed,
-        'cell':                 [float(v) for v in (cell or ('40','40','40','90','90','90'))],
-        'dmin':                 DMIN,
-        'grid_shape':           list(grid_shape),
-    }
+    if partial_occ:
+        meta = {
+            'n_atoms_full':            n_atoms,
+            'n_atoms_partial':         n_partial,
+            'partial_occ_mode':        True,
+            'partial_occ_atom_indices': selected,
+            'partial_occ_values':      occs,
+            'cell':                    [float(v) for v in (cell or ('40','40','40','90','90','90'))],
+            'dmin':                    DMIN,
+            'grid_shape':              list(grid_shape),
+        }
+    else:
+        meta = {
+            'n_atoms_full':         n_atoms,
+            'n_atoms_partial':      n_partial,
+            'deletion_fraction':    round(len(removed) / n_atoms, 4),
+            'removed_atom_indices': removed,
+            'cell':                 [float(v) for v in (cell or ('40','40','40','90','90','90'))],
+            'dmin':                 DMIN,
+            'grid_shape':           list(grid_shape),
+        }
     (outdir / 'metadata.json').write_text(json.dumps(meta, indent=2))
     log.info('[%05d] done → %s', sample_idx, outdir)
     return str(outdir)
@@ -361,7 +408,7 @@ def _pending_indices(outdir, all_indices):
 
 
 def _sbatch_array(script_path, outdir_abs, pending, partition, max_array,
-                  natoms, nmissing, cell_size, verbose):
+                  natoms, nmissing, cell_size, verbose, partial_occ=False):
     """Submit a sbatch array job; return the SLURM job-id string."""
     array_spec = _make_array_spec(pending)
     if max_array and max_array > 0:
@@ -372,6 +419,7 @@ def _sbatch_array(script_path, outdir_abs, pending, partition, max_array,
     if nmissing is not None: extra += [f'--nmissing {nmissing}']
     if cell_size != 40.0:    extra += [f'--cell-size {cell_size}']
     if verbose:              extra += ['--verbose']
+    if partial_occ:          extra += ['--partial-occ']
     extra_str = ' '.join(extra)
 
     lines = [
@@ -455,6 +503,9 @@ def main():
                         help='Cubic cell edge in Å (default: 40)')
     parser.add_argument('--verbose',     action='store_true',
                         help='Enable debug logging')
+    parser.add_argument('--partial-occ', action='store_true',
+                        help='Partial occupancy mode: give nmissing atoms random occ in [0,1) '
+                             'instead of deleting them')
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -482,7 +533,8 @@ def main():
         i = args.start
         try:
             generate_sample(i, outdir_root=outdir, natoms=args.natoms,
-                            cell=cell, nmissing=args.nmissing)
+                            cell=cell, nmissing=args.nmissing,
+                            partial_occ=args.partial_occ)
             log.info('Done. ok=1  errors=0')
         except Exception as exc:
             log.error('Sample %05d FAILED: %s', i, exc)
@@ -506,7 +558,7 @@ def main():
 
     job_id = _sbatch_array(
         script_path, outdir_abs, pending, args.partition, args.max_array,
-        args.natoms, args.nmissing, args.cell_size, args.verbose,
+        args.natoms, args.nmissing, args.cell_size, args.verbose, args.partial_occ,
     )
     log.info('Submitted SLURM array job %s  (%d tasks)', job_id, len(pending))
 
