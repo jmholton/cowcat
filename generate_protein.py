@@ -303,12 +303,66 @@ def step3_setup_structure(tmpdir, rng, n_waters=10, n_flood=0, flood_avoid_fullo
     return added, flood_added
 
 
+def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0):
+    """Return set of (chain, resnum) pairs involved in severe nonbond clashes.
+
+    Parses phenix .geo nonbonded blocks using the Lennard-Jones energy formula
+    from molprobify_runme.com:
+      lj0(r, r0) = 4 * ((r0*2^(-1/6)/r)^12 - (r0*2^(-1/6)/r)^6)
+      lj(r, r0)  = lj0(r, r0) - lj0(6, r0)   [shifted to 0 at r=6 Å]
+
+    Only heavy-atom clashes (obs < ideal) above lj_threshold are flagged.
+    Atom ID format in .geo: 15-char PDB string; chain at index 9, resnum 10:15.
+    """
+    def _lj(r, r0):
+        if r <= 0:
+            return 1e40
+        s = r0 * 2 ** (-1 / 6)
+        def lj0(r):
+            return 4 * ((s / r) ** 12 - (s / r) ** 6)
+        return lj0(r) - lj0(6.0)
+
+    bad = set()
+    try:
+        lines = Path(geo_file).read_text().splitlines()
+    except OSError:
+        return bad
+
+    i = 0
+    while i < len(lines):
+        if 'nonbonded pdb=' in lines[i]:
+            m1 = re.search(r'"([^"]*)"', lines[i])
+            m2 = re.search(r'"([^"]*)"', lines[i + 1]) if i + 1 < len(lines) else None
+            if m1 and m2 and i + 3 < len(lines):
+                id1, id2 = m1.group(1), m2.group(1)
+                # Skip hydrogen pairs — H atoms have name starting with H after strip
+                atom1 = id1[0:4].strip() if len(id1) >= 4 else ''
+                atom2 = id2[0:4].strip() if len(id2) >= 4 else ''
+                if not atom1.startswith('H') and not atom2.startswith('H'):
+                    parts = lines[i + 3].split()
+                    if len(parts) >= 2:
+                        try:
+                            obs, ideal = float(parts[0]), float(parts[1])
+                            if obs < ideal and _lj(obs, ideal) > lj_threshold:
+                                for id_str in (id1, id2):
+                                    if len(id_str) >= 15:
+                                        chain  = id_str[9]
+                                        resnum = id_str[10:15].strip()
+                                        bad.add((chain, resnum))
+                        except ValueError:
+                            pass
+            i += 4
+        else:
+            i += 1
+    return bad
+
+
 def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None):
     """Run phenix.geometry_minimization; return path to *_minimized.pdb.
 
     Saves stdout+stderr to {stem}{log_tag}.phenix.log in tmpdir.
     """
-    result = run([PHENIX_GM, pdb_name, 'write_geo_file=False', 'cdl=false',
+    result = run([PHENIX_GM, pdb_name, 'cdl=false',
                   'link_all=False', 'link_none=True', 'link_ligands=False',
                   'correct_hydrogens=False'],
                  cwd=tmpdir, check=False)
@@ -536,89 +590,15 @@ def _merge_altconfs(conf_pdbs, out_pdb, rng=None, flood_occ=None):
     st_out.write_pdb(str(out_pdb))
 
 
-def _combine_protein_solvent_sfs(protein_mtz, solvent_mtz, out_mtz, solvent_B):
-    """Add bulk-solvent SFs (with B-factor envelope) to protein SFs.
-
-    F_total(hkl) = F_protein(hkl) + exp(-B_sol * s² / 4) * F_solvent(hkl)
-
-    where s² = (h/a)² + (k/b)² + (l/c)² for a P1 orthorhombic cell.
-
-    HKLs present in protein but absent from solvent get protein-only contribution.
-    Falls back to copying protein_mtz if no F/PHI columns found in solvent_mtz.
-    """
-    prot = gemmi.read_mtz_file(str(protein_mtz))
-    solv = gemmi.read_mtz_file(str(solvent_mtz))
-
-    h_p = np.array(prot.column_with_label('H'),    dtype=np.int32)
-    k_p = np.array(prot.column_with_label('K'),    dtype=np.int32)
-    l_p = np.array(prot.column_with_label('L'),    dtype=np.int32)
-    fc_p  = np.array(prot.column_with_label('FC'),   dtype=np.float64)
-    phi_p = np.array(prot.column_with_label('PHIC'), dtype=np.float64)
-
-    # Find F and PHI columns in solvent MTZ (sfall may label them FC/PHIC or F/PHI)
-    solv_col_labels = [col.label for col in solv.columns]
-    fc_lbl  = next((l for l in solv_col_labels if l.upper().startswith('FC')),  None)
-    phi_lbl = next((l for l in solv_col_labels if l.upper().startswith('PHI')), None)
-    if fc_lbl is None or phi_lbl is None:
-        log.warning('Bulk solvent MTZ missing FC/PHI; using protein SFs only. cols=%s',
-                    solv_col_labels)
-        shutil.copy2(str(protein_mtz), str(out_mtz))
-        return
-
-    h_s = np.array(solv.column_with_label('H'),      dtype=np.int32)
-    k_s = np.array(solv.column_with_label('K'),      dtype=np.int32)
-    l_s = np.array(solv.column_with_label('L'),      dtype=np.int32)
-    fc_s  = np.array(solv.column_with_label(fc_lbl),  dtype=np.float64)
-    phi_s = np.array(solv.column_with_label(phi_lbl), dtype=np.float64)
-
-    # Build (h,k,l) → index lookup for solvent reflections
-    solv_idx = {(int(h), int(k), int(l)): i
-                for i, (h, k, l) in enumerate(zip(h_s.tolist(), k_s.tolist(), l_s.tolist()))}
-
-    # B-factor envelope: exp(-B * s² / 4),  s² = (h/a)² + (k/b)² + (l/c)²
-    a, b, c = CELL[0], CELL[1], CELL[2]
-    s_sq = (h_p / a)**2 + (k_p / b)**2 + (l_p / c)**2
-    bfac = np.exp(-solvent_B * s_sq / 4.0)
-
-    # Look up solvent index for each protein HKL
-    js = np.array([solv_idx.get((int(h), int(k), int(l)), -1)
-                   for h, k, l in zip(h_p.tolist(), k_p.tolist(), l_p.tolist())],
-                  dtype=np.int64)
-    has_s = js >= 0
-
-    F_prot = fc_p * np.exp(1j * np.radians(phi_p))
-    F_solv = np.zeros(len(F_prot), dtype=complex)
-    F_solv[has_s] = (fc_s[js[has_s]] *
-                     np.exp(1j * np.radians(phi_s[js[has_s]])) *
-                     bfac[has_s])
-
-    F_tot   = F_prot + F_solv
-    fc_out  = np.abs(F_tot).astype(np.float32)
-    phi_out = np.degrees(np.angle(F_tot)).astype(np.float32)
-
-    mtz_out_obj = gemmi.Mtz()
-    mtz_out_obj.cell       = prot.cell
-    mtz_out_obj.spacegroup = prot.spacegroup
-    mtz_out_obj.add_dataset('HKL_base')
-    for lbl in ('H', 'K', 'L'):
-        mtz_out_obj.add_column(lbl, 'H')
-    mtz_out_obj.add_dataset('data')
-    mtz_out_obj.add_column('FC',   'F')
-    mtz_out_obj.add_column('PHIC', 'P')
-    data = np.column_stack([h_p, k_p, l_p, fc_out, phi_out]).astype(np.float32)
-    mtz_out_obj.set_data(data)
-    mtz_out_obj.write_to_file(str(out_mtz))
-
-
 def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
                            solvent_radius=1.41, solvent_scale=0.334, solvent_B=50.0):
     """Compute structure factors including a bulk solvent contribution.
 
     Mirrors the model in ano_sfall.com (James Holton):
       1. Protein SFs from gemmi sfcalc.
-      2. Solvent mask via cavenv (fallback: sfall SOLVMAP), scaled to
-         solvent_scale e⁻/Å³ (default 0.334 = bulk water at 1 g/cm³).
-      3. Mask → SFs via sfall SFCALC MAPIN.
+      2. Solvent mask via cavenv, scaled to solvent_scale e⁻/Å³
+         (default 0.334 = bulk water at 1 g/cm³).
+      3. Mask → SFs via gemmi FFT (transform_to_f_phi).
       4. Apply exp(-B_sol * s²/4) Debye-Waller envelope (B_sol = 50 Å²).
       5. F_total = F_protein + F_solvent.
 
@@ -631,8 +611,14 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     run(['gemmi', 'sfcalc', f'--dmin={DMIN}',
          '--to-mtz=_protein_only.mtz', str(pdb_path)],
         cwd=tmpdir)
+    prot = gemmi.read_mtz_file(str(tmpdir / '_protein_only.mtz'))
+    h_p   = np.array(prot.column_with_label('H'),    dtype=np.int32)
+    k_p   = np.array(prot.column_with_label('K'),    dtype=np.int32)
+    l_p   = np.array(prot.column_with_label('L'),    dtype=np.int32)
+    fc_p  = np.array(prot.column_with_label('FC'),   dtype=np.float64)
+    phi_p = np.array(prot.column_with_label('PHIC'), dtype=np.float64)
 
-    # ── 2. Solvent mask via cavenv (fallback: sfall SOLVMAP) ───────────────────
+    # ── 2. Solvent mask via cavenv ──────────────────────────────────────────────
     cavenv_kw = (
         f'CELL {cell_kw}\nSYMM P1\nENVSOLVENT\n'
         f'GRID {grid_kw}\nRADMAX {solvent_radius}\n'
@@ -643,44 +629,43 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     if cv.returncode != 0 or not (tmpdir / '_raw_solvent.map').exists():
-        log.warning('cavenv failed (rc=%d); falling back to sfall SOLVMAP', cv.returncode)
-        sfall_mask_kw = (
-            f'MODE ATMMAP SOLVMAP\nCELL {cell_kw}\nSYMM P1\n'
-            f'resolution {DMIN}\nGRID {grid_kw}\nvdwrad {solvent_radius}\n'
-        ).encode()
-        run(['sfall', 'xyzin', str(pdb_path), 'mapout', '_raw_solvent.map'],
-            cwd=tmpdir, input_bytes=sfall_mask_kw)
+        raise RuntimeError(f'cavenv failed (rc={cv.returncode}):\n'
+                           f'{cv.stdout.decode(errors="replace")[-1000:]}')
 
-    # ── 3. Scale mask to bulk water electron density ────────────────────────────
-    md = subprocess.run(
-        ['mapdump', 'mapin', '_raw_solvent.map'],
-        input=b'go\n', cwd=str(tmpdir),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    max_val = 1.0
-    for line in md.stdout.decode(errors='replace').splitlines():
-        if 'Maximum dens' in line:
-            try:
-                max_val = float(line.split()[-1])
-            except ValueError:
-                pass
-    scale = (solvent_scale / max_val) if max_val > 0 else solvent_scale
-    run(['mapmask', 'mapin', '_raw_solvent.map', 'mapout', '_scaled_solvent.map'],
-        cwd=tmpdir, input_bytes=f'scale factor {scale} 0\n'.encode())
+    # ── 3. Scale mask to bulk water electron density (via gemmi in-memory) ──────
+    ccp4 = gemmi.read_ccp4_map(str(tmpdir / '_raw_solvent.map'))
+    ccp4.setup(float('nan'))
+    arr = np.array(ccp4.grid, copy=False)
+    max_val = float(arr.max()) or 1.0
+    arr *= (solvent_scale / max_val)
 
-    # ── 4. Mask → SFs via sfall ────────────────────────────────────────────────
-    run(['sfall', 'mapin', '_scaled_solvent.map', 'hklout', '_solvent_sfall.mtz'],
-        cwd=tmpdir, input_bytes=(
-            f'MODE SFCALC MAPIN\nCELL {cell_kw}\nSYMM P1\nresolution {DMIN}\n'
-        ).encode())
+    # ── 4. Mask → SFs via gemmi FFT ─────────────────────────────────────────────
+    hkl = gemmi.transform_map_to_f_phi(ccp4.grid, half_l=True)
 
-    # ── 5. Combine: F_total = F_protein + exp(-B*s²/4) * F_solvent ─────────────
-    _combine_protein_solvent_sfs(
-        tmpdir / '_protein_only.mtz',
-        tmpdir / '_solvent_sfall.mtz',
-        mtz_out,
-        solvent_B,
-    )
+    # ── 5. Apply B envelope & combine ───────────────────────────────────────────
+    a, b, c = CELL[0], CELL[1], CELL[2]
+    s_sq = (h_p / a)**2 + (k_p / b)**2 + (l_p / c)**2
+    bfac = np.exp(-solvent_B * s_sq / 4.0)
+
+    F_prot = fc_p * np.exp(1j * np.radians(phi_p))
+    hkl_array = np.column_stack([h_p, k_p, l_p]).astype(np.int32)
+    F_solv = hkl.get_value_by_hkl(hkl_array).astype(complex) * bfac
+    F_tot  = F_prot + F_solv
+
+    fc_out  = np.abs(F_tot).astype(np.float32)
+    phi_out = np.degrees(np.angle(F_tot)).astype(np.float32)
+
+    out = gemmi.Mtz()
+    out.cell       = prot.cell
+    out.spacegroup = prot.spacegroup
+    out.add_dataset('HKL_base')
+    for lbl in ('H', 'K', 'L'):
+        out.add_column(lbl, 'H')
+    out.add_dataset('data')
+    out.add_column('FC',   'F')
+    out.add_column('PHIC', 'P')
+    out.set_data(np.column_stack([h_p, k_p, l_p, fc_out, phi_out]).astype(np.float32))
+    out.write_to_file(str(mtz_out))
 
 
 def step6_sfcalc(pdb_path, mtz_out, tmpdir, bulk_solvent=True):
@@ -1173,6 +1158,17 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         minimized_pdb = step4_phenix_geommin('built.pdb', tmpdir, log_tag='_1st')
         t = _t('phenix_gm_1st', t)
 
+        # 4c: Check .geo file for severe heavy-atom nonbond clashes (obs < ideal,
+        #     LJ energy > 10).  Delete offenders NOW before building altlocs —
+        #     cheaper than re-running sfcalc/refmac later via step9_probe.
+        geo_file = tmpdir / 'built_minimized.geo'
+        geo_bad = _parse_geo_bad_nonbonds(geo_file)
+        if geo_bad:
+            log.info('step4c: deleting %d residues with severe nonbond clashes: %s',
+                     len(geo_bad), geo_bad)
+            _delete_residues_from_pdb(minimized_pdb, geo_bad)
+        t = _t('geo_clash_check', t)
+
         # 4b: Self-refine B factors (20 refmac cycles against own SFs)
         #     Gives chemically correlated B factors before jigglepdb
         selfref_pdb = step4b_selfref_b_factors(minimized_pdb, tmpdir)
@@ -1211,7 +1207,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         t = _t('build_mixed_model', t)
 
         # 10a: NCYC 0 probe to detect geometry clashes
-        clashing_residues_deleted = step9_probe(tmpdir)
+        clashing_residues_deleted = geo_bad | step9_probe(tmpdir)
         t = _t('probe_ncyc0', t)
         if clashing_residues_deleted:
             # Delete clashing residues from GROUND TRUTH, not the partial model.
