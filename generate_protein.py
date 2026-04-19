@@ -54,6 +54,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 
 import gemmi
 import numpy as np
+from scipy.ndimage import uniform_filter
 
 # ── Tool paths ─────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = Path(__file__).parent.resolve()
@@ -347,7 +348,7 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0):
                                 for id_str in (id1, id2):
                                     if len(id_str) >= 15:
                                         chain  = id_str[9]
-                                        resnum = id_str[10:15].strip()
+                                        resnum = int(id_str[10:15])
                                         bad.add((chain, resnum))
                         except ValueError:
                             pass
@@ -619,12 +620,23 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     phi_p = np.array(prot.column_with_label('PHIC'), dtype=np.float64)
 
     # ── 2. Solvent mask via cavenv ──────────────────────────────────────────────
+    # Strip flood-water chain (F) before masking: flood waters are already in
+    # F_protein from sfcalc above; including them in cavenv would exclude their
+    # positions from the mask, giving an artificially low bulk-solvent scale.
+    st_mask = gemmi.read_structure(str(pdb_path))
+    for model in st_mask:
+        to_remove = [i for i, ch in enumerate(model) if ch.name in ('W', 'F')]
+        for i in reversed(to_remove):
+            del model[i]
+    mask_pdb = str(tmpdir / '_mask_input.pdb')
+    st_mask.write_pdb(mask_pdb)
+
     cavenv_kw = (
         f'CELL {cell_kw}\nSYMM P1\nENVSOLVENT\n'
         f'GRID {grid_kw}\nRADMAX {solvent_radius}\n'
     ).encode()
     cv = subprocess.run(
-        ['cavenv', 'xyzin', str(pdb_path), 'mapout', '_raw_solvent.map'],
+        ['cavenv', 'xyzin', mask_pdb, 'mapout', '_raw_solvent.map'],
         input=cavenv_kw, cwd=str(tmpdir),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
@@ -639,13 +651,31 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     max_val = float(arr.max()) or 1.0
     arr *= (solvent_scale / max_val)
 
-    # ── 4. Mask → SFs via gemmi FFT ─────────────────────────────────────────────
+    # ── 4. Real-space smoothing (box filter, N iterations) ───────────────────────
+    # Mirrors ano_sfall.com: N = floor(B_sol / (2*(spacing*pi*1.468)^2))
+    # Each 3x3x3 box-filter pass applies effective B of per_iter Å².
+    # Remainder is applied in reciprocal space.
+    grid_spacing = CELL[0] / arr.shape[0]   # Å per voxel (40/60 for our cell)
+    per_iter = 2.0 * (grid_spacing * np.pi * 1.468) ** 2
+    n_smooth = int(solvent_B / per_iter) if per_iter > 0 else 0
+    if n_smooth < 3:
+        n_smooth = 0   # too few iterations: skip (per ano_sfall.com)
+    smooth_B = n_smooth * per_iter
+    rs_solvent_B = solvent_B - smooth_B
+    if n_smooth > 0:
+        pad = n_smooth + 1
+        padded = np.pad(arr, pad, mode='wrap')
+        for _ in range(n_smooth):
+            padded = uniform_filter(padded, size=3, mode='nearest')
+        arr[:] = padded[pad:-pad, pad:-pad, pad:-pad]
+
+    # ── 5. Mask → SFs via gemmi FFT ─────────────────────────────────────────────
     hkl = gemmi.transform_map_to_f_phi(ccp4.grid, half_l=True)
 
-    # ── 5. Apply B envelope & combine ───────────────────────────────────────────
+    # ── 6. Apply B envelope & combine ───────────────────────────────────────────
     a, b, c = CELL[0], CELL[1], CELL[2]
     s_sq = (h_p / a)**2 + (k_p / b)**2 + (l_p / c)**2
-    bfac = np.exp(-solvent_B * s_sq / 4.0)
+    bfac = np.exp(-rs_solvent_B * s_sq / 4.0)
 
     F_prot = fc_p * np.exp(1j * np.radians(phi_p))
     hkl_array = np.column_stack([h_p, k_p, l_p]).astype(np.int32)
@@ -986,6 +1016,17 @@ def _parse_unused_links(log_text):
     return to_delete
 
 
+def _add_extra_b(pdb_path, extra_b):
+    """Add extra_b to every atom's B factor in pdb_path (in-place)."""
+    st = gemmi.read_structure(str(pdb_path))
+    for model in st:
+        for chain in model:
+            for res in chain:
+                for atom in res:
+                    atom.b_iso = max(0.0, atom.b_iso + extra_b)
+    st.write_pdb(str(pdb_path))
+
+
 def _delete_residues_from_pdb(pdb_path, to_delete):
     """Delete residues from a PDB file in-place.
 
@@ -1116,7 +1157,8 @@ def step10_convert_maps(tmpdir, outdir):
 def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                     flood_avoid_fullocc=True, flood_occ=None,
                     shift_scale=0.5, n_altlocs=2, missing_fraction=0.05,
-                    never_collected_fraction=0.05, seed=None, debug=False):
+                    never_collected_fraction=0.05, extra_b=0.0,
+                    seed=None, debug=False):
     """Run the full pipeline for one sample. Returns (sample_idx, ok, info).
 
     If debug=True, the entire tmpdir is copied to sample_dir/debug/ before
@@ -1183,6 +1225,12 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         # 6: Each conformer was already minimized independently inside
         #    step5_jigglepdb_and_merge; multiconf.pdb is the truth structure.
         shutil.copy2(tmpdir / 'multiconf.pdb', tmpdir / 'truth_full.pdb')
+
+        # 6b: Apply extra_b to all truth atoms — broadens the target density,
+        #     simulating lower effective resolution.  Modifies truth_full.pdb
+        #     in-place so the saved PDB, truth.mtz, and truth.map are consistent.
+        if extra_b:
+            _add_extra_b(tmpdir / 'truth_full.pdb', extra_b)
 
         # 7: sfcalc on truth_full → truth.mtz
         step6_sfcalc(tmpdir / 'truth_full.pdb', tmpdir / 'truth.mtz', tmpdir)
@@ -1272,6 +1320,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             n_reflections_missing=n_missing,
             never_collected_fraction=never_collected_fraction,
             n_reflections_never_collected=n_never,
+            extra_b=extra_b,
             cell=list(CELL),
             dmin=DMIN,
             grid_shape=[60, 60, 60],
@@ -1307,7 +1356,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        flood_avoid_fullocc=True, shift_scale=0.5, n_altlocs=2,
                        missing_fraction=0.05, never_collected_fraction=0.05,
-                       max_array=300, seed=None, flood_occ=None):
+                       extra_b=0.0, max_array=300, seed=None, flood_occ=None):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / '_slurm_protein.sh'
     python  = sys.executable
@@ -1317,8 +1366,9 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     # parallel inside step5_jigglepdb_and_merge (ThreadPoolExecutor).
     cpus_per_task = max(n_altlocs, 2)
 
-    seed_line     = f'    --seed {seed} \\\n'     if seed     is not None else ''
+    seed_line      = f'    --seed {seed} \\\n'          if seed      is not None else ''
     flood_occ_line = f'    --flood-occ {flood_occ} \\\n' if flood_occ is not None else ''
+    extra_b_line   = f'    --extra-b {extra_b} \\\n'     if extra_b              else ''
     script_text = f"""\
 #!/bin/bash
 #SBATCH --job-name=prot_data
@@ -1341,7 +1391,7 @@ mkdir -p {outdir}/logs
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
     --never-collected-fraction {never_collected_fraction} \\
-{flood_occ_line}{seed_line}"""
+{flood_occ_line}{extra_b_line}{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
@@ -1389,6 +1439,8 @@ def main():
                         help='Number of alternate conformers to generate (default 2)')
     parser.add_argument('--missing-fraction', type=float, default=0.05,
                         help='Fraction of reflections collected but rejected (F→NaN, default 0.05)')
+    parser.add_argument('--extra-b',  type=float, default=0.0,
+                        help='Extra B factor added to all truth_full.pdb atoms before sfcalc')
     parser.add_argument('--never-collected-fraction', type=float, default=0.05,
                         help='Fraction of reflections never measured (rows deleted, default 0.05)')
     parser.add_argument('--debug',      action='store_true',
@@ -1419,6 +1471,7 @@ def main():
             n_altlocs=args.n_altlocs,
             missing_fraction=args.missing_fraction,
             never_collected_fraction=args.never_collected_fraction,
+            extra_b=args.extra_b,
             seed=args.seed,
             debug=args.debug,
         )
@@ -1431,7 +1484,8 @@ def main():
             args.nsamples, outdir.resolve(),
             args.nresidues, args.nwaters, args.n_flood, args.flood_avoid_fullocc,
             args.shift_scale, args.n_altlocs, args.missing_fraction,
-            args.never_collected_fraction, args.max_array,
+            args.never_collected_fraction,
+            extra_b=args.extra_b, max_array=args.max_array,
             seed=args.seed, flood_occ=args.flood_occ,
         )
         sys.exit(0 if ok else 1)
@@ -1448,6 +1502,7 @@ def main():
                                            args.flood_occ, args.shift_scale,
                                            args.n_altlocs, args.missing_fraction,
                                            args.never_collected_fraction,
+                                           extra_b=args.extra_b,
                                            seed=args.seed, debug=args.debug)
             done += 1
             status = 'OK' if ok else 'ERR'
@@ -1460,7 +1515,8 @@ def main():
                             args.nresidues, args.nwaters, args.n_flood,
                             args.flood_avoid_fullocc, args.flood_occ,
                             args.shift_scale, args.n_altlocs, args.missing_fraction,
-                            args.never_collected_fraction, args.seed, args.debug): sid
+                            args.never_collected_fraction, args.extra_b,
+                            args.seed, args.debug): sid
                 for sid in sample_ids
             }
             for fut in as_completed(futures):
