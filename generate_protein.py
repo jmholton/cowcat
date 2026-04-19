@@ -309,7 +309,8 @@ def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None):
     Saves stdout+stderr to {stem}{log_tag}.phenix.log in tmpdir.
     """
     result = run([PHENIX_GM, pdb_name, 'write_geo_file=False', 'cdl=false',
-                  'link_all=False', 'link_none=True', 'link_ligands=False'],
+                  'link_all=False', 'link_none=True', 'link_ligands=False',
+                  'correct_hydrogens=False'],
                  cwd=tmpdir, check=False)
     stem = Path(pdb_name).stem
     log_name = f'{stem}{log_tag or ""}.phenix.log'
@@ -332,8 +333,8 @@ def step4b_selfref_b_factors(minimized_pdb, tmpdir):
     values into physically sensible, bonding-correlated ones.  The refined
     coordinate file is returned; its B factors are used by jigglepdb byB.
     """
-    # Calculate SFs for the minimised model
-    step6_sfcalc(minimized_pdb, tmpdir / 'selfref.mtz', tmpdir)
+    # Calculate SFs for the minimised model (no bulk solvent needed for selfref)
+    step6_sfcalc(minimized_pdb, tmpdir / 'selfref.mtz', tmpdir, bulk_solvent=False)
 
     # Build a pseudo-observed MTZ (F=|FC|, SIGF=0.02·|FC|)
     step7_build_refme_mtz(tmpdir / 'selfref.mtz', tmpdir / 'selfref_refme.mtz')
@@ -524,15 +525,176 @@ def _merge_altconfs(conf_pdbs, out_pdb, rng=None, flood_occ=None):
                     atom.altloc  = lbl
                     res_out.add_atom(atom)
 
+            # Water/flood altlocs: assign independent B factors so each
+            # conformer has a realistic spread rather than all the same value.
+            if chain_name in ('W', 'F') and rng is not None:
+                for a in res_out:
+                    a.b_iso = float(np.clip(
+                        rng.lognormal(BFAC_SC_MU, BFAC_SC_SIGMA + 0.3),
+                        BFAC_SC_MIN, 120.0))
+
     st_out.write_pdb(str(out_pdb))
 
 
-def step6_sfcalc(pdb_path, mtz_out, tmpdir):
-    """Add hydrogens to pdb_path in-place via hgen, then compute structure factors.
+def _combine_protein_solvent_sfs(protein_mtz, solvent_mtz, out_mtz, solvent_B):
+    """Add bulk-solvent SFs (with B-factor envelope) to protein SFs.
+
+    F_total(hkl) = F_protein(hkl) + exp(-B_sol * s² / 4) * F_solvent(hkl)
+
+    where s² = (h/a)² + (k/b)² + (l/c)² for a P1 orthorhombic cell.
+
+    HKLs present in protein but absent from solvent get protein-only contribution.
+    Falls back to copying protein_mtz if no F/PHI columns found in solvent_mtz.
+    """
+    prot = gemmi.read_mtz_file(str(protein_mtz))
+    solv = gemmi.read_mtz_file(str(solvent_mtz))
+
+    h_p = np.array(prot.column_with_label('H'),    dtype=np.int32)
+    k_p = np.array(prot.column_with_label('K'),    dtype=np.int32)
+    l_p = np.array(prot.column_with_label('L'),    dtype=np.int32)
+    fc_p  = np.array(prot.column_with_label('FC'),   dtype=np.float64)
+    phi_p = np.array(prot.column_with_label('PHIC'), dtype=np.float64)
+
+    # Find F and PHI columns in solvent MTZ (sfall may label them FC/PHIC or F/PHI)
+    solv_col_labels = [col.label for col in solv.columns]
+    fc_lbl  = next((l for l in solv_col_labels if l.upper().startswith('FC')),  None)
+    phi_lbl = next((l for l in solv_col_labels if l.upper().startswith('PHI')), None)
+    if fc_lbl is None or phi_lbl is None:
+        log.warning('Bulk solvent MTZ missing FC/PHI; using protein SFs only. cols=%s',
+                    solv_col_labels)
+        shutil.copy2(str(protein_mtz), str(out_mtz))
+        return
+
+    h_s = np.array(solv.column_with_label('H'),      dtype=np.int32)
+    k_s = np.array(solv.column_with_label('K'),      dtype=np.int32)
+    l_s = np.array(solv.column_with_label('L'),      dtype=np.int32)
+    fc_s  = np.array(solv.column_with_label(fc_lbl),  dtype=np.float64)
+    phi_s = np.array(solv.column_with_label(phi_lbl), dtype=np.float64)
+
+    # Build (h,k,l) → index lookup for solvent reflections
+    solv_idx = {(int(h), int(k), int(l)): i
+                for i, (h, k, l) in enumerate(zip(h_s.tolist(), k_s.tolist(), l_s.tolist()))}
+
+    # B-factor envelope: exp(-B * s² / 4),  s² = (h/a)² + (k/b)² + (l/c)²
+    a, b, c = CELL[0], CELL[1], CELL[2]
+    s_sq = (h_p / a)**2 + (k_p / b)**2 + (l_p / c)**2
+    bfac = np.exp(-solvent_B * s_sq / 4.0)
+
+    # Look up solvent index for each protein HKL
+    js = np.array([solv_idx.get((int(h), int(k), int(l)), -1)
+                   for h, k, l in zip(h_p.tolist(), k_p.tolist(), l_p.tolist())],
+                  dtype=np.int64)
+    has_s = js >= 0
+
+    F_prot = fc_p * np.exp(1j * np.radians(phi_p))
+    F_solv = np.zeros(len(F_prot), dtype=complex)
+    F_solv[has_s] = (fc_s[js[has_s]] *
+                     np.exp(1j * np.radians(phi_s[js[has_s]])) *
+                     bfac[has_s])
+
+    F_tot   = F_prot + F_solv
+    fc_out  = np.abs(F_tot).astype(np.float32)
+    phi_out = np.degrees(np.angle(F_tot)).astype(np.float32)
+
+    mtz_out_obj = gemmi.Mtz()
+    mtz_out_obj.cell       = prot.cell
+    mtz_out_obj.spacegroup = prot.spacegroup
+    mtz_out_obj.add_dataset('HKL_base')
+    for lbl in ('H', 'K', 'L'):
+        mtz_out_obj.add_column(lbl, 'H')
+    mtz_out_obj.add_dataset('data')
+    mtz_out_obj.add_column('FC',   'F')
+    mtz_out_obj.add_column('PHIC', 'P')
+    data = np.column_stack([h_p, k_p, l_p, fc_out, phi_out]).astype(np.float32)
+    mtz_out_obj.set_data(data)
+    mtz_out_obj.write_to_file(str(out_mtz))
+
+
+def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
+                           solvent_radius=1.41, solvent_scale=0.334, solvent_B=50.0):
+    """Compute structure factors including a bulk solvent contribution.
+
+    Mirrors the model in ano_sfall.com (James Holton):
+      1. Protein SFs from gemmi sfcalc.
+      2. Solvent mask via cavenv (fallback: sfall SOLVMAP), scaled to
+         solvent_scale e⁻/Å³ (default 0.334 = bulk water at 1 g/cm³).
+      3. Mask → SFs via sfall SFCALC MAPIN.
+      4. Apply exp(-B_sol * s²/4) Debye-Waller envelope (B_sol = 50 Å²).
+      5. F_total = F_protein + F_solvent.
+
+    H must already be present in pdb_path (call step6_sfcalc which adds H first).
+    """
+    cell_kw = f'{CELL[0]} {CELL[1]} {CELL[2]} 90 90 90'
+    grid_kw = '60 60 60'   # matches gemmi sample_rate=3.0 on 40 Å cell
+
+    # ── 1. Protein SFs ─────────────────────────────────────────────────────────
+    run(['gemmi', 'sfcalc', f'--dmin={DMIN}',
+         '--to-mtz=_protein_only.mtz', str(pdb_path)],
+        cwd=tmpdir)
+
+    # ── 2. Solvent mask via cavenv (fallback: sfall SOLVMAP) ───────────────────
+    cavenv_kw = (
+        f'CELL {cell_kw}\nSYMM P1\nENVSOLVENT\n'
+        f'GRID {grid_kw}\nRADMAX {solvent_radius}\n'
+    ).encode()
+    cv = subprocess.run(
+        ['cavenv', 'xyzin', str(pdb_path), 'mapout', '_raw_solvent.map'],
+        input=cavenv_kw, cwd=str(tmpdir),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if cv.returncode != 0 or not (tmpdir / '_raw_solvent.map').exists():
+        log.warning('cavenv failed (rc=%d); falling back to sfall SOLVMAP', cv.returncode)
+        sfall_mask_kw = (
+            f'MODE ATMMAP SOLVMAP\nCELL {cell_kw}\nSYMM P1\n'
+            f'resolution {DMIN}\nGRID {grid_kw}\nvdwrad {solvent_radius}\n'
+        ).encode()
+        run(['sfall', 'xyzin', str(pdb_path), 'mapout', '_raw_solvent.map'],
+            cwd=tmpdir, input_bytes=sfall_mask_kw)
+
+    # ── 3. Scale mask to bulk water electron density ────────────────────────────
+    md = subprocess.run(
+        ['mapdump', 'mapin', '_raw_solvent.map'],
+        input=b'go\n', cwd=str(tmpdir),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    max_val = 1.0
+    for line in md.stdout.decode(errors='replace').splitlines():
+        if 'Maximum dens' in line:
+            try:
+                max_val = float(line.split()[-1])
+            except ValueError:
+                pass
+    scale = (solvent_scale / max_val) if max_val > 0 else solvent_scale
+    run(['mapmask', 'mapin', '_raw_solvent.map', 'mapout', '_scaled_solvent.map'],
+        cwd=tmpdir, input_bytes=f'scale factor {scale} 0\n'.encode())
+
+    # ── 4. Mask → SFs via sfall ────────────────────────────────────────────────
+    run(['sfall', 'mapin', '_scaled_solvent.map', 'hklout', '_solvent_sfall.mtz'],
+        cwd=tmpdir, input_bytes=(
+            f'MODE SFCALC MAPIN\nCELL {cell_kw}\nSYMM P1\nresolution {DMIN}\n'
+        ).encode())
+
+    # ── 5. Combine: F_total = F_protein + exp(-B*s²/4) * F_solvent ─────────────
+    _combine_protein_solvent_sfs(
+        tmpdir / '_protein_only.mtz',
+        tmpdir / '_solvent_sfall.mtz',
+        mtz_out,
+        solvent_B,
+    )
+
+
+def step6_sfcalc(pdb_path, mtz_out, tmpdir, bulk_solvent=True):
+    """Add hydrogens to pdb_path in-place, then compute structure factors.
+
+    If bulk_solvent=True (default), includes a mask-based bulk solvent
+    contribution (cavenv + sfall, matching ano_sfall.com parameters:
+    radius=1.41 Å, scale=0.334 e⁻/Å³, B=50 Å²).
+
+    Set bulk_solvent=False for internal steps (e.g. self-refinement B factors)
+    where speed matters and absolute realism is not required.
 
     pdb_path is overwritten with the H-containing model so that truth_full.pdb
-    saved to the sample directory includes H.  FC amplitudes (and thus the
-    'observed' Fo in refme.mtz) include the H contribution.
+    saved to the sample directory includes H.
     """
     pdb_with_h = tmpdir / '_sfcalc_withH.pdb'
     result = subprocess.run(
@@ -544,9 +706,13 @@ def step6_sfcalc(pdb_path, mtz_out, tmpdir):
     pdb_with_h.write_bytes(result.stdout)
     # Replace truth_full.pdb with the H-containing version
     pdb_with_h.replace(pdb_path)
-    run(['gemmi', 'sfcalc', f'--dmin={DMIN}',
-         f'--to-mtz={mtz_out}', str(pdb_path)],
-        cwd=tmpdir)
+
+    if bulk_solvent:
+        _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir)
+    else:
+        run(['gemmi', 'sfcalc', f'--dmin={DMIN}',
+             f'--to-mtz={mtz_out}', str(pdb_path)],
+            cwd=tmpdir)
 
 
 def step7_build_refme_mtz(truth_mtz, refme_mtz):
@@ -657,15 +823,18 @@ def step7c_add_freer_flags(refme_mtz, tmpdir):
 
 def _add_collapsed_atom(res_out, atoms):
     """Add a single atom to res_out at the mean position/B of all altloc atoms.
-    Occupancy = sum of altloc occs (preserves partial occupancy)."""
+    Occupancy = sum of altloc occs; rounded to 1.0 when sum > 0.95 (floating-point
+    tolerance) so that blank-conformer atoms always arrive at refmac with occ=1.0
+    and are not picked up by refmac_occupancy_setup.com for occupancy refinement."""
     pos = np.array([[a.pos.x, a.pos.y, a.pos.z] for a in atoms])
     cx, cy, cz = pos.mean(axis=0)
+    total_occ = sum(a.occ for a in atoms)
     a_out = gemmi.Atom()
     a_out.name    = atoms[0].name
     a_out.element = atoms[0].element
     a_out.pos     = gemmi.Position(cx, cy, cz)
     a_out.b_iso   = float(np.mean([a.b_iso for a in atoms]))
-    a_out.occ     = float(min(1.0, sum(a.occ for a in atoms)))
+    a_out.occ     = 1.0 if total_occ > 0.95 else float(min(1.0, total_occ))
     a_out.altloc  = '\x00'
     res_out.add_atom(a_out)
 
@@ -832,17 +1001,28 @@ def _parse_unused_links(log_text):
     return to_delete
 
 
-def step9_refmac(tmpdir):
-    """Run refmac5 (20 cycles) → refmacout.mtz and refmac.log.
+def _delete_residues_from_pdb(pdb_path, to_delete):
+    """Delete residues from a PDB file in-place.
 
-    Steps:
-      1. Generate occupancy groups via refmac_occupancy_setup.com.
-      2. NCYC 0 probe run to detect geometry clashes (unused links).
-      3. Delete clashing residues from starthere.pdb; regenerate occ groups.
-      4. Full NCYC 20 refinement.
+    to_delete: set of (chain_name, resnum_int) tuples.
+    """
+    st = gemmi.read_structure(str(pdb_path))
+    for chain in st[0]:
+        drop = [ri for ri, res in enumerate(chain)
+                if (chain.name, res.seqid.num) in to_delete]
+        for ri in reversed(drop):
+            del chain[ri]
+    st.write_pdb(str(pdb_path))
 
-    Returns (log_text, deleted_residues) where deleted_residues is a set of
-    (chain, resnum) tuples removed from starthere.pdb.
+
+def step9_probe(tmpdir):
+    """NCYC 0 refmac probe to detect geometry clashes (unused links).
+
+    Runs refmac with NCYC 0 on starthere.pdb and parses the log for 'Unused'
+    link entries, which indicate impossible geometry (e.g. side chain threading
+    through a ring).  Saves the probe log to probe_refmac.log.
+
+    Returns a set of (chain, resnum_int) tuples that should be deleted.
     """
     def _build_occ_bytes():
         run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), 'starthere.pdb'],
@@ -850,11 +1030,8 @@ def step9_refmac(tmpdir):
         b = (tmpdir / 'refmac_opts_occ.txt').read_bytes()
         return b if b.endswith(b'\n') else b + b'\n'
 
-    occ_bytes = _build_occ_bytes()
-
-    # ── Step 1: NCYC 0 probe to detect unused links ────────────────────────────
     probe_kw = (
-        occ_bytes +
+        _build_occ_bytes() +
         b'MAKE HYDR A NEWLIGAND NOEXIT\n'
         b'NCYC 0\n'
         b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
@@ -874,22 +1051,26 @@ def step9_refmac(tmpdir):
         stderr=subprocess.STDOUT,
     )
     probe_log = probe.stdout.decode(errors='replace')
+    (tmpdir / 'probe_refmac.log').write_text(probe_log)
+    return _parse_unused_links(probe_log)
 
-    # ── Step 2: Delete clashing residues from starthere.pdb ───────────────────
-    deleted = _parse_unused_links(probe_log)
-    if deleted:
-        st = gemmi.read_structure(str(tmpdir / 'starthere.pdb'))
-        for chain in st[0]:
-            drop = [ri for ri, res in enumerate(chain)
-                    if (chain.name, res.seqid.num) in deleted]
-            for ri in reversed(drop):
-                del chain[ri]
-        st.write_pdb(str(tmpdir / 'starthere.pdb'))
-        occ_bytes = _build_occ_bytes()
 
-    # ── Step 3: Full NCYC 20 refinement ───────────────────────────────────────
+def step9_refmac(tmpdir):
+    """Full NCYC 20 refmac on starthere.pdb → refmacout.mtz / refmac.log.
+
+    Assumes starthere.pdb and refme.mtz are already correct (clash detection
+    and ground-truth correction are done by the caller before this is called).
+
+    Returns log_text.
+    """
+    def _build_occ_bytes():
+        run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), 'starthere.pdb'],
+            cwd=tmpdir)
+        b = (tmpdir / 'refmac_opts_occ.txt').read_bytes()
+        return b if b.endswith(b'\n') else b + b'\n'
+
     keywords = (
-        occ_bytes +
+        _build_occ_bytes() +
         b'MAKE HYDR A NEWLIGAND NOEXIT\n'
         b'NCYC 20\n'
         b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
@@ -914,7 +1095,7 @@ def step9_refmac(tmpdir):
     (tmpdir / 'refmac.log').write_text(log_text)
     if result.returncode != 0:
         raise RuntimeError(f'refmac5 failed:\n{log_text[-3000:]}')
-    return log_text, deleted
+    return log_text
 
 
 def step10_convert_maps(tmpdir, outdir):
@@ -967,28 +1148,41 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
     seq = list(rng.choice(AA_NAMES, size=n_residues, p=AA_PROBS))
 
     tmpdir = Path(tempfile.mkdtemp(prefix=f'prot_{sample_idx:05d}_'))
+    timings = {}
+    def _t(label, t_prev):
+        now = time.time()
+        timings[label] = round(now - t_prev, 1)
+        return now
+
     try:
+        t = time.time()
+
         # 1-2: Build backbone + side chains
         step1_build_backbone(seq, rng, tmpdir)
         step2_build_sidechains(seq, rng, tmpdir)
+        t = _t('build_seq', t)
 
         # 3: Set up structure (cell, waters, centre, B factors)
         n_water_added, n_flood_added = step3_setup_structure(
             tmpdir, rng, n_waters=n_waters,
             n_flood=n_flood, flood_avoid_fullocc=flood_avoid_fullocc,
             flood_occ=flood_occ)
+        t = _t('setup_struct', t)
 
         # 4: First geometry minimisation
         minimized_pdb = step4_phenix_geommin('built.pdb', tmpdir, log_tag='_1st')
+        t = _t('phenix_gm_1st', t)
 
         # 4b: Self-refine B factors (20 refmac cycles against own SFs)
         #     Gives chemically correlated B factors before jigglepdb
         selfref_pdb = step4b_selfref_b_factors(minimized_pdb, tmpdir)
+        t = _t('selfref_bfac', t)
 
         # 5: jigglepdb using refined B factors → altloc A/B/...
         step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng,
                                   shift_scale=shift_scale, n_altlocs=n_altlocs,
                                   flood_occ=flood_occ)
+        t = _t('jiggle_and_merge', t)
 
         # 6: Each conformer was already minimized independently inside
         #    step5_jigglepdb_and_merge; multiconf.pdb is the truth structure.
@@ -996,6 +1190,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 
         # 7: sfcalc on truth_full → truth.mtz
         step6_sfcalc(tmpdir / 'truth_full.pdb', tmpdir / 'truth.mtz', tmpdir)
+        t = _t('sfcalc', t)
 
         # 8: Build refme.mtz
         step7_build_refme_mtz(tmpdir / 'truth.mtz', tmpdir / 'refme.mtz')
@@ -1009,12 +1204,30 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         #     'never_collected' → row deleted entirely; refmac has no knowledge of them.
         n_missing, n_never = simulate_missing_data(
             tmpdir / 'refme.mtz', missing_fraction, never_collected_fraction, rng)
+        t = _t('refme_mtz', t)
 
         # 9: Build mixed single/multi-conformer model → starthere.pdb
         step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng)
+        t = _t('build_mixed_model', t)
 
-        # 10: refmac refinement
-        refmac_log, clashing_residues_deleted = step9_refmac(tmpdir)
+        # 10a: NCYC 0 probe to detect geometry clashes
+        clashing_residues_deleted = step9_probe(tmpdir)
+        t = _t('probe_ncyc0', t)
+        if clashing_residues_deleted:
+            # Delete clashing residues from GROUND TRUTH, not the partial model.
+            # They clash because the amorphous builder placed atoms in impossible
+            # geometry; the truth structure is wrong, not the refinement target.
+            _delete_residues_from_pdb(tmpdir / 'truth_full.pdb',
+                                      clashing_residues_deleted)
+            # Recalculate truth.mtz from corrected ground truth (H already present).
+            _sfcalc_with_bulksolv(tmpdir / 'truth_full.pdb', tmpdir / 'truth.mtz', tmpdir)
+            # Rebuild starthere.pdb from corrected truth_full.pdb.
+            step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng)
+            t = _t('clash_correction', t)
+
+        # 10b: Full NCYC 20 refinement
+        refmac_log = step9_refmac(tmpdir)
+        t = _t('refmac_ncyc20', t)
 
         # Parse final Rwork from refmac log
         # "Overall R factor = 0.0201" appears once per cycle; last is final cycle.
@@ -1035,6 +1248,8 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         if (tmpdir / 'refmacout.mtz').exists():
             shutil.copy2(tmpdir / 'refmacout.mtz', sample_dir / 'refmacout.mtz')
         shutil.copy2(tmpdir / 'refmac.log',        sample_dir / 'refmac.log')
+        if (tmpdir / 'probe_refmac.log').exists():
+            shutil.copy2(tmpdir / 'probe_refmac.log', sample_dir / 'probe_refmac.log')
         for plog in tmpdir.glob('*.phenix.log'):
             shutil.copy2(plog, sample_dir / plog.name)
 
@@ -1044,6 +1259,8 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             if debug_dir.exists():
                 shutil.rmtree(str(debug_dir))
             shutil.copytree(str(tmpdir), str(debug_dir))
+
+        t = _t('maps_and_copy', t)
 
         # Metadata
         meta = dict(
@@ -1062,11 +1279,13 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             cell=list(CELL),
             dmin=DMIN,
             grid_shape=[60, 60, 60],
+            step_timings=timings,
         )
         (sample_dir / 'metadata.json').write_text(json.dumps(meta, indent=2))
 
         elapsed = time.time() - t0
-        return sample_idx, True, f'ok in {elapsed:.1f}s  Rwork={rwork}'
+        timing_str = '  '.join(f'{k}={v}s' for k, v in timings.items())
+        return sample_idx, True, f'ok in {elapsed:.1f}s  Rwork={rwork}\n  {timing_str}'
 
     except Exception as e:
         import traceback
@@ -1098,6 +1317,10 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     python  = sys.executable
     me      = Path(__file__).resolve()
 
+    # Each task needs one CPU per altloc conformer so phenix.GM runs truly in
+    # parallel inside step5_jigglepdb_and_merge (ThreadPoolExecutor).
+    cpus_per_task = max(n_altlocs, 2)
+
     seed_line     = f'    --seed {seed} \\\n'     if seed     is not None else ''
     flood_occ_line = f'    --flood-occ {flood_occ} \\\n' if flood_occ is not None else ''
     script_text = f"""\
@@ -1108,6 +1331,7 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
 #SBATCH --output={outdir}/logs/%A_%a.log
 #SBATCH --error={outdir}/logs/%A_%a.log
 #SBATCH --time=02:00:00
+#SBATCH --cpus-per-task={cpus_per_task}
 
 mkdir -p {outdir}/logs
 {python} {me} \\
