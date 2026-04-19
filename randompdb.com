@@ -99,7 +99,7 @@ awk '{minX=$1;maxX=$2;minY=$3;maxY=$4;minZ=$5;maxZ=$6;N=$7*$8;srand();\
             print x,y,z}\
      }' |\
 awk '{printf"ATOM %6d  %-3s %3s %1s%4d     %7.3f %7.3f %7.3f %5.2f%6.2f\n",\
-          1, "OW1", "WAT", " ", 1, $1, $2, $3, 1, 20}' |\
+          1, "O  ", "HOH", " ", 1, $1, $2, $3, 1, 20}' |\
 cat >! temp.pdb
 echo "END" >> temp.pdb
 
@@ -133,7 +133,7 @@ EOF
 # now reformat the PDB
 cat temp.pdb |\
 awk '/^ATOM/{++i; printf"ATOM %6d  %-3s %3s %1s%4d     %7.3f %7.3f %7.3f %5.2f%6.2f\n",\
-          i%100000, "OW1", "WAT", " ", i%10000, $6, $7, $8, 1, 20}' |\
+          i%100000, "O  ", "HOH", " ", i%10000, $6, $7, $8, 1, 20}' |\
 cat >! random.pdb
 
 mv random.pdb temp.pdb
@@ -297,6 +297,6 @@ awk '{minX=$1;maxX=$2;minY=$3;maxY=$4;minZ=$5;maxZ=$6;N=$7;srand();\
     ++n;X[n]=x;Y[n]=y;Z[n]=z;\
     print x,y,z}}' |\
 awk '{printf"ATOM %6d  %-3s %3s %1s%4d     %7.3f %7.3f %7.3f %5.2f%6.2f\n",\
-          1, "OW1", "WAT", " ", 1, $1, $2, $3, 1, 20}' |\
+          1, "O  ", "HOH", " ", 1, $1, $2, $3, 1, 20}' |\
 cat >! temp.pdb
 echo "END" >> temp.pdb

@@ -15,6 +15,7 @@ Upweights errors at real density peaks, where the ghost-peak problem matters mos
 
 import argparse
 import os
+import sys
 import time
 import json
 from pathlib import Path
@@ -23,7 +24,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import make_splits
+from dataset import make_splits, make_splits_multi
 from model import UNet3D, count_parameters
 
 
@@ -71,8 +72,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='Train 3D U-Net for electron density reconstruction.'
     )
-    parser.add_argument('--data',        default='./data',
-                        help='Root data directory (default: ./data)')
+    parser.add_argument('--data',        default=['./data'], nargs='+',
+                        help='One or more data directories (space-separated)')
     parser.add_argument('--outdir',      default='./checkpoints',
                         help='Where to save checkpoints (default: ./checkpoints)')
     parser.add_argument('--epochs',      type=int, default=100)
@@ -93,11 +94,27 @@ def main():
                              '(optimizer/scheduler reset — for curriculum transfer)')
     args = parser.parse_args()
 
+    # ── Log file (train_<suffix>.log beside the script) ───────────────────────
+    _suffix  = Path(args.outdir).name.replace('checkpoints_', '', 1)
+    _logpath = Path(__file__).parent / f'train_{_suffix}.log'
+
+    class _Tee:
+        def __init__(self, *streams): self.streams = streams
+        def write(self, data):
+            for s in self.streams: s.write(data)
+        def flush(self):
+            for s in self.streams: s.flush()
+
+    _lf = open(_logpath, 'a')
+    sys.stdout = _Tee(sys.__stdout__, _lf)
+    sys.stderr = _Tee(sys.__stderr__, _lf)
+    print(f'Logging to {_logpath}')
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_ds, val_ds = make_splits(args.data, val_fraction=args.val_frac)
+    train_ds, val_ds = make_splits_multi(args.data, val_fraction=args.val_frac)
     print(f'Train: {len(train_ds)}  Val: {len(val_ds)}')
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,

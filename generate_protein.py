@@ -1092,13 +1092,14 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        flood_avoid_fullocc=True, shift_scale=0.5, n_altlocs=2,
                        missing_fraction=0.05, never_collected_fraction=0.05,
-                       max_array=300, seed=None):
+                       max_array=300, seed=None, flood_occ=None):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / '_slurm_protein.sh'
     python  = sys.executable
     me      = Path(__file__).resolve()
 
-    seed_line = f'    --seed {seed} \\\n' if seed is not None else ''
+    seed_line     = f'    --seed {seed} \\\n'     if seed     is not None else ''
+    flood_occ_line = f'    --flood-occ {flood_occ} \\\n' if flood_occ is not None else ''
     script_text = f"""\
 #!/bin/bash
 #SBATCH --job-name=prot_data
@@ -1120,7 +1121,7 @@ mkdir -p {outdir}/logs
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
     --never-collected-fraction {never_collected_fraction} \\
-{seed_line}"""
+{flood_occ_line}{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
@@ -1210,7 +1211,8 @@ def main():
             args.nsamples, outdir.resolve(),
             args.nresidues, args.nwaters, args.n_flood, args.flood_avoid_fullocc,
             args.shift_scale, args.n_altlocs, args.missing_fraction,
-            args.never_collected_fraction, args.max_array, seed=args.seed,
+            args.never_collected_fraction, args.max_array,
+            seed=args.seed, flood_occ=args.flood_occ,
         )
         sys.exit(0 if ok else 1)
 

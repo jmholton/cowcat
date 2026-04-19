@@ -14,7 +14,7 @@ import os
 import json
 import numpy as np
 import torch
-from torch.utils.data import Dataset, random_split
+from torch.utils.data import Dataset, ConcatDataset, random_split
 
 
 REQUIRED = {'truth.map', '2fofc.map', 'fofc.map', 'fc.map', 'metadata.json'}
@@ -152,4 +152,21 @@ def make_splits(data_dir, val_fraction=0.2, seed=42):
     n_val = max(1, int(len(full) * val_fraction))
     n_train = len(full) - n_val
     return random_split(full, [n_train, n_val],
+                        generator=torch.Generator().manual_seed(seed))
+
+
+def make_splits_multi(data_dirs, val_fraction=0.2, seed=42):
+    """Like make_splits but accepts a list of data directories.
+
+    Concatenates all directories into one pool, then does a single train/val split.
+    Falls back to make_splits for a single directory (supports PackedDataset).
+    """
+    if len(data_dirs) == 1:
+        return make_splits(data_dirs[0], val_fraction=val_fraction, seed=seed)
+    datasets = [ElectronDensityDataset(d) for d in data_dirs]
+    combined = ConcatDataset(datasets)
+    n = len(combined)
+    n_val = max(1, int(n * val_fraction))
+    n_train = n - n_val
+    return random_split(combined, [n_train, n_val],
                         generator=torch.Generator().manual_seed(seed))

@@ -86,5 +86,39 @@ class UNet3D(nn.Module):
         return self.head(d1)
 
 
+class TwoStageUNet3D(nn.Module):
+    """Two-stage U-Net for iterative electron density refinement.
+
+    Stage 1 (frozen): UNet3D(in_channels=4) → pred1
+    Stage 2 (trained): UNet3D(in_channels=5) → pred2
+        Input to Stage 2 = [original 4 channels | Stage-1 prediction]
+
+    Load Stage 1 weights from a checkpoint, then freeze them.
+    Only Stage 2 parameters are optimised during training.
+    """
+
+    def __init__(self, base_features=32):
+        super().__init__()
+        self.stage1 = UNet3D(in_channels=4, out_channels=1,
+                             base_features=base_features)
+        self.stage2 = UNet3D(in_channels=5, out_channels=1,
+                             base_features=base_features)
+
+    def load_stage1(self, checkpoint_path, device='cpu'):
+        """Load Stage-1 weights from a checkpoint and freeze them."""
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        self.stage1.load_state_dict(ckpt['model'])
+        for p in self.stage1.parameters():
+            p.requires_grad_(False)
+        self.stage1.eval()
+
+    def forward(self, x):
+        with torch.no_grad():
+            pred1 = self.stage1(x)          # (B, 1, D, H, W)
+        inp2  = torch.cat([x, pred1], dim=1)  # (B, 5, D, H, W)
+        pred2 = self.stage2(inp2)
+        return pred2
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
