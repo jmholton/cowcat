@@ -50,7 +50,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import gemmi
 import numpy as np
@@ -371,7 +371,12 @@ def step4b_selfref_b_factors(minimized_pdb, tmpdir):
 
 
 def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlocs=2, flood_occ=None):
-    """Run jigglepdb n_altlocs times on the self-refined model, merge → multiconf.pdb."""
+    """Run jigglepdb n_altlocs times, minimize each conformer independently in
+    parallel, then merge → multiconf.pdb (used directly as truth_full.pdb).
+
+    Each jigglepdb output is a single-conformer PDB, so phenix.geometry_minimization
+    runs without altloc complexity and all n_altlocs jobs run concurrently.
+    """
     labels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[:n_altlocs]
     seeds  = [int(rng.integers(1000, 99999)) for _ in range(n_altlocs)]
     conf_pdbs = []
@@ -393,15 +398,69 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
         p.write_bytes(result.stdout)
         conf_pdbs.append(p)
 
-    _merge_altconfs(conf_pdbs, tmpdir / 'multiconf.pdb', rng=rng, flood_occ=flood_occ)
+    # Minimize each single-conformer PDB independently and in parallel
+    def _minimize_one(conf_pdb):
+        return step4_phenix_geommin(conf_pdb.name, tmpdir, log_tag=f'_{conf_pdb.stem}')
+
+    with ThreadPoolExecutor(max_workers=n_altlocs) as pool:
+        minimized_pdbs = list(pool.map(_minimize_one, conf_pdbs))
+
+    _merge_altconfs(minimized_pdbs, tmpdir / 'multiconf.pdb', rng=rng, flood_occ=flood_occ)
+
+
+def _sample_correlated_protein_occs(chain_residues, n_conf, rng):
+    """Generate spatially correlated per-residue Dirichlet occupancy fractions.
+
+    Occupancies along the chain are correlated via an AR(1) latent disorder field.
+    Disorder amplitude is larger where sequential CA–CA distances are small
+    (compact/helical regions) and smaller where the chain is extended.
+
+    Returns a list of n_residues lists, each of length n_conf, summing to 1.0.
+    """
+    residues = list(chain_residues)
+    n = len(residues)
+
+    # Extract CA positions (None if residue has no CA, e.g. GLY H-only)
+    ca_pos = []
+    for res in residues:
+        ca = next((a for a in res if a.name == 'CA'), None)
+        ca_pos.append(np.array([ca.pos.x, ca.pos.y, ca.pos.z]) if ca else None)
+
+    # Sequential CA–CA distances; default 5.0 Å for missing or first residue
+    ca_dists = np.full(n, 5.0)
+    for i in range(1, n):
+        if ca_pos[i] is not None and ca_pos[i - 1] is not None:
+            ca_dists[i] = np.linalg.norm(ca_pos[i] - ca_pos[i - 1])
+
+    # AR(1) correlation: higher for close CA–CA (helix ~3.8 Å → ρ≈0.85)
+    rho = np.exp(-ca_dists / 5.0)
+
+    # Disorder amplitude: inversely proportional to CA–CA distance
+    # helix (~3.8 Å) → amp≈0.66;  extended (~6 Å) → amp≈0.42;  loop (>10 Å) → ~0.25
+    amp = 2.5 / np.maximum(ca_dists, 3.5)
+
+    # AR(1) latent disorder field
+    z = np.zeros(n)
+    for i in range(1, n):
+        z[i] = rho[i] * z[i - 1] + np.sqrt(max(0.0, 1.0 - rho[i] ** 2)) * rng.normal(0, amp[i])
+
+    # Map z → Dirichlet concentration α: large |z| → small α (unequal occupancies)
+    alpha = np.exp(-0.5 * z ** 2)
+    alpha = np.maximum(alpha, 0.05)
+
+    occs_list = []
+    for i in range(n):
+        raw = rng.dirichlet(np.full(n_conf, alpha[i]))
+        raw = np.clip(raw, 0.05, 0.90)
+        occs_list.append((raw / raw.sum()).tolist())
+    return occs_list
 
 
 def _merge_altconfs(conf_pdbs, out_pdb, rng=None, flood_occ=None):
     """Combine N single-conf PDBs into an N-altloc PDB (altlocs A, B, C, ...).
 
-    Per-residue occupancies are Dirichlet-distributed, scaled to a chain-specific
-    total occupancy:
-      chain 'A' (protein):  total = 1.0
+    Per-residue occupancies are scaled to a chain-specific total occupancy:
+      protein chains:             total = 1.0, correlated along chain via AR(1)
       chain 'W' (ordered waters): total = rng.uniform(0.3, 1.0) per water
       chain 'F' (flood waters):   total = flood_occ (default 0.1)
     """
@@ -410,6 +469,13 @@ def _merge_altconfs(conf_pdbs, out_pdb, rng=None, flood_occ=None):
     st_out   = structs[0].clone()
     n_conf   = len(structs)
     _flood_occ = flood_occ if flood_occ is not None else 0.1
+
+    # Pre-compute correlated occupancies for protein chains
+    chain_occs = {}  # chain_idx → list of occ vectors (one per residue)
+    if rng is not None:
+        for ci, chain in enumerate(structs[0][0]):
+            if chain.name not in ('W', 'F'):
+                chain_occs[ci] = _sample_correlated_protein_occs(chain, n_conf, rng)
 
     for ci, chains in enumerate(zip(*[s[0] for s in structs])):
         chain_out = st_out[0][ci]
@@ -423,11 +489,17 @@ def _merge_altconfs(conf_pdbs, out_pdb, rng=None, flood_occ=None):
                 total_occ = float(rng.uniform(0.3, 1.0)) if rng is not None else 1.0
             else:
                 total_occ = 1.0
-            # Dirichlet-distributed per-residue occupancies, scaled to total_occ
+
+            # Per-conformer occupancies
             if rng is not None:
-                raw = rng.dirichlet(np.ones(n_conf))
-                raw = np.clip(raw, 0.05, 0.90)
-                occs = (raw / raw.sum() * total_occ).tolist()
+                if ci in chain_occs:
+                    # Protein chain: use pre-computed correlated fractions
+                    occs = [o * total_occ for o in chain_occs[ci][ri]]
+                else:
+                    # Water / flood chains: independent Dirichlet
+                    raw = rng.dirichlet(np.ones(n_conf))
+                    raw = np.clip(raw, 0.05, 0.90)
+                    occs = (raw / raw.sum() * total_occ).tolist()
             else:
                 occs = [total_occ / n_conf] * n_conf
 
@@ -599,10 +671,8 @@ def _add_collapsed_atom(res_out, atoms):
 
 
 def _reduce_conformers(by_name, sc_names, max_confs=3):
-    """Merge closest conformer pairs until ≤ max_confs altlocs remain.
+    """Drop lowest-occupancy conformers until ≤ max_confs altlocs remain.
 
-    Distance between two conformers = max atomic displacement across all
-    shared side-chain atoms (same metric as the keep_altloc threshold).
     Returns (updated_by_name, remaining_label_list).
     """
     labels = sorted({a.altloc for name in sc_names
@@ -611,57 +681,41 @@ def _reduce_conformers(by_name, sc_names, max_confs=3):
     if len(labels) <= max_confs:
         return by_name, labels
 
-    # Represent each conformer as {atom_name: [x, y, z, b, occ, element, atom_name_str]}
-    conf = {}
+    # Mean occupancy per conformer label
+    occ_by_label = {}
     for l in labels:
-        conf[l] = {}
-        for name in sc_names:
-            for a in by_name.get(name, ()):
-                if a.altloc == l:
-                    conf[l][name] = [a.pos.x, a.pos.y, a.pos.z,
-                                     a.b_iso, a.occ, a.element, a.name]
+        occs = [a.occ for name in sc_names
+                for a in by_name.get(name, ()) if a.altloc == l]
+        occ_by_label[l] = float(np.mean(occs)) if occs else 0.0
 
+    # Drop lowest-occupancy conformers until ≤ max_confs remain
     while len(labels) > max_confs:
-        # Find the pair of conformers with the smallest max atomic displacement
-        best_li, best_lj, best_dist = labels[0], labels[1], float('inf')
-        for i in range(len(labels)):
-            for j in range(i + 1, len(labels)):
-                li, lj = labels[i], labels[j]
-                shared = set(conf[li]) & set(conf[lj])
-                d = max((np.linalg.norm(np.array(conf[li][n][:3]) - np.array(conf[lj][n][:3]))
-                         for n in shared), default=0.0)
-                if d < best_dist:
-                    best_dist = d
-                    best_li, best_lj = li, lj
+        drop_l = min(labels, key=lambda l: occ_by_label[l])
+        labels.remove(drop_l)
+        del occ_by_label[drop_l]
 
-        # Merge best_lj into best_li (average position/B, sum occ)
-        for name in set(conf[best_li]) | set(conf[best_lj]):
-            if name in conf[best_li] and name in conf[best_lj]:
-                xi, yi, zi, bi, oi, el, an = conf[best_li][name]
-                xj, yj, zj, bj, oj = conf[best_lj][name][:5]
-                conf[best_li][name] = [(xi+xj)/2, (yi+yj)/2, (zi+zj)/2,
-                                       (bi+bj)/2, min(1.0, oi+oj), el, an]
-            elif name in conf[best_lj]:
-                conf[best_li][name] = conf[best_lj][name]
-        del conf[best_lj]
-        labels.remove(best_lj)
+    # Renormalize surviving occupancies to sum to 1.0
+    total = sum(occ_by_label.values())
+    scale = (1.0 / total) if total > 0 else 1.0
+    for l in labels:
+        occ_by_label[l] *= scale
 
-    # Rebuild by_name with reduced conformers (mc atoms are not in sc_names, unchanged)
+    # Rebuild by_name keeping only surviving labels, with renormalized occupancies
+    label_set = set(labels)
     new_by_name = dict(by_name)
     for name in sc_names:
         atoms_list = []
-        for l in labels:
-            if name not in conf[l]:
+        for a in by_name.get(name, ()):
+            if a.altloc not in label_set:
                 continue
-            x, y, z, b, occ, el, an = conf[l][name]
-            a = gemmi.Atom()
-            a.name    = an
-            a.element = el
-            a.pos     = gemmi.Position(x, y, z)
-            a.b_iso   = b
-            a.occ     = occ
-            a.altloc  = l
-            atoms_list.append(a)
+            new_a = gemmi.Atom()
+            new_a.name    = a.name
+            new_a.element = a.element
+            new_a.pos     = a.pos
+            new_a.b_iso   = a.b_iso
+            new_a.occ     = occ_by_label[a.altloc]
+            new_a.altloc  = a.altloc
+            atoms_list.append(new_a)
         if atoms_list:
             new_by_name[name] = atoms_list
     return new_by_name, labels
@@ -712,27 +766,17 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng):
             mc_names = [n for n in by_name if n in MAINCHAIN_ATOMS]
             sc_names = [n for n in by_name if n not in MAINCHAIN_ATOMS]
 
-            # Check if any side-chain atom exceeds threshold from its centroid
-            keep_altloc = False
-            for name in sc_names:
-                atoms = by_name[name]
-                if len(atoms) > 1:
-                    pos = np.array([[a.pos.x, a.pos.y, a.pos.z] for a in atoms])
-                    centroid = pos.mean(axis=0)
-                    if np.max(np.linalg.norm(pos - centroid, axis=1)) > ALTLOC_DIST_THRESHOLD:
-                        keep_altloc = True
-                        break
-
             # Main chain: always collapse
             for name in mc_names:
                 _add_collapsed_atom(res_out, by_name[name])
 
-            if not keep_altloc:
-                # Side chain: collapse
+            # Side chain: keep altlocs if any SC atom has multiple conformers;
+            # drop lowest-occupancy ones until ≤ 3 remain.
+            has_altloc = any(len(by_name.get(n, [])) > 1 for n in sc_names)
+            if not has_altloc:
                 for name in sc_names:
                     _add_collapsed_atom(res_out, by_name[name])
             else:
-                # Merge closest conformer pairs until ≤ 3 altlocs remain
                 by_name, present = _reduce_conformers(by_name, sc_names, max_confs=3)
 
                 # Scramble altloc labels per residue
@@ -759,10 +803,94 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng):
     st_out.write_pdb(str(tmpdir / 'starthere.pdb'))
 
 
+def _parse_unused_links(log_text):
+    """Parse refmac's 'Automatic generation of links' section.
+
+    Returns a set of (chain, resnum_int) tuples for every residue that appears
+    in an 'Unused' link entry (both ends of each clashing pair).
+
+    Log line format:
+      Unused  :  <link>  Mon1  At1  alt1  Ch1  Res1  Mon2  At2  alt2  Ch2  Res2  distM  distI
+    """
+    to_delete = set()
+    in_section = False
+    for line in log_text.splitlines():
+        if 'Automatic generation of links' in line:
+            in_section = True
+        if not in_section:
+            continue
+        if not line.strip().startswith('Unused'):
+            continue
+        parts = line.split()
+        # parts: [0]Unused [1]: [2]link [3]Mon1 [4]At1 [5]alt1 [6]Ch1 [7]Res1
+        #        [8]Mon2 [9]At2 [10]alt2 [11]Ch2 [12]Res2 [13]distM [14]distI
+        try:
+            to_delete.add((parts[6],  int(parts[7])))
+            to_delete.add((parts[11], int(parts[12])))
+        except (IndexError, ValueError):
+            pass
+    return to_delete
+
+
 def step9_refmac(tmpdir):
-    """Run refmac5 (20 cycles) → refmacout.mtz and refmac.log."""
+    """Run refmac5 (20 cycles) → refmacout.mtz and refmac.log.
+
+    Steps:
+      1. Generate occupancy groups via refmac_occupancy_setup.com.
+      2. NCYC 0 probe run to detect geometry clashes (unused links).
+      3. Delete clashing residues from starthere.pdb; regenerate occ groups.
+      4. Full NCYC 20 refinement.
+
+    Returns (log_text, deleted_residues) where deleted_residues is a set of
+    (chain, resnum) tuples removed from starthere.pdb.
+    """
+    def _build_occ_bytes():
+        run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), 'starthere.pdb'],
+            cwd=tmpdir)
+        b = (tmpdir / 'refmac_opts_occ.txt').read_bytes()
+        return b if b.endswith(b'\n') else b + b'\n'
+
+    occ_bytes = _build_occ_bytes()
+
+    # ── Step 1: NCYC 0 probe to detect unused links ────────────────────────────
+    probe_kw = (
+        occ_bytes +
+        b'MAKE HYDR A NEWLIGAND NOEXIT\n'
+        b'NCYC 0\n'
+        b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
+        b'MONI DIST 10\n'
+        b'END\n'
+    )
+    probe = subprocess.run(
+        [str(REFMAC5),
+         'XYZIN',  'starthere.pdb',
+         'XYZOUT', '_probe.pdb',
+         'HKLIN',  'refme.mtz',
+         'HKLOUT', '_probe.mtz',
+         'LIBOUT',  'refmac.lib'],
+        input=probe_kw,
+        cwd=str(tmpdir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    probe_log = probe.stdout.decode(errors='replace')
+
+    # ── Step 2: Delete clashing residues from starthere.pdb ───────────────────
+    deleted = _parse_unused_links(probe_log)
+    if deleted:
+        st = gemmi.read_structure(str(tmpdir / 'starthere.pdb'))
+        for chain in st[0]:
+            drop = [ri for ri, res in enumerate(chain)
+                    if (chain.name, res.seqid.num) in deleted]
+            for ri in reversed(drop):
+                del chain[ri]
+        st.write_pdb(str(tmpdir / 'starthere.pdb'))
+        occ_bytes = _build_occ_bytes()
+
+    # ── Step 3: Full NCYC 20 refinement ───────────────────────────────────────
     keywords = (
-        b'MAKE HYDR NO NEWLIGAND NOEXIT\n'
+        occ_bytes +
+        b'MAKE HYDR A NEWLIGAND NOEXIT\n'
         b'NCYC 20\n'
         b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
         b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT '
@@ -786,7 +914,7 @@ def step9_refmac(tmpdir):
     (tmpdir / 'refmac.log').write_text(log_text)
     if result.returncode != 0:
         raise RuntimeError(f'refmac5 failed:\n{log_text[-3000:]}')
-    return log_text
+    return log_text, deleted
 
 
 def step10_convert_maps(tmpdir, outdir):
@@ -822,7 +950,7 @@ def step10_convert_maps(tmpdir, outdir):
 def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                     flood_avoid_fullocc=True, flood_occ=None,
                     shift_scale=0.5, n_altlocs=2, missing_fraction=0.05,
-                    never_collected_fraction=0.05, debug=False):
+                    never_collected_fraction=0.05, seed=None, debug=False):
     """Run the full pipeline for one sample. Returns (sample_idx, ok, info).
 
     If debug=True, the entire tmpdir is copied to sample_dir/debug/ before
@@ -835,7 +963,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
     if sample_dir.exists() and (sample_dir / 'metadata.json').exists():
         return sample_idx, True, 'already done'
 
-    rng = np.random.default_rng(seed=sample_idx)
+    rng = np.random.default_rng(seed=sample_idx if seed is None else seed)
     seq = list(rng.choice(AA_NAMES, size=n_residues, p=AA_PROBS))
 
     tmpdir = Path(tempfile.mkdtemp(prefix=f'prot_{sample_idx:05d}_'))
@@ -862,9 +990,9 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                                   shift_scale=shift_scale, n_altlocs=n_altlocs,
                                   flood_occ=flood_occ)
 
-        # 6: Second geometry minimisation → truth_full.pdb
-        truth_full_pdb = step4_phenix_geommin('multiconf.pdb', tmpdir, log_tag='_2nd')
-        shutil.copy2(truth_full_pdb, tmpdir / 'truth_full.pdb')
+        # 6: Each conformer was already minimized independently inside
+        #    step5_jigglepdb_and_merge; multiconf.pdb is the truth structure.
+        shutil.copy2(tmpdir / 'multiconf.pdb', tmpdir / 'truth_full.pdb')
 
         # 7: sfcalc on truth_full → truth.mtz
         step6_sfcalc(tmpdir / 'truth_full.pdb', tmpdir / 'truth.mtz', tmpdir)
@@ -886,7 +1014,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng)
 
         # 10: refmac refinement
-        refmac_log = step9_refmac(tmpdir)
+        refmac_log, clashing_residues_deleted = step9_refmac(tmpdir)
 
         # Parse final Rwork from refmac log
         # "Overall R factor = 0.0201" appears once per cycle; last is final cycle.
@@ -925,6 +1053,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             n_waters_requested=n_waters,
             n_waters_added=n_water_added,
             n_flood_added=n_flood_added,
+            n_clashing_residues_deleted=len(clashing_residues_deleted),
             rwork_final=rwork,
             missing_fraction=missing_fraction,
             n_reflections_missing=n_missing,
@@ -963,12 +1092,13 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        flood_avoid_fullocc=True, shift_scale=0.5, n_altlocs=2,
                        missing_fraction=0.05, never_collected_fraction=0.05,
-                       max_array=300):
+                       max_array=300, seed=None):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / '_slurm_protein.sh'
     python  = sys.executable
     me      = Path(__file__).resolve()
 
+    seed_line = f'    --seed {seed} \\\n' if seed is not None else ''
     script_text = f"""\
 #!/bin/bash
 #SBATCH --job-name=prot_data
@@ -989,8 +1119,8 @@ mkdir -p {outdir}/logs
     --shift-scale {shift_scale} \\
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
-    --never-collected-fraction {never_collected_fraction}
-"""
+    --never-collected-fraction {never_collected_fraction} \\
+{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
@@ -1042,6 +1172,9 @@ def main():
                         help='Fraction of reflections never measured (rows deleted, default 0.05)')
     parser.add_argument('--debug',      action='store_true',
                         help='Copy entire tmpdir to sample_dir/debug/ for inspection')
+    parser.add_argument('--seed',       type=int, default=None,
+                        help='Fixed RNG seed (overrides sample-id as seed); '
+                             'use to hold the protein structure constant while varying other params')
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1065,6 +1198,7 @@ def main():
             n_altlocs=args.n_altlocs,
             missing_fraction=args.missing_fraction,
             never_collected_fraction=args.never_collected_fraction,
+            seed=args.seed,
             debug=args.debug,
         )
         print(f'Sample {idx:05d}: {msg}')
@@ -1076,7 +1210,7 @@ def main():
             args.nsamples, outdir.resolve(),
             args.nresidues, args.nwaters, args.n_flood, args.flood_avoid_fullocc,
             args.shift_scale, args.n_altlocs, args.missing_fraction,
-            args.never_collected_fraction, args.max_array,
+            args.never_collected_fraction, args.max_array, seed=args.seed,
         )
         sys.exit(0 if ok else 1)
 
@@ -1092,7 +1226,7 @@ def main():
                                            args.flood_occ, args.shift_scale,
                                            args.n_altlocs, args.missing_fraction,
                                            args.never_collected_fraction,
-                                           debug=args.debug)
+                                           seed=args.seed, debug=args.debug)
             done += 1
             status = 'OK' if ok else 'ERR'
             ok_count += ok; err_count += (not ok)
@@ -1104,7 +1238,7 @@ def main():
                             args.nresidues, args.nwaters, args.n_flood,
                             args.flood_avoid_fullocc, args.flood_occ,
                             args.shift_scale, args.n_altlocs, args.missing_fraction,
-                            args.never_collected_fraction, args.debug): sid
+                            args.never_collected_fraction, args.seed, args.debug): sid
                 for sid in sample_ids
             }
             for fut in as_completed(futures):
