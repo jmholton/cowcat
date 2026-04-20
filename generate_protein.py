@@ -1362,7 +1362,7 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        extra_b=0.0, max_array=300, seed=None, flood_occ=None,
                        cell=None, dmin=2.0):
     """Write and submit a SLURM array job script."""
-    script = SCRIPT_DIR / '_slurm_protein.sh'
+    script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     python  = sys.executable
     me      = Path(__file__).resolve()
 
