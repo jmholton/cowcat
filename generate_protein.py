@@ -606,7 +606,10 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     H must already be present in pdb_path (call step6_sfcalc which adds H first).
     """
     cell_kw = f'{CELL[0]} {CELL[1]} {CELL[2]} 90 90 90'
-    grid_kw = '60 60 60'   # matches gemmi sample_rate=3.0 on 40 Å cell
+    na = round(CELL[0] * SAMPLE_RATE / DMIN)
+    nb = round(CELL[1] * SAMPLE_RATE / DMIN)
+    nc = round(CELL[2] * SAMPLE_RATE / DMIN)
+    grid_kw = f'{na} {nb} {nc}'
 
     # ── 1. Protein SFs ─────────────────────────────────────────────────────────
     run(['gemmi', 'sfcalc', f'--dmin={DMIN}',
@@ -1356,7 +1359,8 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        flood_avoid_fullocc=True, shift_scale=0.5, n_altlocs=2,
                        missing_fraction=0.05, never_collected_fraction=0.05,
-                       extra_b=0.0, max_array=300, seed=None, flood_occ=None):
+                       extra_b=0.0, max_array=300, seed=None, flood_occ=None,
+                       cell=None, dmin=2.0):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / '_slurm_protein.sh'
     python  = sys.executable
@@ -1369,6 +1373,9 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     seed_line      = f'    --seed {seed} \\\n'          if seed      is not None else ''
     flood_occ_line = f'    --flood-occ {flood_occ} \\\n' if flood_occ is not None else ''
     extra_b_line   = f'    --extra-b {extra_b} \\\n'     if extra_b              else ''
+    _cell = cell if cell is not None else (40.0, 40.0, 40.0)
+    cell_line      = f'    --cell {_cell[0]} {_cell[1]} {_cell[2]} \\\n'
+    dmin_line      = f'    --dmin {dmin} \\\n'
     script_text = f"""\
 #!/bin/bash
 #SBATCH --job-name=prot_data
@@ -1391,7 +1398,7 @@ mkdir -p {outdir}/logs
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
     --never-collected-fraction {never_collected_fraction} \\
-{flood_occ_line}{extra_b_line}{seed_line}"""
+{cell_line}{dmin_line}{flood_occ_line}{extra_b_line}{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
@@ -1443,6 +1450,11 @@ def main():
                         help='Extra B factor added to all truth_full.pdb atoms before sfcalc')
     parser.add_argument('--never-collected-fraction', type=float, default=0.05,
                         help='Fraction of reflections never measured (rows deleted, default 0.05)')
+    parser.add_argument('--cell', nargs=3, type=float, default=[40.0, 40.0, 40.0],
+                        metavar=('A', 'B', 'C'),
+                        help='P1 unit cell dimensions in Å (default: 40 40 40)')
+    parser.add_argument('--dmin', type=float, default=2.0,
+                        help='Resolution cutoff in Å (default: 2.0)')
     parser.add_argument('--debug',      action='store_true',
                         help='Copy entire tmpdir to sample_dir/debug/ for inspection')
     parser.add_argument('--seed',       type=int, default=None,
@@ -1454,6 +1466,10 @@ def main():
         level=logging.INFO,
         format='%(asctime)s %(levelname)s %(message)s',
     )
+
+    global CELL, DMIN
+    CELL = tuple(args.cell)
+    DMIN = args.dmin
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1487,6 +1503,7 @@ def main():
             args.never_collected_fraction,
             extra_b=args.extra_b, max_array=args.max_array,
             seed=args.seed, flood_occ=args.flood_occ,
+            cell=CELL, dmin=DMIN,
         )
         sys.exit(0 if ok else 1)
 
