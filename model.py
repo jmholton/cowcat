@@ -4,7 +4,12 @@ model.py  –  3D U-Net for electron density map reconstruction.
 Architecture
 ------------
 Input  : (B, 4, D, H, W)  –  2Fo-Fc, Fo-Fc, Fc, cross-Patterson channels
-Output : (B, 1, D, H, W)  –  predicted ground-truth density
+Output : tuple
+    mean_map    (B, 1, D, H, W)  –  z-normalised predicted difference map
+    log_var_map (B, 1, D, H, W)  –  per-voxel log-variance of mean_map;
+                                     exp(0.5 * log_var) is the predicted std
+    log_scale   (B,)             –  log(std) of physical diff; multiply mean_map
+                                     by exp(log_scale) to recover physical units
 
 Three encoder levels (base_features=32 by default):
     enc1  32  ch   60×60×60
@@ -60,8 +65,17 @@ class UNet3D(nn.Module):
         self.dec2 = _ConvBlock(f * 4 + f * 2, f * 2)
         self.dec1 = _ConvBlock(f * 2 + f,     f)
 
-        # ── Head ──────────────────────────────────────────────────────────────
-        self.head = nn.Conv3d(f, out_channels, kernel_size=1)
+        # ── Map + log-variance head (2 channels) ──────────────────────────────
+        # channel 0: z-normalised mean prediction
+        # channel 1: per-voxel log-variance of that prediction
+        self.head = nn.Conv3d(f, 2, kernel_size=1)
+
+        # ── Scale head (bottleneck → scalar log_std) ───────────────────────────
+        self.scale_head = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),   # (B, 8f, 1, 1, 1)
+            nn.Flatten(),              # (B, 8f)
+            nn.Linear(f * 8, 1),      # (B, 1)
+        )
 
     def forward(self, x):
         # Encoder
@@ -71,6 +85,9 @@ class UNet3D(nn.Module):
 
         # Bottleneck
         b = self.bottleneck(self.pool(e3))
+
+        # Scale prediction from bottleneck
+        log_scale = self.scale_head(b).squeeze(1)  # (B,)
 
         # Decoder — interpolate to exact encoder spatial dims to handle odd sizes
         d3 = self.dec3(torch.cat([
@@ -83,7 +100,8 @@ class UNet3D(nn.Module):
             F.interpolate(d2, size=e1.shape[2:], mode='trilinear', align_corners=False),
             e1], dim=1))
 
-        return self.head(d1)
+        out = self.head(d1)
+        return out[:, :1], out[:, 1:], log_scale  # mean_map, log_var_map, log_scale
 
 
 class TwoStageUNet3D(nn.Module):

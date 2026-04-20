@@ -77,31 +77,33 @@ def _build_input(twofofc, fofc, fc):
 # ── Inference: whole-map or tiled ────────────────────────────────────────────
 
 def _infer_whole(model, x, device):
-    """Run model on the full volume at once."""
+    """Run model on the full volume at once.
+    Returns (mean_map, uncertainty_map, log_scale) as numpy arrays / scalar."""
     with torch.no_grad():
-        pred = model(x.to(device))
-    return pred[0, 0].cpu().numpy()
+        mean, log_var, log_scale = model(x.to(device))
+    return (mean[0, 0].cpu().numpy(),
+            np.exp(0.5 * log_var[0, 0].cpu().numpy()),
+            log_scale[0].item())
 
 
 def _infer_tiled(model, x, device, patch=60, overlap=30):
     """Patch-based inference with cosine-blending at boundaries.
 
-    x      : (1, 4, D, H, W) tensor
-    patch  : cubic patch side length (voxels)
-    overlap: half-overlap between adjacent patches (voxels); stride = patch - overlap
+    Returns (mean_map, uncertainty_map, log_scale) as numpy arrays / scalar.
+    mean and uncertainty are both blended with a Hanning window.
+    log_scale is averaged across patches (global prediction).
     """
     _, _, D, H, W = x.shape
     stride = patch - overlap
-    output    = np.zeros((D, H, W), dtype=np.float64)
-    weight    = np.zeros((D, H, W), dtype=np.float64)
+    out_mean = np.zeros((D, H, W), dtype=np.float64)
+    out_var  = np.zeros((D, H, W), dtype=np.float64)
+    weight   = np.zeros((D, H, W), dtype=np.float64)
+    scales   = []
 
-    # 1-D cosine window, zero at edges, one in the centre
     window_1d = np.hanning(patch).astype(np.float64)
-    # 3-D weight: outer product of three 1-D windows
     win3d = window_1d[:, None, None] * window_1d[None, :, None] * window_1d[None, None, :]
 
     def _starts(size):
-        """Patch start positions covering [0, size) with at least one patch."""
         pts = list(range(0, size - patch, stride))
         pts.append(size - patch)
         return sorted(set(pts))
@@ -111,12 +113,18 @@ def _infer_tiled(model, x, device, patch=60, overlap=30):
             for ix in _starts(W):
                 chunk = x[:, :, iz:iz+patch, iy:iy+patch, ix:ix+patch]
                 with torch.no_grad():
-                    pred = model(chunk.to(device))[0, 0].cpu().numpy()
-                output[iz:iz+patch, iy:iy+patch, ix:ix+patch] += pred * win3d
-                weight[iz:iz+patch, iy:iy+patch, ix:ix+patch] += win3d
+                    mean, log_var, log_scale = model(chunk.to(device))
+                m = mean[0, 0].cpu().numpy()
+                v = np.exp(log_var[0, 0].cpu().numpy())   # variance
+                out_mean[iz:iz+patch, iy:iy+patch, ix:ix+patch] += m * win3d
+                out_var [iz:iz+patch, iy:iy+patch, ix:ix+patch] += v * win3d
+                weight  [iz:iz+patch, iy:iy+patch, ix:ix+patch] += win3d
+                scales.append(log_scale[0].item())
 
     weight = np.where(weight < 1e-12, 1.0, weight)
-    return (output / weight).astype(np.float32)
+    mean_map = (out_mean / weight).astype(np.float32)
+    unc_map  = np.sqrt(out_var / weight).astype(np.float32)  # std from blended var
+    return mean_map, unc_map, float(np.mean(scales))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -161,7 +169,7 @@ def main():
     # ── Load model ────────────────────────────────────────────────────────────
     sys.path.insert(0, str(Path(__file__).parent))
     from model import UNet3D
-    model = UNet3D(in_channels=4, out_channels=1,
+    model = UNet3D(in_channels=4, out_channels=2,
                    base_features=args.base_features).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt['model'])
@@ -173,14 +181,22 @@ def main():
     # ── Inference ─────────────────────────────────────────────────────────────
     if args.tile:
         print(f'Tiled inference  patch={args.patch}  overlap={args.overlap}')
-        arr = _infer_tiled(model, x, device, patch=args.patch, overlap=args.overlap)
+        mean_map, unc_map, log_scale = _infer_tiled(model, x, device,
+                                                    patch=args.patch, overlap=args.overlap)
     else:
-        arr = _infer_whole(model, x, device)
+        mean_map, unc_map, log_scale = _infer_whole(model, x, device)
 
-    print(f'Output range: [{arr.min():.3f}, {arr.max():.3f}]')
+    physical_scale = float(np.exp(log_scale))
+    print(f'log_scale={log_scale:.3f}  (physical std ≈ {physical_scale:.4f})')
+    print(f'mean_map range:  [{mean_map.min():.3f}, {mean_map.max():.3f}]  (z-normalised)')
+    print(f'uncertainty range: [{unc_map.min():.3f}, {unc_map.max():.3f}]  (predicted std)')
 
-    # ── Write output map ──────────────────────────────────────────────────────
-    _write_map(args.output, arr, args.fofc2)
+    # ── Write output maps ─────────────────────────────────────────────────────
+    _write_map(args.output, mean_map, args.fofc2)
+    unc_path = str(args.output).replace('.map', '_uncertainty.map')
+    if unc_path == args.output:
+        unc_path = args.output + '_uncertainty.map'
+    _write_map(unc_path, unc_map, args.fofc2)
 
 
 if __name__ == '__main__':

@@ -22,6 +22,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset import make_splits, make_splits_multi
@@ -32,27 +33,29 @@ from model import UNet3D, count_parameters
 # Loss
 # ══════════════════════════════════════════════════════════════════════════════
 
-def peak_weighted_mse(pred, target, alpha=0.5):
-    """MSE weighted by absolute ground-truth density magnitude."""
-    weights = 1.0 + alpha * target.abs()
-    return (weights * (pred - target) ** 2).mean()
+def heteroscedastic_nll(mean, log_var, target):
+    """Heteroscedastic Gaussian NLL: ½·exp(-s)·(μ-y)² + ½·s  where s=log_var.
+    Jointly optimises prediction accuracy and calibrated per-voxel uncertainty."""
+    return 0.5 * (torch.exp(-log_var) * (mean - target) ** 2 + log_var).mean()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Training / validation loops
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_epoch(model, loader, device, optimizer=None):
+def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0):
     """Single train or eval pass. Pass optimizer=None for eval."""
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
 
     with torch.set_grad_enabled(training):
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            pred = model(x)
-            loss = peak_weighted_mse(pred, y)
+        for x, y, s in loader:
+            x, y, s = x.to(device), y.to(device), s.to(device)
+            pred_map, pred_log_var, pred_log_scale = model(x)
+            loss_map   = heteroscedastic_nll(pred_map, pred_log_var, y)
+            loss_scale = F.mse_loss(pred_log_scale, s)
+            loss = loss_map + scale_weight * loss_scale
 
             if training:
                 optimizer.zero_grad()
@@ -92,6 +95,8 @@ def main():
     parser.add_argument('--pretrain',    default=None,
                         help='Path to checkpoint to load model weights only '
                              '(optimizer/scheduler reset — for curriculum transfer)')
+    parser.add_argument('--scale-weight', type=float, default=1.0,
+                        help='Weight on scale-prediction MSE loss (default: 1.0)')
     args = parser.parse_args()
 
     # ── Log file (train_<suffix>.log beside the script) ───────────────────────
@@ -163,8 +168,8 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        train_loss = run_epoch(model, train_loader, device, optimizer)
-        val_loss   = run_epoch(model, val_loader,   device, optimizer=None)
+        train_loss = run_epoch(model, train_loader, device, optimizer,      args.scale_weight)
+        val_loss   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
         scheduler.step()
 
         elapsed = time.time() - t0

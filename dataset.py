@@ -2,11 +2,13 @@
 dataset.py  –  PyTorch Dataset for electron density map pairs.
 
 Each sample directory contains:
-    truth.map   – ground-truth Fo density  (target)
+    truth.map   – ground-truth Fc density (from truth_full.pdb)
     2fofc.map   – 2Fo-Fc from refmac       (input channel 0)
     fofc.map    – Fo-Fc difference map     (input channel 1)
-    fc.map      – Fc density               (input channel 2)
+    fc.map      – FC_ALL_LS from refmac    (input channel 2)
 
+Target: truth.map − fc.map  (ideal Fo-Fc: truth density minus partial-model Fc).
+Positive peaks mark missing density; negative peaks mark spurious centroid density.
 Maps are z-score normalised per-channel per-sample before returning.
 """
 
@@ -89,7 +91,12 @@ class ElectronDensityDataset(Dataset):
             ch3 = _znorm(np.load(crossp_path))
         else:
             ch3 = _znorm(_cross_patterson(fofc_raw, fc_raw))
-        tgt = _znorm(_load_map(os.path.join(base, 'truth.map')))
+
+        truth_raw = _load_map(os.path.join(base, 'truth.map'))
+        diff_raw  = truth_raw - fc_raw
+        diff_std  = float(diff_raw.std())
+        log_scale = np.log(diff_std + 1e-8)
+        tgt = _znorm(diff_raw)
 
         x = np.stack([ch0, ch1, ch2, ch3], axis=0)  # (4, D, H, W)
 
@@ -101,8 +108,9 @@ class ElectronDensityDataset(Dataset):
                 tgt = np.flip(tgt, axis=spatial_axis)       # tgt is (D,H,W)
 
         x   = torch.from_numpy(x.copy())
-        y   = torch.from_numpy(tgt[np.newaxis].copy())  # (1, D, H, W)
-        return x, y
+        y   = torch.from_numpy(tgt[np.newaxis].copy())      # (1, D, H, W)
+        s   = torch.tensor(log_scale, dtype=torch.float32)  # scalar
+        return x, y, s
 
 
 class PackedDataset(Dataset):
