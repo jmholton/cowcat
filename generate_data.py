@@ -1201,7 +1201,8 @@ def _sbatch_array(script_path, outdir_abs, pending, partition, max_array,
                   xyz_shift=None, xyz_natoms=None,
                   bfac_shift=None, bfac_natoms=None,
                   n_altconfs=1, altconf_rms=0.5, n_clusters=1,
-                  all_clusters=False, no_refmac=False):
+                  all_clusters=False, no_refmac=False,
+                  cell=None, dmin=2.0):
     """Submit a sbatch array job; return the SLURM job-id string."""
     array_spec = _make_array_spec(pending)
     if max_array and max_array > 0:
@@ -1213,6 +1214,8 @@ def _sbatch_array(script_path, outdir_abs, pending, partition, max_array,
     if nmissing        is not None: extra += [f'--modified {nmissing}']
     if modified_range  is not None: extra += [f'--modified-range {modified_range[0]} {modified_range[1]}']
     if cell_size != 40.0:           extra += [f'--cell-size {cell_size}']
+    if cell      is not None:       extra += [f'--cell {cell[0]} {cell[1]} {cell[2]}']
+    if dmin      != 2.0:            extra += [f'--dmin {dmin}']
     if verbose:                     extra += ['--verbose']
     if partial_occ:                 extra += ['--partial-occ']
     if xyz_shift       is not None: extra += [f'--xyz-shift {xyz_shift}']
@@ -1312,6 +1315,11 @@ def main():
                         help='Fix number of deleted/modified atoms (default: DELETE_FRAC * n_atoms)')
     parser.add_argument('--modified-range', type=int, nargs=2, metavar=('MIN', 'MAX'),
                         help='Draw n_modified uniformly from [MIN, MAX] per sample')
+    parser.add_argument('--cell', nargs=3, type=float, default=None,
+                        metavar=('A', 'B', 'C'),
+                        help='Non-cubic P1 cell dimensions in Å (overrides --cell-size)')
+    parser.add_argument('--dmin', type=float, default=2.0,
+                        help='Resolution cutoff in Å (default: 2.0)')
     parser.add_argument('--cell-size',   type=float, default=40.0,
                         help='Cubic cell edge in Å (default: 40)')
     parser.add_argument('--verbose',     action='store_true',
@@ -1350,8 +1358,13 @@ def main():
         format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    cs   = str(int(args.cell_size)) if args.cell_size == int(args.cell_size) else str(args.cell_size)
-    cell = (cs, cs, cs, '90', '90', '90')
+    global DMIN
+    DMIN = args.dmin
+    if args.cell is not None:
+        cell = (str(args.cell[0]), str(args.cell[1]), str(args.cell[2]), '90', '90', '90')
+    else:
+        cs   = str(int(args.cell_size)) if args.cell_size == int(args.cell_size) else str(args.cell_size)
+        cell = (cs, cs, cs, '90', '90', '90')
 
     if not RANDOMPDB.exists():
         sys.exit(f'ERROR: required script not found: {RANDOMPDB}')
@@ -1420,6 +1433,7 @@ def main():
         n_altconfs=args.n_altconfs, altconf_rms=args.altconf_rms,
         n_clusters=args.n_clusters,
         all_clusters=args.all_clusters, no_refmac=args.no_refmac,
+        cell=args.cell, dmin=args.dmin,
     )
     log.info('Submitted SLURM array job %s  (%d tasks)', job_id, len(pending))
 
