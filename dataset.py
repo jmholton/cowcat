@@ -107,6 +107,12 @@ class ElectronDensityDataset(Dataset):
                 x   = np.flip(x,   axis=spatial_axis + 1)  # x has leading channel dim
                 tgt = np.flip(tgt, axis=spatial_axis)       # tgt is (D,H,W)
 
+        # Random periodic translation — maps are periodic on the P1 grid so
+        # wrap-around is exact. Breaks the centering bias from data generation.
+        shifts = [np.random.randint(s) for s in tgt.shape]
+        x   = np.roll(x,   shifts, axis=(1, 2, 3))
+        tgt = np.roll(tgt, shifts, axis=(0, 1, 2))
+
         x   = torch.from_numpy(x.copy())
         y   = torch.from_numpy(tgt[np.newaxis].copy())      # (1, D, H, W)
         s   = torch.tensor(log_scale, dtype=torch.float32)  # scalar
@@ -137,6 +143,10 @@ class PackedDataset(Dataset):
             if np.random.rand() < 0.5:
                 x = np.flip(x, axis=spatial_axis + 1)
                 y = np.flip(y, axis=spatial_axis + 1)
+
+        shifts = [np.random.randint(s) for s in x.shape[1:]]
+        x = np.roll(x, shifts, axis=(1, 2, 3))
+        y = np.roll(y, shifts, axis=(1, 2, 3))
 
         return torch.from_numpy(x.copy()), torch.from_numpy(y.copy())
 
