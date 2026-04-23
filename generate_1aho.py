@@ -97,21 +97,20 @@ def jiggle_structure(st, shift_scale, seed):
 
 
 def write_protein_only_pdb(st, out_path):
-    """Write a PDB containing only non-HOH chains; return list of chain names."""
+    """Write PDB with all residues (protein + structural waters) for sfcalc.
+    Returns list of protein chain names (HOH-only chains excluded from list)."""
     st2 = gemmi.Structure()
     st2.cell = st.cell
     st2.spacegroup_hm = st.spacegroup_hm
     mdl = gemmi.Model('1')
     chain_names = []
     for chain in st[0]:
-        if not any(res.name not in ('HOH', 'WAT', 'H2O') for res in chain):
-            continue
         ch2 = gemmi.Chain(chain.name)
         for res in chain:
-            if res.name not in ('HOH', 'WAT', 'H2O'):
-                ch2.add_residue(res.clone())
+            ch2.add_residue(res.clone())
         mdl.add_chain(ch2)
-        chain_names.append(chain.name)
+        if any(res.name not in ('HOH', 'WAT', 'H2O') for res in chain):
+            chain_names.append(chain.name)
     st2.add_model(mdl)
     st2.write_pdb(str(out_path))
     return chain_names
