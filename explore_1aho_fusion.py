@@ -48,8 +48,10 @@ DISTAL_SC = frozenset({
 ALL_ALT_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 # Maximum altloc groups passed to refmac for bouquet/disulfide residues.
-# Refmac MX1ALT=20 is the hard limit; we use fewer to reduce per-cycle cost.
-BOUQUET_MAX_ALT = 8
+BOUQUET_MAX_ALT = 24
+# Minimum altloc groups for disulfide pairs (correlated motion, SG-SG constraint
+# makes individual CYS look ordered even when the pair samples multiple positions).
+DISULF_MIN_NCONF = 16
 
 
 def adaptive_k(spread, min_k=8, max_k=48, scale=0.5):
@@ -278,6 +280,42 @@ def bouquet_max_spread(reskey, conf_data, chain_names):
     return float(np.max(np.linalg.norm(pts - center, axis=1)))
 
 
+def heavy_atom_max_dev(reskey, conf_data, chain_names):
+    """Per-atom centroid deviation (heavy atoms only), max across all atoms in residue."""
+    all_anames = set()
+    for cn in chain_names:
+        rd = conf_data[cn].get(reskey)
+        if rd:
+            all_anames.update(rd['atoms'].keys())
+    max_dev = 0.0
+    for aname in all_anames:
+        if aname.startswith('H'):
+            continue
+        pts = []
+        for cn in chain_names:
+            rd = conf_data[cn].get(reskey)
+            if rd and aname in rd['atoms']:
+                a = rd['atoms'][aname]
+                pts.append([a.pos.x, a.pos.y, a.pos.z])
+        if len(pts) < 2:
+            continue
+        pts = np.array(pts)
+        dev = float(np.max(np.linalg.norm(pts - pts.mean(axis=0), axis=1)))
+        if dev > max_dev:
+            max_dev = dev
+    return max_dev
+
+
+def dev_to_nconf(dev):
+    """Map per-residue heavy-atom max deviation (Å) to number of altloc groups."""
+    if dev < 1.5:
+        return 3
+    elif dev < 3.5:
+        return 8
+    else:
+        return 16
+
+
 def ca_max_spread(reskey, conf_data, chain_names):
     """Max distance of CA from its centroid across all conformers.
 
@@ -364,6 +402,10 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
     ref_chain_name = chain_names[0]
     ref_chain_data = conf_data[ref_chain_name]
 
+    # Pre-compute per-residue heavy-atom max deviation for nconf scheduling
+    res_devs = {reskey: heavy_atom_max_dev(reskey, conf_data, chain_names)
+                for reskey in ref_chain_data}
+
     # ── Pre-compute shared SC groups for disulfide pairs ─────────────────────
     disulfides   = detect_disulfides(conf_data, chain_names)
     disulf_groups = {}  # reskey → list of lists of chain names (one list per group)
@@ -382,7 +424,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             n_half = max(1, len(common) // 2)
             chosen = sorted(rng.choice(len(common), n_half, replace=False).tolist())
             common = [common[i] for i in chosen]
-        k = min(len(common), BOUQUET_MAX_ALT)
+        k = min(len(common), max(DISULF_MIN_NCONF, dev_to_nconf(max(res_devs.get(rk1, 0.0), res_devs.get(rk2, 0.0)))))
         # Combined SG density score for ordering
         scores = []
         for cn in common:
@@ -535,7 +577,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
                     half_idx = np.sort(rng.choice(n_conf, n_half, replace=False))
                 else:
                     half_idx = np.arange(n_conf)
-                k = min(len(half_idx), BOUQUET_MAX_ALT)
+                k = min(len(half_idx), dev_to_nconf(res_devs.get(reskey, 0.0)))
                 half_order = half_idx[np.argsort(scores[half_idx])]
                 all_groups = [arr for arr in np.array_split(half_order, k) if len(arr) > 0]
             multi = len(all_groups) > 1
