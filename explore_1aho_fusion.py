@@ -343,7 +343,8 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
                       density_grid,
                       bouquet_threshold=1.5,
                       mc_bouq_threshold=0.5,
-                      out_pdb=None, tmpdir=None):
+                      out_pdb=None, tmpdir=None,
+                      rng=None):
     """Build starthere.pdb using the given fusion strategy.
 
     Returns path to the written PDB.
@@ -372,7 +373,11 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
                   if rk1 in conf_data[cn] and rk2 in conf_data[cn]]
         if not common:
             continue
-        # Use all conformers, up to refmac's MX1ALT=20 altloc limit
+        # Randomly select half of common conformers (same half for both CYS)
+        if rng is not None and len(common) >= 2:
+            n_half = max(1, len(common) // 2)
+            chosen = sorted(rng.choice(len(common), n_half, replace=False).tolist())
+            common = [common[i] for i in chosen]
         k = min(len(common), 20)
         # Combined SG density score for ordering
         scores = []
@@ -520,8 +525,15 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
                 ]
                 all_groups = [g for g in all_groups if len(g) > 0]
             else:
-                k = min(n_conf, 20)
-                all_groups = split_by_density(all_anames, k)
+                scores = density_score(valid_chains, reskey, all_anames, conf_data, density_grid)
+                if rng is not None and n_conf >= 2:
+                    n_half = max(1, n_conf // 2)
+                    half_idx = np.sort(rng.choice(n_conf, n_half, replace=False))
+                else:
+                    half_idx = np.arange(n_conf)
+                k = min(len(half_idx), 20)
+                half_order = half_idx[np.argsort(scores[half_idx])]
+                all_groups = [arr for arr in np.array_split(half_order, k) if len(arr) > 0]
             multi = len(all_groups) > 1
             if multi:
                 n_altloc_res += 1
