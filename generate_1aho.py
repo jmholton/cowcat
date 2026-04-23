@@ -60,7 +60,7 @@ S8_MC_THR   = 0.5
 
 # Flood water calibration: n_flood × occ → 8% rms noise on FP
 DEFAULT_N_FLOOD   = 1764
-DEFAULT_FLOOD_OCC = 0.05
+DEFAULT_FLOOD_OCC = 0.09
 
 # shift_scale: Gaussian B-based displacement giving ~8% ΔF/F on the 48-conformer model.
 # Calibration (Python Gaussian, B-based σ per atom):
@@ -147,6 +147,29 @@ def add_flood_chain(st, positions, occ, chain_name='W'):
     return st2
 
 
+def set_sulfur_aniso(st, rng):
+    """Set random anisotropic U_ij for all S atoms in place.
+
+    Eigenvalues are distributed around U_iso with ~40% spread; trace preserved.
+    """
+    S_elem = gemmi.Element('S')
+    for chain in st[0]:
+        for res in chain:
+            for atom in res:
+                if atom.element == S_elem:
+                    u_iso = atom.b_iso / (8.0 * np.pi ** 2)
+                    v = rng.normal(0.0, 0.4 * u_iso, 3)
+                    v -= v.mean()
+                    evals = np.maximum(u_iso + v, 0.01 * u_iso)
+                    M = rng.normal(0.0, 1.0, (3, 3))
+                    Q, _ = np.linalg.qr(M)
+                    U = Q @ np.diag(evals) @ Q.T
+                    atom.aniso = gemmi.SMat33f(
+                        float(U[0, 0]), float(U[1, 1]), float(U[2, 2]),
+                        float(U[0, 1]), float(U[0, 2]), float(U[1, 2]),
+                    )
+
+
 def add_hoh_chains_to_pdb(st_source, pdb_path):
     """Append all HOH-only chains from st_source into the PDB at pdb_path (in place)."""
     st = gemmi.read_structure(str(pdb_path))
@@ -184,7 +207,12 @@ def build_sample_mtz(truth_full_pdb, refme_path, tmpdir):
     fc_p = np.array(prot.column_with_label('FC'),   dtype=np.float64)
     ph_p = np.array(prot.column_with_label('PHIC'), dtype=np.float64)
     F_truth = fc_p * np.exp(1j * np.radians(ph_p))
+    truth_dict = {
+        (int(h_p[i]), int(k_p[i]), int(l_p[i])): F_truth[i]
+        for i in range(len(h_p))
+    }
 
+    # Use refme HKL set as the reference — matches 1aho.mtz coverage exactly
     h_r  = np.array(refme.column_with_label('H'),          dtype=np.int32)
     k_r  = np.array(refme.column_with_label('K'),          dtype=np.int32)
     l_r  = np.array(refme.column_with_label('L'),          dtype=np.int32)
@@ -192,32 +220,28 @@ def build_sample_mtz(truth_full_pdb, refme_path, tmpdir):
     pp_r = np.array(refme.column_with_label('PHIpart'),    dtype=np.float64)
     fr_r = np.array(refme.column_with_label('FreeR_flag'), dtype=np.float32)
 
-    refme_dict = {
-        (int(h_r[i]), int(k_r[i]), int(l_r[i])): (fp_r[i], pp_r[i], fr_r[i])
-        for i in range(len(h_r))
-    }
+    n = len(h_r)
+    fp_out    = np.zeros(n, dtype=np.float32)
+    sp_out    = np.zeros(n, dtype=np.float32)
+    fr_out    = np.zeros(n, dtype=np.float32)
+    fpart_out = np.zeros(n, dtype=np.float32)
+    ppart_out = np.zeros(n, dtype=np.float32)
 
-    fp_out    = np.zeros(len(h_p), dtype=np.float32)
-    sp_out    = np.zeros(len(h_p), dtype=np.float32)
-    fr_out    = np.zeros(len(h_p), dtype=np.float32)
-    fpart_out = np.zeros(len(h_p), dtype=np.float32)
-    ppart_out = np.zeros(len(h_p), dtype=np.float32)
-
-    for i in range(len(h_p)):
-        hkl = (int(h_p[i]), int(k_p[i]), int(l_p[i]))
-        fpa, ppa, fra = refme_dict.get(hkl, (0.0, 0.0, 0.0))
-        F_bulk  = fpa * np.exp(1j * np.radians(ppa))
-        F_obs   = F_truth[i] + F_bulk
-        amp     = float(np.abs(F_obs))
+    for i in range(n):
+        hkl    = (int(h_r[i]), int(k_r[i]), int(l_r[i]))
+        F_t    = truth_dict.get(hkl, 0.0)
+        F_bulk = fp_r[i] * np.exp(1j * np.radians(pp_r[i]))
+        F_obs  = F_t + F_bulk
+        amp    = float(np.abs(F_obs))
         fp_out[i]    = amp
         sp_out[i]    = max(0.01, 0.02 * amp)
-        fr_out[i]    = float(fra)
-        fpart_out[i] = float(fpa)
-        ppart_out[i] = float(ppa)
+        fr_out[i]    = float(fr_r[i])
+        fpart_out[i] = float(fp_r[i])
+        ppart_out[i] = float(pp_r[i])
 
     out = gemmi.Mtz()
-    out.cell       = prot.cell
-    out.spacegroup = prot.spacegroup
+    out.cell       = refme.cell
+    out.spacegroup = refme.spacegroup
     out.add_dataset('HKL_base')
     for lbl in ('H', 'K', 'L'):
         out.add_column(lbl, 'H')
@@ -227,7 +251,7 @@ def build_sample_mtz(truth_full_pdb, refme_path, tmpdir):
     out.add_column('FreeR_flag', 'I')
     out.add_column('Fpart',      'F')
     out.add_column('PHIpart',    'P')
-    data = np.column_stack([h_p, k_p, l_p, fp_out, sp_out, fr_out, fpart_out, ppart_out])
+    data = np.column_stack([h_r, k_r, l_r, fp_out, sp_out, fr_out, fpart_out, ppart_out])
     out.set_data(data.astype(np.float32))
     fobs_mtz = tmpdir / 'fobs.mtz'
     out.write_to_file(str(fobs_mtz))
@@ -335,6 +359,7 @@ def generate_sample(
         # 1. Load original 48-conformer structure, apply jiggle (waters unchanged)
         st_orig = gemmi.read_structure(str(pdb_path))
         st_jig  = jiggle_structure(st_orig, shift_scale, rng_seed)
+        set_sulfur_aniso(st_jig, np.random.default_rng(rng_seed + 2))
         jig_pdb = tmpdir / 'jiggled.pdb'
         st_jig.write_pdb(str(jig_pdb))
         t = _t('jiggle', t)
