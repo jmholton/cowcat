@@ -61,11 +61,11 @@ S8_MC_THR   = 0.5
 
 # Flood water calibration: occ * sqrt(n_flood) = FLOOD_LINE_K gives Rfree ~11%
 # Grid fit: Rfree = 0.0129 * occ*sqrt(nf) + 0.0417  (R²=0.989)
-FLOOD_LINE_K    = 5.27   # occ * sqrt(n_flood) for Rfree ~11%
+FLOOD_LINE_K    = 3.50   # occ * sqrt(n_flood) for Rfree ~11% (recalibrated for wm=10)
 FLOOD_NF_MIN    = 700    # log-uniform sampling range
 FLOOD_NF_MAX    = 4000
 DEFAULT_N_FLOOD   = 1764   # used only when --vary-flood not set
-DEFAULT_FLOOD_OCC = 0.13   # used only when --vary-flood not set
+DEFAULT_FLOOD_OCC = 0.083  # used only when --vary-flood not set (3.50/sqrt(1764))
 
 # shift_scale: Gaussian B-based displacement giving ~8% ΔF/F on the 48-conformer model.
 # Calibration (Python Gaussian, B-based σ per atom):
@@ -74,7 +74,7 @@ DEFAULT_FLOOD_OCC = 0.13   # used only when --vary-flood not set
 DEFAULT_SHIFT_SCALE = 0.50
 
 # Refmac cycles for training data
-DEFAULT_NCYC = 5
+DEFAULT_NCYC = 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -287,7 +287,7 @@ def run_refmac_sample(starthere_pdb, fobs_mtz, ncyc, tmpdir, suffix=''):
     kw += b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT'
     kw += b' DELFWT=DELFWT PHDELWT=PHDELWT\n'
     kw += b'solvent no\n'
-    kw += b'weight matrix 5\n'
+    kw += b'weight matrix 10\n'
     kw += b'scpart 1\n'
     kw += b'damp 0.5 0.5\n'
     kw += b'make hout Y\n'
