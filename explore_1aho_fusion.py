@@ -47,6 +47,10 @@ DISTAL_SC = frozenset({
 # in disjoint uppercase ranges rather than upper/lower-case.
 ALL_ALT_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
+# Maximum altloc groups passed to refmac for bouquet/disulfide residues.
+# Refmac MX1ALT=20 is the hard limit; we use fewer to reduce per-cycle cost.
+BOUQUET_MAX_ALT = 8
+
 
 def adaptive_k(spread, min_k=8, max_k=48, scale=0.5):
     """k ~ spread / scale; floor=8, ceiling=48 (full ensemble)."""
@@ -378,7 +382,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             n_half = max(1, len(common) // 2)
             chosen = sorted(rng.choice(len(common), n_half, replace=False).tolist())
             common = [common[i] for i in chosen]
-        k = min(len(common), 20)
+        k = min(len(common), BOUQUET_MAX_ALT)
         # Combined SG density score for ordering
         scores = []
         for cn in common:
@@ -531,7 +535,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
                     half_idx = np.sort(rng.choice(n_conf, n_half, replace=False))
                 else:
                     half_idx = np.arange(n_conf)
-                k = min(len(half_idx), 20)
+                k = min(len(half_idx), BOUQUET_MAX_ALT)
                 half_order = half_idx[np.argsort(scores[half_idx])]
                 all_groups = [arr for arr in np.array_split(half_order, k) if len(arr) > 0]
             multi = len(all_groups) > 1
