@@ -58,11 +58,15 @@ from scipy.ndimage import uniform_filter
 
 # ── Tool paths ─────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = Path(__file__).parent.resolve()
-BUILD_N2C   = Path('/home/jamesh/projects/git/build_pdb/build_n2c.awk')
-BUILD_SIDE  = Path('/home/jamesh/projects/git/build_pdb/build_side.awk')
+# awk builders: prefer local copy in SCRIPT_DIR (works on any cluster after `git clone`)
+BUILD_N2C   = (SCRIPT_DIR / 'build_n2c.awk') if (SCRIPT_DIR / 'build_n2c.awk').exists() \
+              else Path('/home/jamesh/projects/git/build_pdb/build_n2c.awk')
+BUILD_SIDE  = (SCRIPT_DIR / 'build_side.awk') if (SCRIPT_DIR / 'build_side.awk').exists() \
+              else Path('/home/jamesh/projects/git/build_pdb/build_side.awk')
 JIGGLEPDB   = SCRIPT_DIR / 'jigglepdb.awk'
-PHENIX_GM   = Path('/programs/phenix-2.0-5936/phenix_bin/phenix.geometry_minimization')
-REFMAC5     = Path('/programs/ccp4-8.0/bin/refmac5')
+PHENIX_GM   = Path(shutil.which('phenix.geometry_minimization')
+                   or '/programs/phenix-2.0-5936/phenix_bin/phenix.geometry_minimization')
+REFMAC5     = Path(shutil.which('refmac5') or '/programs/ccp4-8.0/bin/refmac5')
 UNIQUEIFY   = 'uniqueify'
 
 # ── Crystallographic parameters ────────────────────────────────────────────────
@@ -1177,7 +1181,12 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
     rng = np.random.default_rng(seed=sample_idx if seed is None else seed)
     seq = list(rng.choice(AA_NAMES, size=n_residues, p=AA_PROBS))
 
-    tmpdir = Path(tempfile.mkdtemp(prefix=f'prot_{sample_idx:05d}_'))
+    # Use CCP4_SCR (node-local scratch) to avoid NFS traffic during CCP4 map writes.
+    ccp4_scr = Path(os.environ.get('CCP4_SCR', '/tmp'))
+    for stale in ccp4_scr.glob(f'prot_{sample_idx:05d}_*'):
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+    tmpdir = Path(tempfile.mkdtemp(prefix=f'prot_{sample_idx:05d}_', dir=ccp4_scr))
     timings = {}
     def _t(label, t_prev):
         now = time.time()
@@ -1360,7 +1369,8 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        flood_avoid_fullocc=True, shift_scale=0.5, n_altlocs=2,
                        missing_fraction=0.05, never_collected_fraction=0.05,
                        extra_b=0.0, max_array=300, seed=None, flood_occ=None,
-                       cell=None, dmin=2.0):
+                       cell=None, dmin=2.0, partition='debug', account=None,
+                       qos=None, time='00:15:00'):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     python  = sys.executable
@@ -1376,17 +1386,20 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     _cell = cell if cell is not None else (40.0, 40.0, 40.0)
     cell_line      = f'    --cell {_cell[0]} {_cell[1]} {_cell[2]} \\\n'
     dmin_line      = f'    --dmin {dmin} \\\n'
+    account_line   = f'#SBATCH --account={account}\n'    if account else ''
+    qos_line       = f'#SBATCH --qos={qos}\n'            if qos     else ''
     script_text = f"""\
 #!/bin/bash
 #SBATCH --job-name=prot_data
-#SBATCH --partition=debug
-#SBATCH --array=0-{nsamples-1}%{max_array}
+#SBATCH --partition={partition}
+{account_line}{qos_line}#SBATCH --array=0-{nsamples-1}%{max_array}
 #SBATCH --output={outdir}/logs/%A_%a.log
 #SBATCH --error={outdir}/logs/%A_%a.log
-#SBATCH --time=02:00:00
+#SBATCH --time={time}
 #SBATCH --cpus-per-task={cpus_per_task}
 
 mkdir -p {outdir}/logs
+mkdir -p "${{CCP4_SCR:-/tmp}}"
 {python} {me} \\
     --sample-id $SLURM_ARRAY_TASK_ID \\
     --outdir {outdir} \\
@@ -1431,6 +1444,14 @@ def main():
                         help='Submit a SLURM array job instead of running locally')
     parser.add_argument('--max-array',  type=int, default=300,
                         help='SLURM --array concurrency limit')
+    parser.add_argument('--partition',  default='debug',
+                        help='SLURM partition (default: debug)')
+    parser.add_argument('--account',    default=None,
+                        help='SLURM account (e.g. pc_als831)')
+    parser.add_argument('--qos',        default=None,
+                        help='SLURM QOS (e.g. lr_normal)')
+    parser.add_argument('--time',       default='00:15:00',
+                        help='SLURM walltime per task (default: 00:15:00)')
     parser.add_argument('--n-flood',     type=int,   default=0,
                         help='Number of partial-occ flood waters to add (default 0)')
     parser.add_argument('--flood-occ',   type=float, default=None,
@@ -1504,6 +1525,8 @@ def main():
             extra_b=args.extra_b, max_array=args.max_array,
             seed=args.seed, flood_occ=args.flood_occ,
             cell=CELL, dmin=DMIN,
+            partition=args.partition, account=args.account,
+            qos=args.qos, time=args.time,
         )
         sys.exit(0 if ok else 1)
 

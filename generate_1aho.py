@@ -366,7 +366,11 @@ def generate_sample(
         log_nf = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
         n_flood = int(np.round(np.exp(log_nf)))
         flood_occ = float(FLOOD_LINE_K / np.sqrt(n_flood))
-    tmpdir   = Path(tempfile.mkdtemp(prefix=f'1aho_{sample_idx:05d}_'))
+    ccp4_scr = Path(os.environ.get('CCP4_SCR', '/tmp'))
+    for stale in ccp4_scr.glob(f'1aho_{sample_idx:05d}_*'):
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+    tmpdir   = Path(tempfile.mkdtemp(prefix=f'1aho_{sample_idx:05d}_', dir=ccp4_scr))
     timings  = {}
 
     def _t(label, t_prev):
@@ -522,7 +526,8 @@ def generate_sample(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood,
-                       flood_occ, vary_flood, ncyc, max_array, seed, partition):
+                       flood_occ, vary_flood, ncyc, max_array, seed, partition,
+                       account=None, qos=None, time='00:20:00'):
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     me     = Path(__file__).resolve()
 
@@ -530,6 +535,8 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
         f'  --n-flood {n_flood} \\',
         f'  --flood-occ {flood_occ} \\',
     ]
+    account_line = f'#SBATCH --account={account}\n' if account else ''
+    qos_line     = f'#SBATCH --qos={qos}\n'         if qos     else ''
 
     lines = [
         '#!/bin/bash',
@@ -539,8 +546,12 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
         '#SBATCH --cpus-per-task=1',
         '#SBATCH --mem=4G',
         f'#SBATCH --partition={partition}',
+        f'#SBATCH --time={time}',
+    ] + ([f'#SBATCH --account={account}'] if account else []) \
+      + ([f'#SBATCH --qos={qos}']         if qos     else []) + [
         '#SBATCH --export=ALL',
         '',
+        'mkdir -p "${CCP4_SCR:-/tmp}"',
         'IDX=$SLURM_ARRAY_TASK_ID',
         f'ccp4-python {me} \\',
         f'  --sample-id $IDX \\',
@@ -585,6 +596,12 @@ def main():
     ap.add_argument('--workers',     type=int,   default=1)
     ap.add_argument('--max-array',   type=int,   default=300)
     ap.add_argument('--partition',   default='debug')
+    ap.add_argument('--account',     default=None,
+                    help='SLURM account (e.g. pc_als831)')
+    ap.add_argument('--qos',         default=None,
+                    help='SLURM QOS (e.g. lr_normal)')
+    ap.add_argument('--time',        default='00:20:00',
+                    help='SLURM walltime per task (default: 00:20:00)')
     ap.add_argument('--submit',      action='store_true')
     ap.add_argument('--debug',       action='store_true')
     args = ap.parse_args()
@@ -600,6 +617,7 @@ def main():
             args.nsamples, outdir, pdb_path, mtz_path, obs_mtz_path,
             args.shift_scale, args.n_flood, args.flood_occ, args.vary_flood,
             args.ncyc, args.max_array, args.seed, args.partition,
+            account=args.account, qos=args.qos, time=args.time,
         )
         return
 
