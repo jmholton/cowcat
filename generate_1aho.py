@@ -436,16 +436,6 @@ def generate_sample(
         )
         t = _t('refmac', t)
 
-        # 7b. Second refmac run with no flood waters (same partial model, bulk-only Fobs)
-        noflood_pdb   = tmpdir / 'truth_noflood.pdb'
-        st_jig.write_pdb(str(noflood_pdb))   # jiggled protein + 258 waters, no flood chain
-        fobs_noflood, _ = build_sample_mtz(noflood_pdb, mtz_path, obs_mtz_path, tmpdir,
-                                           suffix='_noflood')
-        _, _, log_nf, out_mtz_nf = run_refmac_sample(
-            starthere_pdb, fobs_noflood, ncyc, tmpdir, suffix='_noflood'
-        )
-        t = _t('refmac_noflood', t)
-
         # 8. Write maps
         sample_dir.mkdir(parents=True, exist_ok=True)
         mtz_to_ccp4(truth_mtz,  'FC',     'PHIC',     sample_dir / 'truth.map')
@@ -453,10 +443,6 @@ def generate_sample(
             mtz_to_ccp4(out_mtz, 'FWT',    'PHWT',     sample_dir / '2fofc.map')
             mtz_to_ccp4(out_mtz, 'DELFWT', 'PHDELWT',  sample_dir / 'fofc.map')
             mtz_to_ccp4(out_mtz, 'FC',     'PHIC',     sample_dir / 'fc.map')
-        if out_mtz_nf:
-            mtz_to_ccp4(out_mtz_nf, 'FWT',    'PHWT',    sample_dir / '2fofc_nf.map')
-            mtz_to_ccp4(out_mtz_nf, 'DELFWT', 'PHDELWT', sample_dir / 'fofc_nf.map')
-            mtz_to_ccp4(out_mtz_nf, 'FC',     'PHIC',    sample_dir / 'fc_nf.map')
         t = _t('maps', t)
 
         # 9. Copy useful files
@@ -468,10 +454,6 @@ def generate_sample(
         out_pdb = tmpdir / 'refmacout.pdb'
         if out_pdb.exists():
             shutil.copy2(out_pdb, sample_dir / 'refmacout.pdb')
-        if log_nf:
-            (sample_dir / 'refmac_nf.log').write_text(log_nf)
-        if out_mtz_nf:
-            shutil.copy2(out_mtz_nf, sample_dir / 'refmacout_nf.mtz')
 
         if debug:
             dbg = sample_dir / 'debug'
