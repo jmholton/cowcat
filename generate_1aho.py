@@ -74,7 +74,7 @@ DEFAULT_FLOOD_OCC = 0.13   # used only when --vary-flood not set
 DEFAULT_SHIFT_SCALE = 0.50
 
 # Refmac cycles for training data
-DEFAULT_NCYC = 10
+DEFAULT_NCYC = 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +298,7 @@ def run_refmac_sample(starthere_pdb, fobs_mtz, ncyc, tmpdir, suffix=''):
 
     out_mtz  = tmpdir / f'refmacout{suffix}.mtz'
     out_pdb  = tmpdir / f'refmacout{suffix}.pdb'
+    tmpdir.mkdir(parents=True, exist_ok=True)  # guard against transient cleanup
 
     try:
         r = subprocess.run(
@@ -553,7 +554,7 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
         '',
         'mkdir -p "${CCP4_SCR:-/tmp}"',
         'IDX=$SLURM_ARRAY_TASK_ID',
-        f'ccp4-python {me} \\',
+        f'{sys.executable} {me} \\',
         f'  --sample-id $IDX \\',
         f'  --outdir {outdir} \\',
         f'  --pdb {pdb} \\',
