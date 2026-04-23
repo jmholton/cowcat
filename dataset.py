@@ -116,6 +116,14 @@ class ElectronDensityDataset(Dataset):
         x   = torch.from_numpy(x.copy())
         y   = torch.from_numpy(tgt[np.newaxis].copy())      # (1, D, H, W)
         s   = torch.tensor(log_scale, dtype=torch.float32)  # scalar
+
+        # Random periodic translation — exact for P1 maps (wrap-around is correct BC).
+        # ch3 (cross-Patterson) is translation-invariant: P(M(·-d), N(·-d)) = P(M,N).
+        # Only roll channels 0-2; ch3 stays at its natural (unshifted) state.
+        shifts = [int(np.random.randint(0, d)) for d in x.shape[1:]]
+        x = torch.cat([torch.roll(x[:3], shifts, dims=[1, 2, 3]), x[3:]], dim=0)
+        y = torch.roll(y, shifts, dims=[1, 2, 3])
+
         return x, y, s
 
 
@@ -144,11 +152,14 @@ class PackedDataset(Dataset):
                 x = np.flip(x, axis=spatial_axis + 1)
                 y = np.flip(y, axis=spatial_axis + 1)
 
-        shifts = [np.random.randint(s) for s in x.shape[1:]]
-        x = np.roll(x, shifts, axis=(1, 2, 3))
-        y = np.roll(y, shifts, axis=(1, 2, 3))
+        x = torch.from_numpy(x.copy())
+        y = torch.from_numpy(y.copy())
 
-        return torch.from_numpy(x.copy()), torch.from_numpy(y.copy())
+        shifts = [int(np.random.randint(0, d)) for d in x.shape[1:]]
+        x = torch.cat([torch.roll(x[:3], shifts, dims=[1, 2, 3]), x[3:]], dim=0)
+        y = torch.roll(y, shifts, dims=[1, 2, 3])
+
+        return x, y
 
 
 def make_splits(data_dir, val_fraction=0.2, seed=42):

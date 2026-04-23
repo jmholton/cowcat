@@ -59,9 +59,13 @@ S8_STRATEGY = ('cluster_k3', 'cluster_k8', 'cluster_k3', 'adaptive')
 S8_BOUQ_THR = 1.5
 S8_MC_THR   = 0.5
 
-# Flood water calibration: n_flood × occ → 8% rms noise on FP
-DEFAULT_N_FLOOD   = 1764
-DEFAULT_FLOOD_OCC = 0.09
+# Flood water calibration: occ * sqrt(n_flood) = FLOOD_LINE_K gives Rfree ~11%
+# Grid fit: Rfree = 0.0129 * occ*sqrt(nf) + 0.0417  (R²=0.989)
+FLOOD_LINE_K    = 5.27   # occ * sqrt(n_flood) for Rfree ~11%
+FLOOD_NF_MIN    = 700    # log-uniform sampling range
+FLOOD_NF_MAX    = 4000
+DEFAULT_N_FLOOD   = 1764   # used only when --vary-flood not set
+DEFAULT_FLOOD_OCC = 0.13   # used only when --vary-flood not set
 
 # shift_scale: Gaussian B-based displacement giving ~8% ΔF/F on the 48-conformer model.
 # Calibration (Python Gaussian, B-based σ per atom):
@@ -340,6 +344,7 @@ def generate_sample(
     shift_scale=DEFAULT_SHIFT_SCALE,
     n_flood=DEFAULT_N_FLOOD,
     flood_occ=DEFAULT_FLOOD_OCC,
+    vary_flood=False,
     ncyc=DEFAULT_NCYC,
     seed=None,
     debug=False,
@@ -356,6 +361,11 @@ def generate_sample(
         return sample_idx, True, 'already done'
 
     rng_seed = sample_idx if seed is None else seed + sample_idx
+    if vary_flood:
+        rng_flood = np.random.default_rng(rng_seed + 4)
+        log_nf = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
+        n_flood = int(np.round(np.exp(log_nf)))
+        flood_occ = float(FLOOD_LINE_K / np.sqrt(n_flood))
     tmpdir   = Path(tempfile.mkdtemp(prefix=f'1aho_{sample_idx:05d}_'))
     timings  = {}
 
@@ -512,9 +522,14 @@ def generate_sample(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood,
-                       flood_occ, ncyc, max_array, seed, partition):
+                       flood_occ, vary_flood, ncyc, max_array, seed, partition):
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     me     = Path(__file__).resolve()
+
+    flood_args = ['  --vary-flood \\'] if vary_flood else [
+        f'  --n-flood {n_flood} \\',
+        f'  --flood-occ {flood_occ} \\',
+    ]
 
     lines = [
         '#!/bin/bash',
@@ -534,8 +549,7 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
         f'  --mtz {mtz} \\',
         f'  --obs-mtz {obs_mtz} \\',
         f'  --shift-scale {shift_scale} \\',
-        f'  --n-flood {n_flood} \\',
-        f'  --flood-occ {flood_occ} \\',
+    ] + flood_args + [
         f'  --ncyc {ncyc} \\',
         f'  --seed {seed}',
         '',
@@ -563,6 +577,9 @@ def main():
     ap.add_argument('--shift-scale', type=float, default=DEFAULT_SHIFT_SCALE)
     ap.add_argument('--n-flood',     type=int,   default=DEFAULT_N_FLOOD)
     ap.add_argument('--flood-occ',   type=float, default=DEFAULT_FLOOD_OCC)
+    ap.add_argument('--vary-flood',  action='store_true',
+                    help='Sample n_flood log-uniformly [%d,%d] per sample; occ=%.2f/sqrt(nf)'
+                         % (FLOOD_NF_MIN, FLOOD_NF_MAX, FLOOD_LINE_K))
     ap.add_argument('--ncyc',        type=int,   default=DEFAULT_NCYC)
     ap.add_argument('--seed',        type=int,   default=42)
     ap.add_argument('--workers',     type=int,   default=1)
@@ -581,7 +598,7 @@ def main():
         outdir.mkdir(parents=True, exist_ok=True)
         submit_slurm_array(
             args.nsamples, outdir, pdb_path, mtz_path, obs_mtz_path,
-            args.shift_scale, args.n_flood, args.flood_occ,
+            args.shift_scale, args.n_flood, args.flood_occ, args.vary_flood,
             args.ncyc, args.max_array, args.seed, args.partition,
         )
         return
@@ -595,7 +612,8 @@ def main():
         pdb_path=pdb_path, mtz_path=mtz_path, obs_mtz_path=obs_mtz_path,
         density_grid=density_grid,
         shift_scale=args.shift_scale, n_flood=args.n_flood,
-        flood_occ=args.flood_occ, ncyc=args.ncyc, seed=args.seed,
+        flood_occ=args.flood_occ, vary_flood=args.vary_flood,
+        ncyc=args.ncyc, seed=args.seed,
         debug=args.debug,
     )
 
