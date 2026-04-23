@@ -184,7 +184,7 @@ def add_hoh_chains_to_pdb(st_source, pdb_path):
 # SF / MTZ construction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_sample_mtz(truth_full_pdb, refme_path, obs_mtz_path, tmpdir):
+def build_sample_mtz(truth_full_pdb, refme_path, obs_mtz_path, tmpdir, suffix=''):
     """Build fobs.mtz and truth.mtz for one training sample.
 
     truth_full_pdb: jiggled protein + structural waters + flood waters.
@@ -194,7 +194,7 @@ def build_sample_mtz(truth_full_pdb, refme_path, obs_mtz_path, tmpdir):
 
     Returns (fobs_mtz_path, truth_mtz_path).
     """
-    truth_sf_mtz = tmpdir / '_truth_sf.mtz'
+    truth_sf_mtz = tmpdir / f'_truth_sf{suffix}.mtz'
     subprocess.run(
         ['gemmi', 'sfcalc', f'--dmin={DMIN}', f'--to-mtz={truth_sf_mtz}', str(truth_full_pdb)],
         capture_output=True, check=True,
@@ -265,7 +265,7 @@ def build_sample_mtz(truth_full_pdb, refme_path, obs_mtz_path, tmpdir):
     out.add_column('Fpart',      'F')
     out.add_column('PHIpart',    'P')
     out.set_data(data)
-    fobs_mtz = tmpdir / 'fobs.mtz'
+    fobs_mtz = tmpdir / f'fobs{suffix}.mtz'
     out.write_to_file(str(fobs_mtz))
 
     return fobs_mtz, truth_sf_mtz
@@ -275,7 +275,7 @@ def build_sample_mtz(truth_full_pdb, refme_path, obs_mtz_path, tmpdir):
 # Refmac
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_refmac_sample(starthere_pdb, fobs_mtz, ncyc, tmpdir):
+def run_refmac_sample(starthere_pdb, fobs_mtz, ncyc, tmpdir, suffix=''):
     """Run refmac; return (R, Rfree, log_text, out_mtz_path or None)."""
     os.makedirs(os.environ.get('CCP4_SCR', '/tmp'), exist_ok=True)
 
@@ -292,8 +292,8 @@ def run_refmac_sample(starthere_pdb, fobs_mtz, ncyc, tmpdir):
     kw += generate_occ_groups(starthere_pdb)
     kw += b'END\n'
 
-    out_mtz  = tmpdir / 'refmacout.mtz'
-    out_pdb  = tmpdir / 'refmacout.pdb'
+    out_mtz  = tmpdir / f'refmacout{suffix}.mtz'
+    out_pdb  = tmpdir / f'refmacout{suffix}.pdb'
 
     try:
         r = subprocess.run(
@@ -302,7 +302,7 @@ def run_refmac_sample(starthere_pdb, fobs_mtz, ncyc, tmpdir):
              'XYZOUT', str(out_pdb),
              'HKLIN',  str(fobs_mtz),
              'HKLOUT', str(out_mtz),
-             'LIBOUT', str(tmpdir / '_refmac.lib')],
+             'LIBOUT', str(tmpdir / f'_refmac{suffix}.lib')],
             input=kw,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             cwd=str(tmpdir),
@@ -311,9 +311,9 @@ def run_refmac_sample(starthere_pdb, fobs_mtz, ncyc, tmpdir):
         log = r.stdout.decode(errors='replace')
     except subprocess.TimeoutExpired as e:
         log = (e.stdout or b'').decode(errors='replace') + '\nTIMEOUT after 1800s\n'
-        (tmpdir / 'refmac.log').write_text(log)
+        (tmpdir / f'refmac{suffix}.log').write_text(log)
         return None, None, log, None
-    (tmpdir / 'refmac.log').write_text(log)
+    (tmpdir / f'refmac{suffix}.log').write_text(log)
     rwork, rfree = parse_rfactors(log)
     return rwork, rfree, log, (out_mtz if out_mtz.exists() else None)
 
@@ -409,16 +409,27 @@ def generate_sample(
             bouquet_threshold=S8_BOUQ_THR,
             mc_bouq_threshold=S8_MC_THR,
             out_pdb=starthere_pdb, tmpdir=tmpdir,
+            rng=np.random.default_rng(rng_seed + 3),
         )
         # Add structural waters (from jiggled model — identical to original since HOH not jiggled)
         add_hoh_chains_to_pdb(st_jig_r, starthere_pdb)
         t = _t('build_partial', t)
 
-        # 7. Refmac
+        # 7a. Refmac with flood waters
         rwork, rfree, log, out_mtz = run_refmac_sample(
             starthere_pdb, fobs_mtz, ncyc, tmpdir
         )
         t = _t('refmac', t)
+
+        # 7b. Second refmac run with no flood waters (same partial model, bulk-only Fobs)
+        noflood_pdb   = tmpdir / 'truth_noflood.pdb'
+        st_jig.write_pdb(str(noflood_pdb))   # jiggled protein + 258 waters, no flood chain
+        fobs_noflood, _ = build_sample_mtz(noflood_pdb, mtz_path, obs_mtz_path, tmpdir,
+                                           suffix='_noflood')
+        _, _, log_nf, out_mtz_nf = run_refmac_sample(
+            starthere_pdb, fobs_noflood, ncyc, tmpdir, suffix='_noflood'
+        )
+        t = _t('refmac_noflood', t)
 
         # 8. Write maps
         sample_dir.mkdir(parents=True, exist_ok=True)
@@ -427,6 +438,10 @@ def generate_sample(
             mtz_to_ccp4(out_mtz, 'FWT',    'PHWT',     sample_dir / '2fofc.map')
             mtz_to_ccp4(out_mtz, 'DELFWT', 'PHDELWT',  sample_dir / 'fofc.map')
             mtz_to_ccp4(out_mtz, 'FC',     'PHIC',     sample_dir / 'fc.map')
+        if out_mtz_nf:
+            mtz_to_ccp4(out_mtz_nf, 'FWT',    'PHWT',    sample_dir / '2fofc_nf.map')
+            mtz_to_ccp4(out_mtz_nf, 'DELFWT', 'PHDELWT', sample_dir / 'fofc_nf.map')
+            mtz_to_ccp4(out_mtz_nf, 'FC',     'PHIC',    sample_dir / 'fc_nf.map')
         t = _t('maps', t)
 
         # 9. Copy useful files
@@ -438,6 +453,10 @@ def generate_sample(
         out_pdb = tmpdir / 'refmacout.pdb'
         if out_pdb.exists():
             shutil.copy2(out_pdb, sample_dir / 'refmacout.pdb')
+        if log_nf:
+            (sample_dir / 'refmac_nf.log').write_text(log_nf)
+        if out_mtz_nf:
+            shutil.copy2(out_mtz_nf, sample_dir / 'refmacout_nf.mtz')
 
         if debug:
             dbg = sample_dir / 'debug'
