@@ -155,7 +155,7 @@ END{
 	i = n_of[Build_atom[build,1]];
 	j = n_of[Build_atom[build,2]];
 	k = n_of[Build_atom[build,3]];
-	if(k != a) print "WHAT THE FUCK? "
+	if(k != a) print "WHAT THE FRAK? "
 
 	if(i == "" || j == "" || k == "")
 	{
