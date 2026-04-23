@@ -50,8 +50,9 @@ DMIN       = 0.965
 SAMPLE_RATE = 3.0
 
 # Default 1AHO source files (relative to SCRIPT_DIR or absolute)
-DEFAULT_PDB = SCRIPT_DIR / '1aho' / 'refmacout_minRfree.pdb'
-DEFAULT_MTZ = SCRIPT_DIR / '1aho' / 'refme_minRfree.mtz'
+DEFAULT_PDB     = SCRIPT_DIR / '1aho' / 'refmacout_minRfree.pdb'
+DEFAULT_MTZ     = SCRIPT_DIR / '1aho' / 'refme_minRfree.mtz'
+DEFAULT_OBS_MTZ = SCRIPT_DIR / '1aho' / '1aho.mtz'   # real data: valid HKL mask + FreeR_flag
 
 # Strategy S8: best from exploration
 S8_STRATEGY = ('cluster_k3', 'cluster_k8', 'cluster_k3', 'adaptive')
@@ -183,12 +184,13 @@ def add_hoh_chains_to_pdb(st_source, pdb_path):
 # SF / MTZ construction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_sample_mtz(truth_full_pdb, refme_path, tmpdir):
+def build_sample_mtz(truth_full_pdb, refme_path, obs_mtz_path, tmpdir):
     """Build fobs.mtz and truth.mtz for one training sample.
 
-    truth_full_pdb includes jiggled protein + structural waters + flood waters.
+    truth_full_pdb: jiggled protein + structural waters + flood waters.
     truth.mtz: FC/PHIC = sfcalc(truth_full_pdb)  (no bulk solvent)
-    fobs.mtz:  FP = |F_truth + F_bulk|, Fpart = F_bulk only
+    fobs.mtz:  FP = |F_truth + F_bulk|, using obs_mtz_path for valid HKL mask
+               and FreeR_flag; refme_path for Fpart/PHIpart.
 
     Returns (fobs_mtz_path, truth_mtz_path).
     """
@@ -200,6 +202,7 @@ def build_sample_mtz(truth_full_pdb, refme_path, tmpdir):
 
     prot  = gemmi.read_mtz_file(str(truth_sf_mtz))
     refme = gemmi.read_mtz_file(str(refme_path))
+    obs   = gemmi.read_mtz_file(str(obs_mtz_path))
 
     h_p  = np.array(prot.column_with_label('H'),    dtype=np.int32)
     k_p  = np.array(prot.column_with_label('K'),    dtype=np.int32)
@@ -212,36 +215,43 @@ def build_sample_mtz(truth_full_pdb, refme_path, tmpdir):
         for i in range(len(h_p))
     }
 
-    # Use refme HKL set as the reference — matches 1aho.mtz coverage exactly
-    h_r  = np.array(refme.column_with_label('H'),          dtype=np.int32)
-    k_r  = np.array(refme.column_with_label('K'),          dtype=np.int32)
-    l_r  = np.array(refme.column_with_label('L'),          dtype=np.int32)
-    fp_r = np.array(refme.column_with_label('Fpart'),      dtype=np.float64)
-    pp_r = np.array(refme.column_with_label('PHIpart'),    dtype=np.float64)
-    fr_r = np.array(refme.column_with_label('FreeR_flag'), dtype=np.float32)
+    # Fpart/PHIpart from refme
+    h_r  = np.array(refme.column_with_label('H'),       dtype=np.int32)
+    k_r  = np.array(refme.column_with_label('K'),       dtype=np.int32)
+    l_r  = np.array(refme.column_with_label('L'),       dtype=np.int32)
+    fp_r = np.array(refme.column_with_label('Fpart'),   dtype=np.float64)
+    pp_r = np.array(refme.column_with_label('PHIpart'), dtype=np.float64)
+    fpart_dict = {
+        (int(h_r[i]), int(k_r[i]), int(l_r[i])): (fp_r[i], pp_r[i])
+        for i in range(len(h_r))
+    }
 
-    n = len(h_r)
-    fp_out    = np.zeros(n, dtype=np.float32)
-    sp_out    = np.zeros(n, dtype=np.float32)
-    fr_out    = np.zeros(n, dtype=np.float32)
-    fpart_out = np.zeros(n, dtype=np.float32)
-    ppart_out = np.zeros(n, dtype=np.float32)
+    # HKL mask + FreeR_flag from obs (1aho.mtz): only keep non-NaN rows
+    h_o  = np.array(obs.column_with_label('H'),          dtype=np.int32)
+    k_o  = np.array(obs.column_with_label('K'),          dtype=np.int32)
+    l_o  = np.array(obs.column_with_label('L'),          dtype=np.int32)
+    fp_o = np.array(obs.column_with_label('FP'),         dtype=np.float32)
+    fr_o = np.array(obs.column_with_label('FreeR_flag'), dtype=np.float32)
+    valid = ~np.isnan(fp_o)
 
-    for i in range(n):
-        hkl    = (int(h_r[i]), int(k_r[i]), int(l_r[i]))
-        F_t    = truth_dict.get(hkl, 0.0)
-        F_bulk = fp_r[i] * np.exp(1j * np.radians(pp_r[i]))
+    rows = []
+    for i in range(len(h_o)):
+        if not valid[i]:
+            continue
+        hkl  = (int(h_o[i]), int(k_o[i]), int(l_o[i]))
+        F_t  = truth_dict.get(hkl, 0.0)
+        fpa, ppa = fpart_dict.get(hkl, (0.0, 0.0))
+        F_bulk = fpa * np.exp(1j * np.radians(ppa))
         F_obs  = F_t + F_bulk
         amp    = float(np.abs(F_obs))
-        fp_out[i]    = amp
-        sp_out[i]    = max(0.01, 0.02 * amp)
-        fr_out[i]    = float(fr_r[i])
-        fpart_out[i] = float(fp_r[i])
-        ppart_out[i] = float(pp_r[i])
+        rows.append((h_o[i], k_o[i], l_o[i],
+                     amp, max(0.01, 0.02 * amp), float(fr_o[i]),
+                     float(fpa), float(ppa)))
 
+    data = np.array(rows, dtype=np.float32)
     out = gemmi.Mtz()
-    out.cell       = refme.cell
-    out.spacegroup = refme.spacegroup
+    out.cell       = obs.cell
+    out.spacegroup = obs.spacegroup
     out.add_dataset('HKL_base')
     for lbl in ('H', 'K', 'L'):
         out.add_column(lbl, 'H')
@@ -251,12 +261,10 @@ def build_sample_mtz(truth_full_pdb, refme_path, tmpdir):
     out.add_column('FreeR_flag', 'I')
     out.add_column('Fpart',      'F')
     out.add_column('PHIpart',    'P')
-    data = np.column_stack([h_r, k_r, l_r, fp_out, sp_out, fr_out, fpart_out, ppart_out])
-    out.set_data(data.astype(np.float32))
+    out.set_data(data)
     fobs_mtz = tmpdir / 'fobs.mtz'
     out.write_to_file(str(fobs_mtz))
 
-    # truth.mtz is just the sfcalc output (FC/PHIC already there)
     return fobs_mtz, truth_sf_mtz
 
 
@@ -325,7 +333,7 @@ def mtz_to_ccp4(mtz_path, f_col, phi_col, out_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_sample(
-    sample_idx, outdir, pdb_path, mtz_path, density_grid,
+    sample_idx, outdir, pdb_path, mtz_path, obs_mtz_path, density_grid,
     shift_scale=DEFAULT_SHIFT_SCALE,
     n_flood=DEFAULT_N_FLOOD,
     flood_occ=DEFAULT_FLOOD_OCC,
@@ -386,7 +394,7 @@ def generate_sample(
         t = _t('flood_waters', t)
 
         # 5. Build fobs.mtz (FP = |F_truth + F_bulk|) and truth.mtz (sfcalc of truth_full.pdb)
-        fobs_mtz, truth_mtz = build_sample_mtz(truth_pdb, mtz_path, tmpdir)
+        fobs_mtz, truth_mtz = build_sample_mtz(truth_pdb, mtz_path, obs_mtz_path, tmpdir)
         t = _t('build_mtz', t)
 
         # 6. Build partial model using S8 strategy + append 258 structural waters
@@ -481,7 +489,7 @@ def generate_sample(
 # SLURM submission
 # ─────────────────────────────────────────────────────────────────────────────
 
-def submit_slurm_array(nsamples, outdir, pdb, mtz, shift_scale, n_flood,
+def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood,
                        flood_occ, ncyc, max_array, seed, partition):
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     me     = Path(__file__).resolve()
@@ -502,6 +510,7 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, shift_scale, n_flood,
         f'  --outdir {outdir} \\',
         f'  --pdb {pdb} \\',
         f'  --mtz {mtz} \\',
+        f'  --obs-mtz {obs_mtz} \\',
         f'  --shift-scale {shift_scale} \\',
         f'  --n-flood {n_flood} \\',
         f'  --flood-occ {flood_occ} \\',
@@ -524,6 +533,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--pdb',         default=str(DEFAULT_PDB))
     ap.add_argument('--mtz',         default=str(DEFAULT_MTZ))
+    ap.add_argument('--obs-mtz',     default=str(DEFAULT_OBS_MTZ))
     ap.add_argument('--outdir',      default='data_1aho')
     ap.add_argument('--nsamples',    type=int, default=1000)
     ap.add_argument('--sample-id',   type=int, default=None,
@@ -540,14 +550,15 @@ def main():
     ap.add_argument('--debug',       action='store_true')
     args = ap.parse_args()
 
-    pdb_path = Path(args.pdb).resolve()
-    mtz_path = Path(args.mtz).resolve()
-    outdir   = Path(args.outdir).resolve()
+    pdb_path     = Path(args.pdb).resolve()
+    mtz_path     = Path(args.mtz).resolve()
+    obs_mtz_path = Path(args.obs_mtz).resolve()
+    outdir       = Path(args.outdir).resolve()
 
     if args.submit:
         outdir.mkdir(parents=True, exist_ok=True)
         submit_slurm_array(
-            args.nsamples, outdir, pdb_path, mtz_path,
+            args.nsamples, outdir, pdb_path, mtz_path, obs_mtz_path,
             args.shift_scale, args.n_flood, args.flood_occ,
             args.ncyc, args.max_array, args.seed, args.partition,
         )
@@ -559,7 +570,8 @@ def main():
     density_grid = load_density_map(str(refmac_mtz))
 
     common_kw = dict(
-        pdb_path=pdb_path, mtz_path=mtz_path, density_grid=density_grid,
+        pdb_path=pdb_path, mtz_path=mtz_path, obs_mtz_path=obs_mtz_path,
+        density_grid=density_grid,
         shift_scale=args.shift_scale, n_flood=args.n_flood,
         flood_occ=args.flood_occ, ncyc=args.ncyc, seed=args.seed,
         debug=args.debug,
