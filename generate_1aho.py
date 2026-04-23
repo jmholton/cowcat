@@ -68,8 +68,8 @@ DEFAULT_FLOOD_OCC = 0.05
 # Linear extrapolation to 8%: ss ≈ 0.50.  The 48 conformers average out noise by ~√48.
 DEFAULT_SHIFT_SCALE = 0.50
 
-# Refmac cycles for training data (shorter than exploration's NCYC 50)
-DEFAULT_NCYC = 50
+# Refmac cycles for training data
+DEFAULT_NCYC = 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,25 +96,6 @@ def jiggle_structure(st, shift_scale, seed):
     return st2
 
 
-def write_protein_only_pdb(st, out_path):
-    """Write PDB with all residues (protein + structural waters) for sfcalc.
-    Returns list of protein chain names (HOH-only chains excluded from list)."""
-    st2 = gemmi.Structure()
-    st2.cell = st.cell
-    st2.spacegroup_hm = st.spacegroup_hm
-    mdl = gemmi.Model('1')
-    chain_names = []
-    for chain in st[0]:
-        ch2 = gemmi.Chain(chain.name)
-        for res in chain:
-            ch2.add_residue(res.clone())
-        mdl.add_chain(ch2)
-        if any(res.name not in ('HOH', 'WAT', 'H2O') for res in chain):
-            chain_names.append(chain.name)
-    st2.add_model(mdl)
-    st2.write_pdb(str(out_path))
-    return chain_names
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Flood waters
@@ -126,7 +107,6 @@ def place_flood_waters(cell, existing_xyzs, n_flood, occ, seed, min_dist=2.0):
     Positions are random in the unit cell, avoiding existing atoms by min_dist Å.
     """
     rng = np.random.default_rng(seed)
-    a, b, c = cell.a, cell.b, cell.c
     existing = np.array(existing_xyzs) if existing_xyzs else np.zeros((0, 3))
 
     positions = []
@@ -134,7 +114,6 @@ def place_flood_waters(cell, existing_xyzs, n_flood, occ, seed, min_dist=2.0):
     for _ in range(max_attempts):
         if len(positions) >= n_flood:
             break
-        # Random fractional coord → Cartesian (P1, orthogonal)
         frac = rng.random(3)
         pos  = gemmi.Fractional(*frac)
         xyz  = cell.orthogonalize(pos)
@@ -148,16 +127,10 @@ def place_flood_waters(cell, existing_xyzs, n_flood, occ, seed, min_dist=2.0):
     return np.array(positions[:n_flood])
 
 
-def flood_sf_dict(positions, occ, cell, spacegroup_hm, tmpdir):
-    """Compute SFs for a set of water positions; return {(h,k,l): complex_F}."""
-    if len(positions) == 0:
-        return {}
-
-    st_w = gemmi.Structure()
-    st_w.cell = cell
-    st_w.spacegroup_hm = spacegroup_hm
-    mdl = gemmi.Model('1')
-    ch  = gemmi.Chain('W')
+def add_flood_chain(st, positions, occ, chain_name='W'):
+    """Add flood water atoms to a cloned structure; return the new structure."""
+    st2 = st.clone()
+    ch  = gemmi.Chain(chain_name)
     for i, (x, y, z) in enumerate(positions):
         res = gemmi.Residue()
         res.name  = 'HOH'
@@ -170,48 +143,39 @@ def flood_sf_dict(positions, occ, cell, spacegroup_hm, tmpdir):
         a.b_iso   = 20.0
         res.add_atom(a)
         ch.add_residue(res)
-    mdl.add_chain(ch)
-    st_w.add_model(mdl)
+    st2[0].add_chain(ch)
+    return st2
 
-    flood_pdb = tmpdir / '_flood.pdb'
-    flood_mtz = tmpdir / '_flood.mtz'
-    st_w.write_pdb(str(flood_pdb))
 
-    subprocess.run(
-        ['gemmi', 'sfcalc', f'--dmin={DMIN}', f'--to-mtz={flood_mtz}', str(flood_pdb)],
-        capture_output=True, check=True,
-    )
-
-    m  = gemmi.read_mtz_file(str(flood_mtz))
-    h  = np.array(m.column_with_label('H'),    dtype=np.int32)
-    k  = np.array(m.column_with_label('K'),    dtype=np.int32)
-    l  = np.array(m.column_with_label('L'),    dtype=np.int32)
-    fc = np.array(m.column_with_label('FC'),   dtype=np.float64)
-    ph = np.array(m.column_with_label('PHIC'), dtype=np.float64)
-    F  = fc * np.exp(1j * np.radians(ph))
-    return {(int(h[i]), int(k[i]), int(l[i])): F[i] for i in range(len(h))}
+def add_hoh_chains_to_pdb(st_source, pdb_path):
+    """Append all HOH-only chains from st_source into the PDB at pdb_path (in place)."""
+    st = gemmi.read_structure(str(pdb_path))
+    for chain in st_source[0]:
+        if all(res.name in ('HOH', 'WAT', 'H2O') for res in chain):
+            st[0].add_chain(chain.clone())
+    st.write_pdb(str(pdb_path))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SF / MTZ construction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_sample_mtz(prot_only_pdb, refme_path, flood_dict, tmpdir):
+def build_sample_mtz(truth_full_pdb, refme_path, tmpdir):
     """Build fobs.mtz and truth.mtz for one training sample.
 
-    fobs.mtz: FP, SIGFP, FreeR_flag, Fpart, PHIpart
-    truth.mtz: FC (= FP), PHIC (= phase of total F)
+    truth_full_pdb includes jiggled protein + structural waters + flood waters.
+    truth.mtz: FC/PHIC = sfcalc(truth_full_pdb)  (no bulk solvent)
+    fobs.mtz:  FP = |F_truth + F_bulk|, Fpart = F_bulk only
 
     Returns (fobs_mtz_path, truth_mtz_path).
     """
-    # Protein SFs
-    prot_mtz = tmpdir / '_prot_sf.mtz'
+    truth_sf_mtz = tmpdir / '_truth_sf.mtz'
     subprocess.run(
-        ['gemmi', 'sfcalc', f'--dmin={DMIN}', f'--to-mtz={prot_mtz}', str(prot_only_pdb)],
+        ['gemmi', 'sfcalc', f'--dmin={DMIN}', f'--to-mtz={truth_sf_mtz}', str(truth_full_pdb)],
         capture_output=True, check=True,
     )
 
-    prot = gemmi.read_mtz_file(str(prot_mtz))
+    prot  = gemmi.read_mtz_file(str(truth_sf_mtz))
     refme = gemmi.read_mtz_file(str(refme_path))
 
     h_p  = np.array(prot.column_with_label('H'),    dtype=np.int32)
@@ -219,13 +183,13 @@ def build_sample_mtz(prot_only_pdb, refme_path, flood_dict, tmpdir):
     l_p  = np.array(prot.column_with_label('L'),    dtype=np.int32)
     fc_p = np.array(prot.column_with_label('FC'),   dtype=np.float64)
     ph_p = np.array(prot.column_with_label('PHIC'), dtype=np.float64)
-    F_prot = fc_p * np.exp(1j * np.radians(ph_p))
+    F_truth = fc_p * np.exp(1j * np.radians(ph_p))
 
-    h_r  = np.array(refme.column_with_label('H'),        dtype=np.int32)
-    k_r  = np.array(refme.column_with_label('K'),        dtype=np.int32)
-    l_r  = np.array(refme.column_with_label('L'),        dtype=np.int32)
-    fp_r = np.array(refme.column_with_label('Fpart'),    dtype=np.float64)
-    pp_r = np.array(refme.column_with_label('PHIpart'),  dtype=np.float64)
+    h_r  = np.array(refme.column_with_label('H'),          dtype=np.int32)
+    k_r  = np.array(refme.column_with_label('K'),          dtype=np.int32)
+    l_r  = np.array(refme.column_with_label('L'),          dtype=np.int32)
+    fp_r = np.array(refme.column_with_label('Fpart'),      dtype=np.float64)
+    pp_r = np.array(refme.column_with_label('PHIpart'),    dtype=np.float64)
     fr_r = np.array(refme.column_with_label('FreeR_flag'), dtype=np.float32)
 
     refme_dict = {
@@ -233,32 +197,24 @@ def build_sample_mtz(prot_only_pdb, refme_path, flood_dict, tmpdir):
         for i in range(len(h_r))
     }
 
-    fp_out   = np.zeros(len(h_p), dtype=np.float32)
-    sp_out   = np.zeros(len(h_p), dtype=np.float32)
-    fr_out   = np.zeros(len(h_p), dtype=np.float32)
+    fp_out    = np.zeros(len(h_p), dtype=np.float32)
+    sp_out    = np.zeros(len(h_p), dtype=np.float32)
+    fr_out    = np.zeros(len(h_p), dtype=np.float32)
     fpart_out = np.zeros(len(h_p), dtype=np.float32)
     ppart_out = np.zeros(len(h_p), dtype=np.float32)
-    # truth complex SFs (same HKL set as prot)
-    fc_t  = np.zeros(len(h_p), dtype=np.float32)
-    ph_t  = np.zeros(len(h_p), dtype=np.float32)
 
     for i in range(len(h_p)):
         hkl = (int(h_p[i]), int(k_p[i]), int(l_p[i]))
         fpa, ppa, fra = refme_dict.get(hkl, (0.0, 0.0, 0.0))
         F_bulk  = fpa * np.exp(1j * np.radians(ppa))
-        F_flood = flood_dict.get(hkl, 0.0)
-        F_solv  = F_bulk + F_flood
-        F_total = F_prot[i] + F_solv
-        amp     = float(np.abs(F_total))
+        F_obs   = F_truth[i] + F_bulk
+        amp     = float(np.abs(F_obs))
         fp_out[i]    = amp
         sp_out[i]    = max(0.01, 0.02 * amp)
         fr_out[i]    = float(fra)
-        fpart_out[i] = float(np.abs(F_solv))
-        ppart_out[i] = float(np.degrees(np.angle(F_solv))) if abs(F_solv) > 0 else 0.0
-        fc_t[i]      = amp
-        ph_t[i]      = float(np.degrees(np.angle(F_total))) if amp > 0 else 0.0
+        fpart_out[i] = float(fpa)
+        ppart_out[i] = float(ppa)
 
-    # Write fobs.mtz
     out = gemmi.Mtz()
     out.cell       = prot.cell
     out.spacegroup = prot.spacegroup
@@ -276,22 +232,8 @@ def build_sample_mtz(prot_only_pdb, refme_path, flood_dict, tmpdir):
     fobs_mtz = tmpdir / 'fobs.mtz'
     out.write_to_file(str(fobs_mtz))
 
-    # Write truth.mtz (FC/PHIC = total F from jiggled model)
-    truth_out = gemmi.Mtz()
-    truth_out.cell       = prot.cell
-    truth_out.spacegroup = prot.spacegroup
-    truth_out.add_dataset('HKL_base')
-    for lbl in ('H', 'K', 'L'):
-        truth_out.add_column(lbl, 'H')
-    truth_out.add_dataset('data')
-    truth_out.add_column('FC',   'F')
-    truth_out.add_column('PHIC', 'P')
-    tdata = np.column_stack([h_p, k_p, l_p, fc_t, ph_t])
-    truth_out.set_data(tdata.astype(np.float32))
-    truth_mtz = tmpdir / 'truth.mtz'
-    truth_out.write_to_file(str(truth_mtz))
-
-    return fobs_mtz, truth_mtz
+    # truth.mtz is just the sfcalc output (FC/PHIC already there)
+    return fobs_mtz, truth_sf_mtz
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,22 +332,18 @@ def generate_sample(
     try:
         t = time.time()
 
-        # 1. Load original 48-conformer structure, apply jiggle
+        # 1. Load original 48-conformer structure, apply jiggle (waters unchanged)
         st_orig = gemmi.read_structure(str(pdb_path))
         st_jig  = jiggle_structure(st_orig, shift_scale, rng_seed)
         jig_pdb = tmpdir / 'jiggled.pdb'
         st_jig.write_pdb(str(jig_pdb))
         t = _t('jiggle', t)
 
-        # 2. Parse jiggled conformers
+        # 2. Parse jiggled conformers (protein chains only)
         st_jig_r, chain_names, conf_data = parse_conformers(jig_pdb)
         t = _t('parse', t)
 
-        # 3. Write protein-only PDB (no HOH, all 48 chains) for sfcalc
-        prot_only_pdb = tmpdir / 'prot_only.pdb'
-        write_protein_only_pdb(st_jig_r, prot_only_pdb)
-
-        # 4. Flood waters: existing atom positions for avoidance check
+        # 3. Flood waters: place random HOH positions avoiding existing atoms
         existing_xyzs = []
         for chain in st_jig_r[0]:
             for res in chain:
@@ -415,17 +353,18 @@ def generate_sample(
             st_jig_r.cell, existing_xyzs, n_flood, flood_occ,
             seed=rng_seed + 1,
         )
-        f_dict = flood_sf_dict(flood_pos, flood_occ, st_jig_r.cell,
-                               st_jig_r.spacegroup_hm, tmpdir)
+
+        # 4. Build truth_full.pdb = jiggled protein + 258 structural waters + flood waters
+        st_truth = add_flood_chain(st_jig, flood_pos, flood_occ, chain_name='W')
+        truth_pdb = tmpdir / 'truth_full.pdb'
+        st_truth.write_pdb(str(truth_pdb))
         t = _t('flood_waters', t)
 
-        # 5. Build fobs.mtz and truth.mtz
-        fobs_mtz, truth_mtz = build_sample_mtz(
-            prot_only_pdb, mtz_path, f_dict, tmpdir
-        )
+        # 5. Build fobs.mtz (FP = |F_truth + F_bulk|) and truth.mtz (sfcalc of truth_full.pdb)
+        fobs_mtz, truth_mtz = build_sample_mtz(truth_pdb, mtz_path, tmpdir)
         t = _t('build_mtz', t)
 
-        # 6. Build partial model using S8 strategy
+        # 6. Build partial model using S8 strategy + append 258 structural waters
         starthere_pdb = tmpdir / 'starthere.pdb'
         _, n_bouq, n_alt = build_reduced_pdb(
             st_jig_r, chain_names, conf_data,
@@ -435,6 +374,8 @@ def generate_sample(
             mc_bouq_threshold=S8_MC_THR,
             out_pdb=starthere_pdb, tmpdir=tmpdir,
         )
+        # Add structural waters (from jiggled model — identical to original since HOH not jiggled)
+        add_hoh_chains_to_pdb(st_jig_r, starthere_pdb)
         t = _t('build_partial', t)
 
         # 7. Refmac
@@ -453,7 +394,7 @@ def generate_sample(
         t = _t('maps', t)
 
         # 9. Copy useful files
-        shutil.copy2(jig_pdb,       sample_dir / 'truth_full.pdb')
+        shutil.copy2(truth_pdb,     sample_dir / 'truth_full.pdb')
         shutil.copy2(starthere_pdb, sample_dir / 'partial.pdb')
         shutil.copy2(tmpdir / 'refmac.log', sample_dir / 'refmac.log')
         if out_mtz:
