@@ -215,43 +215,46 @@ def build_sample_mtz(truth_full_pdb, refme_path, obs_mtz_path, tmpdir):
         for i in range(len(h_p))
     }
 
-    # Fpart/PHIpart from refme
-    h_r  = np.array(refme.column_with_label('H'),       dtype=np.int32)
-    k_r  = np.array(refme.column_with_label('K'),       dtype=np.int32)
-    l_r  = np.array(refme.column_with_label('L'),       dtype=np.int32)
-    fp_r = np.array(refme.column_with_label('Fpart'),   dtype=np.float64)
-    pp_r = np.array(refme.column_with_label('PHIpart'), dtype=np.float64)
-    fpart_dict = {
-        (int(h_r[i]), int(k_r[i]), int(l_r[i])): (fp_r[i], pp_r[i])
-        for i in range(len(h_r))
-    }
+    # obs (1aho.mtz): valid HKL mask only (NaN FP = missing observation)
+    h_o  = np.array(obs.column_with_label('H'),  dtype=np.int32)
+    k_o  = np.array(obs.column_with_label('K'),  dtype=np.int32)
+    l_o  = np.array(obs.column_with_label('L'),  dtype=np.int32)
+    fp_o = np.array(obs.column_with_label('FP'), dtype=np.float32)
+    valid_hkls = frozenset(
+        (int(h_o[i]), int(k_o[i]), int(l_o[i]))
+        for i in range(len(h_o)) if not np.isnan(fp_o[i])
+    )
 
-    # HKL mask + FreeR_flag from obs (1aho.mtz): only keep non-NaN rows
-    h_o  = np.array(obs.column_with_label('H'),          dtype=np.int32)
-    k_o  = np.array(obs.column_with_label('K'),          dtype=np.int32)
-    l_o  = np.array(obs.column_with_label('L'),          dtype=np.int32)
-    fp_o = np.array(obs.column_with_label('FP'),         dtype=np.float32)
-    fr_o = np.array(obs.column_with_label('FreeR_flag'), dtype=np.float32)
-    valid = ~np.isnan(fp_o)
+    # Drive output from refme: 100% complete FreeR_flag, Fpart/PHIpart for all HKLs
+    h_r  = np.array(refme.column_with_label('H'),          dtype=np.int32)
+    k_r  = np.array(refme.column_with_label('K'),          dtype=np.int32)
+    l_r  = np.array(refme.column_with_label('L'),          dtype=np.int32)
+    fp_r = np.array(refme.column_with_label('Fpart'),      dtype=np.float64)
+    pp_r = np.array(refme.column_with_label('PHIpart'),    dtype=np.float64)
+    fr_r = np.array(refme.column_with_label('FreeR_flag'), dtype=np.float32)
 
-    rows = []
-    for i in range(len(h_o)):
-        if not valid[i]:
-            continue
-        hkl  = (int(h_o[i]), int(k_o[i]), int(l_o[i]))
-        F_t  = truth_dict.get(hkl, 0.0)
-        fpa, ppa = fpart_dict.get(hkl, (0.0, 0.0))
-        F_bulk = fpa * np.exp(1j * np.radians(ppa))
-        F_obs  = F_t + F_bulk
-        amp    = float(np.abs(F_obs))
-        rows.append((h_o[i], k_o[i], l_o[i],
-                     amp, max(0.01, 0.02 * amp), float(fr_o[i]),
-                     float(fpa), float(ppa)))
+    nan32 = float('nan')
+    n = len(h_r)
+    fp_out    = np.full(n, nan32, dtype=np.float32)
+    sp_out    = np.full(n, nan32, dtype=np.float32)
+    fr_out    = fr_r.copy()                             # complete FreeR_flag from refme
+    fpart_out = fp_r.astype(np.float32)
+    ppart_out = pp_r.astype(np.float32)
 
-    data = np.array(rows, dtype=np.float32)
+    for i in range(n):
+        hkl = (int(h_r[i]), int(k_r[i]), int(l_r[i]))
+        if hkl not in valid_hkls:
+            continue                                    # leave FP/SIGFP as NaN
+        F_t    = truth_dict.get(hkl, 0.0)
+        F_bulk = fp_r[i] * np.exp(1j * np.radians(pp_r[i]))
+        amp    = float(np.abs(F_t + F_bulk))
+        fp_out[i] = amp
+        sp_out[i] = max(0.01, 0.02 * amp)
+
+    data = np.column_stack([h_r, k_r, l_r, fp_out, sp_out, fr_out, fpart_out, ppart_out])
     out = gemmi.Mtz()
-    out.cell       = obs.cell
-    out.spacegroup = obs.spacegroup
+    out.cell       = refme.cell
+    out.spacegroup = refme.spacegroup
     out.add_dataset('HKL_base')
     for lbl in ('H', 'K', 'L'):
         out.add_column(lbl, 'H')
