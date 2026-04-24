@@ -135,6 +135,8 @@ def place_flood_waters(cell, existing_xyzs, n_flood, occ, seed, min_dist=2.0):
 def add_flood_chain(st, positions, occ, chain_name='W'):
     """Add flood water atoms to a cloned structure; return the new structure."""
     st2 = st.clone()
+    if len(positions) == 0:
+        return st2
     ch  = gemmi.Chain(chain_name)
     for i, (x, y, z) in enumerate(positions):
         res = gemmi.Residue()

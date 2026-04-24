@@ -198,6 +198,19 @@ def main():
         unc_path = args.output + '_uncertainty.map'
     _write_map(unc_path, unc_map, args.fofc2)
 
+    # ── True difference map (truth.map - fc.map), when available ─────────────
+    out_dir   = Path(args.output).parent
+    truth_path = out_dir / 'truth.map'
+    if truth_path.exists():
+        truth_raw = _load_map(str(truth_path))
+        true_diff = _znorm(truth_raw - fc)
+        true_diff_path = out_dir / 'true_diff.map'
+        _write_map(str(true_diff_path), true_diff, args.fofc2)
+        cc = float(np.corrcoef(mean_map.ravel(), true_diff.ravel())[0, 1])
+        cc_fofc = float(np.corrcoef(_znorm(fofc).ravel(), true_diff.ravel())[0, 1])
+        print(f'CC(predicted, true_diff) = {cc:.4f}')
+        print(f'CC(fofc_input, true_diff) = {cc_fofc:.4f}')
+
 
 if __name__ == '__main__':
     main()

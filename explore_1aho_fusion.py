@@ -99,6 +99,29 @@ def density_score(valid_chains, reskey, anames, conf_data, grid):
     return np.array(scores)
 
 
+def _maximin_select(centroids, k):
+    """Greedy maximin: pick k rows of centroids maximising minimum pairwise distance.
+
+    Starts with the point farthest from the global centroid (most outlying),
+    then iteratively selects the point with the largest minimum distance to all
+    already-selected points.  Returns a list of k row indices.
+    """
+    n = len(centroids)
+    k = min(k, n)
+    if k == 1:
+        return [0]
+    mean = centroids.mean(axis=0)
+    start = int(np.argmax(np.linalg.norm(centroids - mean, axis=1)))
+    selected = [start]
+    min_dists = np.linalg.norm(centroids - centroids[start], axis=1).copy()
+    for _ in range(k - 1):
+        nxt = int(np.argmax(min_dists))
+        selected.append(nxt)
+        d = np.linalg.norm(centroids - centroids[nxt], axis=1)
+        np.minimum(min_dists, d, out=min_dists)
+    return selected
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fobs MTZ construction
 # ─────────────────────────────────────────────────────────────────────────────
@@ -506,18 +529,51 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             order  = np.argsort(scores)          # weakest first
             return [arr for arr in np.array_split(order, k) if len(arr) > 0]
 
-        def atoms_from_groups(anames, groups, multi_altloc, labels):
+        def split_by_maximin(anames, k):
+            """Select k representative conformers by maximin; assign Voronoi occupancy.
+
+            Returns (singleton_groups, voronoi_occs):
+              singleton_groups[i] = np.array([rep_i])   — actual conformer index
+              voronoi_occs[i]     = sum of conf_occs for all conformers nearest to rep_i
+            Using the actual conformer's atomic positions (no averaging blur).
+            """
+            n = len(valid_chains)
+            k_actual = min(k, n)
+            centroids = np.zeros((n, 3))
+            for i, cn in enumerate(valid_chains):
+                pts = []
+                for aname in anames:
+                    a = conf_data[cn][reskey]['atoms'].get(aname)
+                    if a:
+                        pts.append([a.pos.x, a.pos.y, a.pos.z])
+                if pts:
+                    centroids[i] = np.mean(pts, axis=0)
+            selected = _maximin_select(centroids, k_actual)
+            # Voronoi partition: assign each conformer to its nearest representative
+            sel_pts = centroids[selected]
+            dists   = np.linalg.norm(
+                centroids[:, None, :] - sel_pts[None, :, :], axis=2)  # (n, k)
+            assign  = np.argmin(dists, axis=1)                         # (n,)
+            voronoi_occs = [
+                float(conf_occs[assign == gi].sum()) for gi in range(k_actual)
+            ]
+            singleton_groups = [np.array([rep]) for rep in selected]
+            return singleton_groups, voronoi_occs
+
+        def atoms_from_groups(anames, groups, multi_altloc, labels, group_occs=None):
             """Write averaged atoms for each group into res_out.
 
             labels: character sequence to use for altloc labels (MC_ALT_LABELS
             or SC_ALT_LABELS).  Every atom name in anames is written for every
             group (using global mean as fallback) so all altlocs are complete.
+            group_occs: if provided, override per-group occupancy (e.g. Voronoi sums
+            when groups are singletons from maximin selection).
             """
             for gi, members in enumerate(groups):
                 lbl = labels[gi] if multi_altloc else '\x00'
                 ws  = conf_occs[members]
                 ws  = ws / ws.sum() if ws.sum() > 0 else np.ones(len(ws)) / len(ws)
-                occ = float(conf_occs[members].sum())
+                occ = group_occs[gi] if group_occs is not None else float(conf_occs[members].sum())
                 for aname in anames:
                     template = ref_atoms.get(aname)
                     if template is None:
@@ -571,20 +627,14 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
                 ]
                 all_groups = [g for g in all_groups if len(g) > 0]
             else:
-                scores = density_score(valid_chains, reskey, all_anames, conf_data, density_grid)
-                if rng is not None and n_conf >= 2:
-                    n_half = max(1, n_conf // 2)
-                    half_idx = np.sort(rng.choice(n_conf, n_half, replace=False))
-                else:
-                    half_idx = np.arange(n_conf)
-                k = min(len(half_idx), dev_to_nconf(res_devs.get(reskey, 0.0)))
-                half_order = half_idx[np.argsort(scores[half_idx])]
-                all_groups = [arr for arr in np.array_split(half_order, k) if len(arr) > 0]
+                k = min(n_conf, dev_to_nconf(res_devs.get(reskey, 0.0)))
+                all_groups, bouq_voccs = split_by_maximin(all_anames, k)
             multi = len(all_groups) > 1
             if multi:
                 n_altloc_res += 1
+            bouq_occs = bouq_voccs if (reskey not in disulf_groups and multi) else None
             atoms_from_groups(all_anames, all_groups, multi_altloc=multi,
-                              labels=ALL_ALT_LABELS)
+                              labels=ALL_ALT_LABELS, group_occs=bouq_occs)
             chain_out.add_residue(res_out)
             continue
 
@@ -594,15 +644,16 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
         mc_k = int(mc_mode.split('_k')[1]) if '_k' in mc_mode else 1
         mc_multi = (mc_k > 1 and n_conf >= 2)
         if mc_multi:
-            mc_groups = split_by_density(mc_anames, mc_k)
+            mc_groups, mc_voccs = split_by_maximin(mc_anames, mc_k)
             n_altloc_res += 1
         else:
-            mc_groups = [all_idx]
+            mc_groups, mc_voccs = [all_idx], None
             mc_k = 1
 
         mc_letters = mc_k if mc_multi else 0
         mc_labels  = ALL_ALT_LABELS[:mc_letters] if mc_multi else ALL_ALT_LABELS
-        atoms_from_groups(mc_anames, mc_groups, multi_altloc=mc_multi, labels=mc_labels)
+        atoms_from_groups(mc_anames, mc_groups, multi_altloc=mc_multi, labels=mc_labels,
+                          group_occs=mc_voccs)
 
         if not sc_anames:
             chain_out.add_residue(res_out)
@@ -621,11 +672,12 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             atoms_from_groups(sc_anames, [all_idx], multi_altloc=False, labels=sc_labels)
             chain_out.add_residue(res_out)
             continue
-        sc_groups = split_by_density(sc_anames, k)
+        sc_groups, sc_voccs = split_by_maximin(sc_anames, k)
         multi = len(sc_groups) > 1
         if multi:
             n_altloc_res += 1
-        atoms_from_groups(sc_anames, sc_groups, multi_altloc=multi, labels=sc_labels)
+        atoms_from_groups(sc_anames, sc_groups, multi_altloc=multi, labels=sc_labels,
+                          group_occs=sc_voccs)
 
         chain_out.add_residue(res_out)
 
