@@ -45,7 +45,7 @@ from explore_1aho_fusion import (
 )
 
 SCRIPT_DIR = Path(__file__).parent
-REFMAC5    = Path('/programs/ccp4-8.0/bin/refmac5')
+REFMAC5    = Path(shutil.which('refmac5') or '/programs/ccp4-8.0/bin/refmac5')
 DMIN       = 0.965
 SAMPLE_RATE = 3.0
 
@@ -150,6 +150,30 @@ def add_flood_chain(st, positions, occ, chain_name='W'):
         ch.add_residue(res)
     st2[0].add_chain(ch)
     return st2
+
+
+def swap_conformer_assignments(conf_data, chain_names, residue_keys, swaps_per_residue, rng):
+    """Apply pairwise conformer swaps to the partial model's conf_data.
+
+    For each residue, draws Poisson(swaps_per_residue) pairwise swaps. Each swap
+    exchanges the atom data for two randomly chosen conformer chains at that residue,
+    breaking backbone connectivity between adjacent residues. Truth structure is unaffected.
+    """
+    if swaps_per_residue <= 0.0:
+        return conf_data
+    nc = len(chain_names)
+    conf_data2 = {cn: dict(rd) for cn, rd in conf_data.items()}
+    for rk in residue_keys:
+        n_swaps = int(rng.poisson(swaps_per_residue))
+        for _ in range(n_swaps):
+            i, j = rng.choice(nc, size=2, replace=False)
+            cn_i, cn_j = chain_names[i], chain_names[j]
+            ri = conf_data2[cn_i].get(rk)
+            rj = conf_data2[cn_j].get(rk)
+            if ri is not None and rj is not None:
+                conf_data2[cn_i][rk] = rj
+                conf_data2[cn_j][rk] = ri
+    return conf_data2
 
 
 def set_sulfur_aniso(st, rng):
@@ -347,6 +371,7 @@ def generate_sample(
     flood_occ=DEFAULT_FLOOD_OCC,
     vary_flood=False,
     ncyc=DEFAULT_NCYC,
+    swaps_per_residue=0.0,
     seed=None,
     debug=False,
 ):
@@ -392,6 +417,12 @@ def generate_sample(
 
         # 2. Parse jiggled conformers (protein chains only)
         st_jig_r, chain_names, conf_data = parse_conformers(jig_pdb)
+        if swaps_per_residue > 0.0:
+            residue_keys = list(conf_data[chain_names[0]].keys())
+            conf_data = swap_conformer_assignments(
+                conf_data, chain_names, residue_keys, swaps_per_residue,
+                np.random.default_rng(rng_seed + 5),
+            )
         t = _t('parse', t)
 
         # 3. Flood waters: place random HOH positions avoiding existing atoms
@@ -468,6 +499,7 @@ def generate_sample(
             sample_idx=int(sample_idx),
             pdb_source=str(pdb_path),
             shift_scale=shift_scale,
+            swaps_per_residue=swaps_per_residue,
             n_flood=n_flood,
             flood_occ=flood_occ,
             ncyc=ncyc,
@@ -509,7 +541,8 @@ def generate_sample(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood,
-                       flood_occ, vary_flood, ncyc, max_array, seed, partition,
+                       flood_occ, vary_flood, ncyc, swaps_per_residue,
+                       max_array, seed, partition,
                        account=None, qos=None, time='00:20:00'):
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     me     = Path(__file__).resolve()
@@ -545,6 +578,7 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
         f'  --shift-scale {shift_scale} \\',
     ] + flood_args + [
         f'  --ncyc {ncyc} \\',
+        f'  --swaps-per-residue {swaps_per_residue} \\',
         f'  --seed {seed}',
         '',
     ]
@@ -575,6 +609,9 @@ def main():
                     help='Sample n_flood log-uniformly [%d,%d] per sample; occ=%.2f/sqrt(nf)'
                          % (FLOOD_NF_MIN, FLOOD_NF_MAX, FLOOD_LINE_K))
     ap.add_argument('--ncyc',        type=int,   default=DEFAULT_NCYC)
+    ap.add_argument('--swaps-per-residue', type=float, default=0.0,
+                    help='Expected pairwise conformer swaps per residue in partial model'
+                         ' (0=none, 1=one swap per residue, Poisson-sampled; default: 0)')
     ap.add_argument('--seed',        type=int,   default=42)
     ap.add_argument('--workers',     type=int,   default=1)
     ap.add_argument('--max-array',   type=int,   default=300)
@@ -599,7 +636,7 @@ def main():
         submit_slurm_array(
             args.nsamples, outdir, pdb_path, mtz_path, obs_mtz_path,
             args.shift_scale, args.n_flood, args.flood_occ, args.vary_flood,
-            args.ncyc, args.max_array, args.seed, args.partition,
+            args.ncyc, args.swaps_per_residue, args.max_array, args.seed, args.partition,
             account=args.account, qos=args.qos, time=args.time,
         )
         return
@@ -614,8 +651,8 @@ def main():
         density_grid=density_grid,
         shift_scale=args.shift_scale, n_flood=args.n_flood,
         flood_occ=args.flood_occ, vary_flood=args.vary_flood,
-        ncyc=args.ncyc, seed=args.seed,
-        debug=args.debug,
+        ncyc=args.ncyc, swaps_per_residue=args.swaps_per_residue,
+        seed=args.seed, debug=args.debug,
     )
 
     if args.sample_id is not None:
