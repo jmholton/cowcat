@@ -10,12 +10,14 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 
 | File | Purpose |
 |------|---------|
-| `generate_protein.py` | Main data generation pipeline — protein backbone + side chains + altloc + refmac |
-| `generate_data.py` | Older pipeline — random O atoms, atom deletion, no refmac (kept for reference) |
+| `generate_1aho.py` | Current data pipeline — jiggle 1AHO PDB, flood waters, sfcalc, refmac, CCP4 maps |
+| `generate_protein.py` | Older pipeline — random 20-residue backbone + side chains + altloc + refmac |
+| `generate_data.py` | Oldest pipeline — random O atoms, atom deletion, no refmac (kept for reference) |
 | `model.py` | UNet3D: 4 input channels, 1 output, base_features=32, circular padding, 5.84M params |
-| `train.py` | Training loop: peak_weighted_mse loss, AdamW, CosineAnnealingLR |
-| `dataset.py` | `make_splits` / `make_splits_multi` — dataset loading utilities |
-| `preprocess.py` | Packs `.map` files into memory-mapped `.bin` for fast loading |
+| `train.py` | Training loop: heteroscedastic NLL loss, AdamW, CosineAnnealingLR, DataParallel |
+| `dataset.py` | `ElectronDensityDataset`, `PackedDataset`, `make_splits` / `make_splits_multi` |
+| `pack.py` | Packs `sample_NNNNN/` dirs into `X.npy`/`Y.npy`/`S.npy` for fast mmap loading |
+| `preprocess.py` | Pre-computes cross-Patterson channel → `crossp.npy` per sample (run before pack.py) |
 | `jigglepdb.awk` | Displaces atom positions to generate alternate conformers |
 | `converge_refmac.com` | Wrapper: runs refmac5 N cycles on `starthere.pdb` + `refme.mtz` → `refmacout.mtz` |
 | `randompdb.com` | Generates random O-atom structure in a P1 cell |
@@ -34,33 +36,63 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 
 ## Python Interpreters
 
-**Critical — do not mix these up:**
+**Critical — do not mix these up. Rules apply on both clusters:**
 
-- `ccp4-python` — use for `generate_protein.py`, `generate_data.py`, and any script importing `gemmi`. Gemmi is installed here; the pytorch python cannot use it (GLIBC too old for prebuilt wheels).
-- `/programs/pytorch/envs/pt/bin/python` — use for `train.py`, `dataset.py`, anything using torch.
-- System `python` is Python 2. Never use it.
-- The symlink `./python3` in this directory points to the base pytorch python (no torch) — use the full `envs/pt` path for training.
+- `ccp4-python` — use for `generate_1aho.py`, `generate_protein.py`, and any script importing `gemmi`. Gemmi is only installed here.
+- PyTorch python — use for `train.py`, `pack.py`, `dataset.py`, anything using torch.
+- Never use the system `python` for project code.
+
+**Original cluster** (`/programs/` paths visible):
+- CCP4 python: `ccp4-python` (on PATH after `source /global/home/groups-sw/ac_als831/ccp4-X/bin/ccp4.setup-sh`)
+- PyTorch python: `/programs/pytorch/envs/pt/bin/python`
+- System `python` is Python 2. The symlink `./python3` points to the base pytorch python (no torch) — use the full `envs/pt` path for training.
+
+**Einsteinium / Lawrencium** (`cluster.sh` handles both):
+- CCP4 python: `ccp4-python` via `setup_ccp4` (sources `/global/home/groups-sw/ac_als831/ccp4-9/bin/ccp4.setup-sh`)
+- PyTorch python: `python3` after `setup_pytorch`:
+  ```bash
+  source /etc/profile.d/modules.sh
+  export MODULEPATH=$MODULEPATH:/global/software/rocky-8.x86_64/modfiles/Core
+  module load --force ml/pytorch/2.3.1-py3.11.7-mf
+  ```
 
 ---
 
 ## SLURM Cluster
 
+Always pass `--export=ALL` to SLURM array jobs so CCP4 environment variables propagate.
+`CCP4_SCR` directory must exist on compute nodes: `os.makedirs(os.environ.get('CCP4_SCR', '/tmp'), exist_ok=True)`.
+
+**Original cluster:**
 - **Data generation**: `--partition debug`, `--workers 300` (cluster ~400 cores total)
 - **Training**: `--partition gpu --gres=gpu:1`
-- Always pass `--export=ALL` to SLURM array jobs so CCP4 environment variables propagate.
-- `CCP4_SCR` directory must exist on compute nodes before refmac5 runs. Fix in code: `os.makedirs(os.environ.get('CCP4_SCR', '/tmp'), exist_ok=True)`.
 
-Common generation invocation:
-```
+```bash
 ccp4-python generate_protein.py --submit --nsamples 1000 \
     --outdir data_n10_N1altconf3_refmac_n1000 --partition debug --max-array 300
-```
 
-Common training invocation:
-```
 srun --partition gpu --gres=gpu:1 \
     /programs/pytorch/envs/pt/bin/python train.py \
     --data data_n10_N1altconf3_refmac_n1000 --epochs 200
+```
+
+**Einsteinium / Lawrencium:**
+- **Account**: `pc_als831`; **GPU QOS**: `es_normal` (min 16 CPUs); **CPU QOS**: `lr_normal`
+- **GPU partition**: `es1` (4× A40 per node); **CPU partition**: `lr6`
+- **MaxArraySize**: 1001 — submit ≤1000 samples per array job, one directory per batch
+- Use `cd "$SLURM_SUBMIT_DIR"` before sourcing `cluster.sh` — SLURM runs from a spool directory.
+
+```bash
+# Generate: one 1000-sample batch per directory (avoids large-dir filesystem slowdown)
+ccp4-python generate_1aho.py --submit --nsamples 1000 --seed 100 \
+    --outdir data/data_1aho_s100 --partition lr6 --account pc_als831 --qos lr_normal
+
+# Pack (once per dir, before training)
+python3 pack.py --data data/data_1aho_s100 --workers 8
+
+# Train
+sbatch train.sh --data data/data_1aho_s100 data/data_1aho_s200 \
+    --outdir checkpoints_1aho --epochs 200
 ```
 
 ---
@@ -100,19 +132,17 @@ UNIQUEIFY  = 'uniqueify'   # on PATH via CCP4 environment
 
 ---
 
-## Current Training Status (as of 2026-04-16)
+## Current Training Status (as of 2026-04-24)
 
-Best checkpoint: `checkpoints_n10_N1altconf2_5/` — epoch 81, val loss **0.00182** (warm-start source for current runs).
+Loss is now heteroscedastic NLL — values are negative and not comparable to earlier MSE-based runs.
 
-Active runs comparing altloc cluster sizes:
+| Checkpoint | Dataset | Best val | Notes |
+|-----------|---------|----------|-------|
+| `checkpoints_n10_N1altconf2_5/` | protein n1000 | 0.00182 (ep 81) | MSE loss; warm-start source |
+| `checkpoints_n10_N1del_altconf3refmac/` | N1del + altconf3_refmac | 0.00261 (ep 10) | MSE loss; 3-conf fastest |
+| `checkpoints_1aho_n1000v3/` | 1AHO n=1000 | **-0.7376** (ep 18) | NLL loss; 2-GPU, 100 ep done |
 
-| Run | Dataset | Best val |
-|-----|---------|----------|
-| `checkpoints_n10_N1del_altconf2refmac` | N1del + altconf2_refmac | 0.00305 (~ep 21) |
-| `checkpoints_n10_N1del_altconf3refmac` | N1del + altconf3_refmac | **0.00261** (~ep 10) |
-| `checkpoints_n10_N1del_altconf5refmac` | N1del + altconf5_refmac | 0.00335 (~ep 9) |
-
-3-conf converges fastest at early epochs.
+Next: generate 9× 1000-sample batches (seeds 100–900) → pack each → retrain on 9k samples, 4 GPUs.
 
 ---
 
@@ -122,3 +152,7 @@ Active runs comparing altloc cluster sizes:
 - **uniqueify path**: `uniqueify` (not the full CCP4 path) — it must be on `$PATH` via CCP4 env.
 - **B factor randomisation**: happens after phenix.reduce adds H (step 4), not before, so H atoms inherit the parent heavy-atom B factor.
 - **simulate_missing_data**: two non-overlapping categories — `missing` (F/SIGF→NaN, row kept with FreeR_flag) and `never_collected` (rows deleted entirely). `uniqueify` must run before this.
+- **Data generation directories**: keep ≤1000 samples per directory to avoid Lustre metadata slowdown. Use separate dirs per batch (e.g. `data_1aho_s100`, `data_1aho_s200`); `make_splits_multi` concatenates them transparently.
+- **DataParallel + pin_memory deadlock**: `pin_memory=True` with DataParallel and forked DataLoader workers causes a hang. `train.py` disables pin_memory when `n_gpus > 1`.
+- **pack.py target**: Y.npy stores `znorm(truth - fc)` (the difference map), not `znorm(truth)`. S.npy stores `log(std(truth - fc))`. Matches `ElectronDensityDataset` exactly.
+- **Einsteinium module loading**: `module load --force ml/pytorch/2.3.1-py3.11.7-mf` requires `Core` in MODULEPATH and the `--force` flag; CUDA/cuDNN warnings on login nodes are harmless.

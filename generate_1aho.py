@@ -45,7 +45,7 @@ from explore_1aho_fusion import (
 )
 
 SCRIPT_DIR = Path(__file__).parent
-REFMAC5    = Path('/programs/ccp4-8.0/bin/refmac5')
+REFMAC5    = Path(shutil.which('refmac5') or '/programs/ccp4-8.0/bin/refmac5')
 DMIN       = 0.965
 SAMPLE_RATE = 3.0
 

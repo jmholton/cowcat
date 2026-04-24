@@ -122,15 +122,16 @@ class ElectronDensityDataset(Dataset):
 
 
 class PackedDataset(Dataset):
-    """Fast dataset backed by pre-packed X.npy / Y.npy memory-mapped arrays.
+    """Fast dataset backed by pre-packed X.npy / Y.npy / S.npy memory-mapped arrays.
 
-    Created by pack.py. Opens 2 files instead of 6×N files — eliminates
+    Created by pack.py. Opens 3 files instead of 5×N files — eliminates
     filesystem overhead on large datasets (10k+ samples).
-    Augmentation (random axis flips) is still applied on the fly.
+    Augmentation (random axis flips, periodic rolls) is still applied on the fly.
     """
-    def __init__(self, x_path, y_path, indices=None):
+    def __init__(self, x_path, y_path, s_path, indices=None):
         self.X = np.load(x_path, mmap_mode='r')  # (N, 4, D, H, W)
         self.Y = np.load(y_path, mmap_mode='r')  # (N, 1, D, H, W)
+        self.S = np.load(s_path, mmap_mode='r')  # (N,)
         self.indices = indices if indices is not None else np.arange(len(self.X))
 
     def __len__(self):
@@ -140,6 +141,7 @@ class PackedDataset(Dataset):
         i = self.indices[idx]
         x = np.array(self.X[i])   # copy out of mmap → writable
         y = np.array(self.Y[i])   # (1, D, H, W)
+        s = float(self.S[i])
 
         for spatial_axis in (0, 1, 2):
             if np.random.rand() < 0.5:
@@ -153,23 +155,34 @@ class PackedDataset(Dataset):
         x = torch.cat([torch.roll(x[:3], shifts, dims=[1, 2, 3]), x[3:]], dim=0)
         y = torch.roll(y, shifts, dims=[1, 2, 3])
 
-        return x, y
+        return x, y, torch.tensor(s, dtype=torch.float32)
+
+
+def _make_dataset(data_dir):
+    """Return PackedDataset if packs exist, else ElectronDensityDataset."""
+    x = os.path.join(data_dir, 'X.npy')
+    y = os.path.join(data_dir, 'Y.npy')
+    s = os.path.join(data_dir, 'S.npy')
+    if os.path.exists(x) and os.path.exists(y) and os.path.exists(s):
+        return PackedDataset(x, y, s)
+    return ElectronDensityDataset(data_dir)
 
 
 def make_splits(data_dir, val_fraction=0.2, seed=42):
     """Return (train_dataset, val_dataset) with a reproducible random split.
 
-    Uses PackedDataset (X.npy/Y.npy) if available, else ElectronDensityDataset.
+    Uses PackedDataset (X.npy/Y.npy/S.npy) if available, else ElectronDensityDataset.
     """
     x_path = os.path.join(data_dir, 'X.npy')
     y_path = os.path.join(data_dir, 'Y.npy')
-    if os.path.exists(x_path) and os.path.exists(y_path):
+    s_path = os.path.join(data_dir, 'S.npy')
+    if os.path.exists(x_path) and os.path.exists(y_path) and os.path.exists(s_path):
         n = len(np.load(x_path, mmap_mode='r'))
         rng = np.random.default_rng(seed)
         idx = rng.permutation(n)
         n_val = max(1, int(n * val_fraction))
-        return (PackedDataset(x_path, y_path, idx[n_val:]),
-                PackedDataset(x_path, y_path, idx[:n_val]))
+        return (PackedDataset(x_path, y_path, s_path, idx[n_val:]),
+                PackedDataset(x_path, y_path, s_path, idx[:n_val]))
 
     full = ElectronDensityDataset(data_dir)
     n_val = max(1, int(len(full) * val_fraction))
@@ -181,12 +194,12 @@ def make_splits(data_dir, val_fraction=0.2, seed=42):
 def make_splits_multi(data_dirs, val_fraction=0.2, seed=42):
     """Like make_splits but accepts a list of data directories.
 
-    Concatenates all directories into one pool, then does a single train/val split.
-    Falls back to make_splits for a single directory (supports PackedDataset).
+    Uses PackedDataset for any directory that has X.npy/Y.npy/S.npy,
+    ElectronDensityDataset otherwise. Falls back to make_splits for single dir.
     """
     if len(data_dirs) == 1:
         return make_splits(data_dirs[0], val_fraction=val_fraction, seed=seed)
-    datasets = [ElectronDensityDataset(d) for d in data_dirs]
+    datasets = [_make_dataset(d) for d in data_dirs]
     combined = ConcatDataset(datasets)
     n = len(combined)
     n_val = max(1, int(n * val_fraction))
