@@ -409,7 +409,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
                       bouquet_threshold=1.5,
                       mc_bouq_threshold=0.5,
                       out_pdb=None, tmpdir=None,
-                      rng=None):
+                      rng=None, max_k=None):
     """Build starthere.pdb using the given fusion strategy.
 
     Returns path to the written PDB.
@@ -628,6 +628,8 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
                 all_groups = [g for g in all_groups if len(g) > 0]
             else:
                 k = min(n_conf, dev_to_nconf(res_devs.get(reskey, 0.0)))
+                if max_k is not None:
+                    k = min(k, max_k)
                 all_groups, bouq_voccs = split_by_maximin(all_anames, k)
             multi = len(all_groups) > 1
             if multi:
@@ -642,6 +644,8 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
         spread_for_mc = ca_max_spread(reskey, conf_data, chain_names)
         mc_mode = mc_bouq if spread_for_mc > mc_bouq_threshold else mc_ord
         mc_k = int(mc_mode.split('_k')[1]) if '_k' in mc_mode else 1
+        if max_k is not None:
+            mc_k = min(mc_k, max_k)
         mc_multi = (mc_k > 1 and n_conf >= 2)
         if mc_multi:
             mc_groups, mc_voccs = split_by_maximin(mc_anames, mc_k)
@@ -668,6 +672,8 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
         else:
             k = int(mode.split('_k')[1]) if '_k' in mode else 1
         k = min(k, sc_max_k)
+        if max_k is not None:
+            k = min(k, max_k)
         if k <= 1:
             atoms_from_groups(sc_anames, [all_idx], multi_altloc=False, labels=sc_labels)
             chain_out.add_residue(res_out)
