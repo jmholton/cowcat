@@ -116,23 +116,30 @@ def main():
     print(f'Logging to {_logpath}')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Device: {device}')
+    n_gpus = torch.cuda.device_count() if device.type == 'cuda' else 0
+    print(f'Device: {device}  GPUs: {n_gpus}')
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_ds, val_ds = make_splits_multi(args.data, val_fraction=args.val_frac)
     print(f'Train: {len(train_ds)}  Val: {len(val_ds)}')
 
+    # pin_memory causes deadlock with DataParallel + forked workers
+    pin = (device.type == 'cuda') and n_gpus <= 1
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=True,  num_workers=args.workers,
-                              pin_memory=(device.type == 'cuda'))
+                              pin_memory=pin)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
                               shuffle=False, num_workers=args.workers,
-                              pin_memory=(device.type == 'cuda'))
+                              pin_memory=pin)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = UNet3D(in_channels=4, out_channels=1,
                    base_features=args.base_features).to(device)
-    print(f'Parameters: {count_parameters(model):,}')
+    raw_model = model
+    if n_gpus > 1:
+        model = nn.DataParallel(model)
+        args.batch_size *= n_gpus
+    print(f'Parameters: {count_parameters(raw_model):,}  batch_size: {args.batch_size}')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-4)
@@ -146,7 +153,7 @@ def main():
     # ── Resume (full state) ───────────────────────────────────────────────────
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt['model'])
+        raw_model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
         start_epoch = ckpt['epoch'] + 1
@@ -157,7 +164,7 @@ def main():
     # ── Pretrain (weights only, optimizer/scheduler reset) ────────────────────
     elif args.pretrain and os.path.exists(args.pretrain):
         ckpt = torch.load(args.pretrain, map_location=device)
-        model.load_state_dict(ckpt['model'])
+        raw_model.load_state_dict(ckpt['model'])
         print(f'Loaded pretrained weights (best_val={ckpt.get("best_val", float("inf")):.5f}), '
               f'optimizer reset')
 
@@ -184,7 +191,7 @@ def main():
         log.append(entry)
 
         # Save latest checkpoint
-        ckpt = dict(epoch=epoch, model=model.state_dict(),
+        ckpt = dict(epoch=epoch, model=raw_model.state_dict(),
                     optimizer=optimizer.state_dict(),
                     scheduler=scheduler.state_dict(),
                     best_val=best_val, log=log)
