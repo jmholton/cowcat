@@ -42,13 +42,12 @@ DISTAL_SC = frozenset({
     'SD', 'SG',
 })
 
-# All altloc labels: MC gets the first mc_k letters, SC gets the next sc_k letters.
-# Gemmi capitalises all altloc chars when writing PDB, so we must keep MC and SC
-# in disjoint uppercase ranges rather than upper/lower-case.
-ALL_ALT_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+# All altloc labels available for output. Written via direct PDB formatter (not
+# gemmi.write_pdb) so case is preserved exactly as given here.
+ALL_ALT_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 
 # Maximum altloc groups passed to refmac for bouquet/disulfide residues.
-BOUQUET_MAX_ALT = 24
+BOUQUET_MAX_ALT = 48
 # Minimum altloc groups for disulfide pairs (correlated motion, SG-SG constraint
 # makes individual CYS look ordered even when the pair samples multiple positions).
 DISULF_MIN_NCONF = 16
@@ -389,6 +388,46 @@ def detect_disulfides(conf_data, chain_names, threshold=2.5):
 # Atom-building helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _write_pdb_direct(st, path):
+    """Write a gemmi Structure to PDB without going through gemmi's writer.
+
+    Gemmi uppercases altloc chars on write, which limits us to 26 labels.
+    Writing ATOM records directly preserves case and allows a–z, 0–9 too.
+    """
+    CRYST1 = (f"CRYST1{st.cell.a:9.3f}{st.cell.b:9.3f}{st.cell.c:9.3f}"
+              f"{st.cell.alpha:7.2f}{st.cell.beta:7.2f}{st.cell.gamma:7.2f}"
+              f" {st.spacegroup_hm:<11s}1\n")
+    lines = [CRYST1]
+    serial = 1
+    for model in st:
+        for chain in model:
+            for res in chain:
+                is_het = res.entity_type == gemmi.EntityType.NonPolymer or \
+                         res.name in ('HOH', 'WAT', 'H2O')
+                rec = 'HETATM' if is_het else 'ATOM  '
+                seqnum = res.seqid.num
+                icode  = res.seqid.icode if res.seqid.icode != ' ' else ' '
+                for atom in res:
+                    altloc = atom.altloc if atom.altloc != '\x00' else ' '
+                    elem   = atom.element.name.upper()
+                    aname  = atom.name
+                    # PDB atom name column (cols 13-16): 4 chars
+                    if len(elem) == 2 or len(aname) == 4:
+                        name4 = f'{aname:<4s}'
+                    else:
+                        name4 = f' {aname:<3s}'
+                    line = (f'{rec}{serial:5d} {name4}{altloc}'
+                            f'{res.name:<3s} {chain.name:1s}'
+                            f'{seqnum:4d}{icode:1s}   '
+                            f'{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}'
+                            f'{atom.occ:6.2f}{atom.b_iso:6.2f}'
+                            f'          {elem:>2s}\n')
+                    lines.append(line)
+                    serial += 1
+    lines.append('END\n')
+    Path(path).write_text(''.join(lines))
+
+
 def make_atom(template, x, y, z, occ, b_iso, altloc):
     a = gemmi.Atom()
     a.name    = template.name
@@ -629,7 +668,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             else:
                 k = min(n_conf, dev_to_nconf(res_devs.get(reskey, 0.0)))
                 if max_k is not None:
-                    k = min(k, max_k)
+                    k = min(n_conf, max_k)   # max_k overrides dev_to_nconf in both directions
                 all_groups, bouq_voccs = split_by_maximin(all_anames, k)
             multi = len(all_groups) > 1
             if multi:
@@ -645,7 +684,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
         mc_mode = mc_bouq if spread_for_mc > mc_bouq_threshold else mc_ord
         mc_k = int(mc_mode.split('_k')[1]) if '_k' in mc_mode else 1
         if max_k is not None:
-            mc_k = min(mc_k, max_k)
+            mc_k = min(n_conf, max_k)
         mc_multi = (mc_k > 1 and n_conf >= 2)
         if mc_multi:
             mc_groups, mc_voccs = split_by_maximin(mc_anames, mc_k)
@@ -663,7 +702,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             chain_out.add_residue(res_out)
             continue
 
-        sc_max_k  = 26 - mc_letters
+        sc_max_k  = len(ALL_ALT_LABELS) - mc_letters
         sc_labels = ALL_ALT_LABELS[mc_letters:]
 
         mode = sc_ord
@@ -671,9 +710,9 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             k = 1
         else:
             k = int(mode.split('_k')[1]) if '_k' in mode else 1
-        k = min(k, sc_max_k)
         if max_k is not None:
-            k = min(k, max_k)
+            k = min(n_conf, max_k)
+        k = min(k, sc_max_k)
         if k <= 1:
             atoms_from_groups(sc_anames, [all_idx], multi_altloc=False, labels=sc_labels)
             chain_out.add_residue(res_out)
@@ -692,7 +731,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
 
     if out_pdb is None:
         out_pdb = tmpdir / 'starthere.pdb'
-    st_out.write_pdb(str(out_pdb))
+    _write_pdb_direct(st_out, out_pdb)
     print(f'    bouquet residues: {n_bouquet}  altloc residues: {n_altloc_res}')
     return out_pdb, n_bouquet, n_altloc_res
 
