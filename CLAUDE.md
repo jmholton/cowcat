@@ -21,6 +21,8 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 | `jigglepdb.awk` | Displaces atom positions to generate alternate conformers |
 | `converge_refmac.com` | Wrapper: runs refmac5 N cycles on `starthere.pdb` + `refme.mtz` → `refmacout.mtz` |
 | `randompdb.com` | Generates random O-atom structure in a P1 cell |
+| `explore_1aho_fusion.py` | Conformer scoring, rebuild, refmac utilities for the 1AHO iterative pipeline |
+| `rebuild_iterate.py` | Standalone iterative rebuild loop: score Fo-Fc outliers → rebuild → refmac → repeat |
 
 ---
 
@@ -132,7 +134,7 @@ UNIQUEIFY  = 'uniqueify'   # on PATH via CCP4 environment
 
 ---
 
-## Current Training Status (as of 2026-04-24)
+## Current Training Status (as of 2026-04-30)
 
 Loss is now heteroscedastic NLL — values are negative and not comparable to earlier MSE-based runs.
 
@@ -143,6 +145,21 @@ Loss is now heteroscedastic NLL — values are negative and not comparable to ea
 | `checkpoints_1aho_n1000v3/` | 1AHO n=1000 | **-0.7376** (ep 18) | NLL loss; 2-GPU, 100 ep done |
 
 Next: generate 9× 1000-sample batches (seeds 100–900) → pack each → retrain on 9k samples, 4 GPUs.
+
+## 1AHO Iterative Rebuild (varconf_sweep)
+
+`explore_1aho_fusion.py` + `rebuild_iterate.py` implement a post-weight-snap rebuild loop for the 1AHO model: score Fo-Fc density outliers, apply top-N prune/add actions on gt48 conformers, run refmac NCYC=5, repeat.
+
+**k16_old results** (`1aho/varconf_sweep/k16_old/`):
+- Starting R=0.046/Rf=0.050 (16-slot weight-snap)
+- After 10 rounds: R=0.039/Rf=0.042
+- Peak candidate criterion (atom-position sampling of Fo-Fc at absent conformers) added but was always redundant with the regular scorer — peak was always already in the top-N list
+- CYS26/CYS48 disulfide never appeared as a candidate; disulfide residues have low per-atom Fo-Fc signal
+
+**Key implementation notes:**
+- `run_refmac_quick` must resolve input paths to absolute before calling refmac (refmac runs in a tmpdir via `cwd=`, so relative paths fail)
+- `find_map_peak_candidate` samples the DELFWT map at absent conformer atom positions (not the global map maximum, which lands in symmetry copies in P2₁2₁2₁)
+- SS-coupled residues (CYS16/36, CYS22/46, CYS26/48, CYS12/63) are added as pairs
 
 ---
 
@@ -156,3 +173,5 @@ Next: generate 9× 1000-sample batches (seeds 100–900) → pack each → retra
 - **DataParallel + pin_memory deadlock**: `pin_memory=True` with DataParallel and forked DataLoader workers causes a hang. `train.py` disables pin_memory when `n_gpus > 1`.
 - **pack.py target**: Y.npy stores `znorm(truth - fc)` (the difference map), not `znorm(truth)`. S.npy stores `log(std(truth - fc))`. Matches `ElectronDensityDataset` exactly.
 - **Einsteinium module loading**: `module load --force ml/pytorch/2.3.1-py3.11.7-mf` requires `Core` in MODULEPATH and the `--force` flag; CUDA/cuDNN warnings on login nodes are harmless.
+- **refmac cwd vs relative paths**: `run_refmac_quick` runs refmac with `cwd=tmpdir`; always resolve XYZIN and HKLIN to absolute paths before passing them in, or refmac will fail with "Cannot find input file".
+- **P2₁2₁2₁ map global peak in symmetry copies**: `transform_f_phi_to_map` returns the full unit cell (4 ASU copies). The global maximum is often in a non-ASU region. When searching for density near protein atoms, sample the map at known atom positions rather than finding the global peak and searching nearby.

@@ -32,120 +32,32 @@ from explore_1aho_fusion import (
     REFMAC5, run,
     parse_conformers, build_fobs_mtz,
     generate_occ_groups, parse_rfactors, load_density_map,
-    _maximin_select,
+    select_chains_maximin, build_starthere_pdb,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-DEFAULT_PDB = Path('1aho/refmacout_minRfree.pdb')
-DEFAULT_MTZ = Path('1aho/refme_minRfree.mtz')
+DEFAULT_PDB = Path('1aho/gt48.pdb')
+DEFAULT_MTZ = Path('1aho/gt48.mtz')
 
-K_LEVELS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48]
-
-
-COMBINE_PDBS = SCRIPT_DIR / 'combine_pdbs_runme.com'
-
-
-# ── Chain-level maximin selection ─────────────────────────────────────────────
-
-def select_chains_maximin(chain_names, conf_data, k):
-    """Select k representative chains by maximin over CA centroid positions.
-
-    Returns (selected_chain_names, voronoi_occs).
-    Each chain has equal prior weight (1/n_chains); representative occ = sum
-    of assigned chains' weights.
-    """
-    n = len(chain_names)
-    k = min(k, n)
-    centroids = np.zeros((n, 3))
-    for i, cn in enumerate(chain_names):
-        pts = []
-        for reskey, rd in conf_data[cn].items():
-            ca = rd['atoms'].get('CA')
-            if ca:
-                pts.append([ca.pos.x, ca.pos.y, ca.pos.z])
-        if pts:
-            centroids[i] = np.mean(pts, axis=0)
-
-    selected_idx = _maximin_select(centroids, k)
-    sel_pts = centroids[selected_idx]
-    dists = np.linalg.norm(centroids[:, None, :] - sel_pts[None, :, :], axis=2)
-    assign = np.argmin(dists, axis=1)
-    w = 1.0 / n
-    voronoi_occs = [float((assign == gi).sum()) * w for gi in range(k)]
-    selected = [chain_names[i] for i in selected_idx]
-    return selected, voronoi_occs
-
-
-def _write_chain_pdb(chain_name, occ, conf_data, ref_chain_data, cell, spacegroup_hm, outpath):
-    """Write one conformer chain as a PDB with chain_id = altloc = chain_name."""
-    lines = [f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
-             f"{cell.alpha:7.2f}{cell.beta:7.2f}{cell.gamma:7.2f}"
-             f" {spacegroup_hm:<11s}1\n"]
-    serial = 1
-    rd_this = conf_data[chain_name]
-    for reskey, ref_rd in ref_chain_data.items():
-        if reskey not in rd_this:
-            continue
-        rd = rd_this[reskey]
-        resname = rd['resname']
-        is_het = resname in ('HOH', 'WAT', 'H2O')
-        rec = 'HETATM' if is_het else 'ATOM  '
-        seqnum = ref_rd['seqid'].num
-        icode  = ref_rd['seqid'].icode if ref_rd['seqid'].icode != ' ' else ' '
-        for aname, ref_atom in ref_rd['atoms'].items():
-            atom = rd['atoms'].get(aname)
-            if atom is None:
-                atom = ref_atom
-            elem = atom.element.name.upper()
-            name4 = f' {aname:<3s}' if len(elem) == 1 and len(aname) < 4 else f'{aname:<4s}'
-            lines.append(
-                f'{rec}{serial:5d} {name4}{chain_name}'
-                f'{resname:<3s} {chain_name:1s}'
-                f'{seqnum:4d}{icode:1s}   '
-                f'{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}'
-                f'{occ:6.2f}{atom.b_iso:6.2f}'
-                f'          {elem:>2s}\n'
-            )
-            serial += 1
-    lines.append('END\n')
-    Path(outpath).write_text(''.join(lines))
-
-
-def build_starthere_pdb(chain_names, conf_data, st_orig, k, ref_pdb, out_pdb, workdir):
-    """Select k chains by maximin, write individual PDBs, combine via combine_pdbs_runme.com."""
-    selected, occs = select_chains_maximin(chain_names, conf_data, k)
-    print(f'    selected chains: {selected}')
-    ref_chain_data = conf_data[chain_names[0]]
-
-    chain_pdbs = []
-    for cn, occ in zip(selected, occs):
-        p = workdir / f'_chain_{cn}.pdb'
-        _write_chain_pdb(cn, occ, conf_data, ref_chain_data,
-                         st_orig.cell, st_orig.spacegroup_hm, p)
-        chain_pdbs.append(str(p))
-
-    result = subprocess.run(
-        ['tcsh', str(COMBINE_PDBS)] + chain_pdbs +
-        [f'refpdb={ref_pdb}', f'outfile={out_pdb}'],
-        capture_output=True, text=True, cwd=workdir,
-    )
-    if result.returncode != 0 or not Path(out_pdb).exists():
-        raise RuntimeError(f'combine_pdbs_runme.com failed:\n{result.stdout}\n{result.stderr}')
-    print(f'    k={k}  n_chains={len(selected)}  occs={[f"{o:.3f}" for o in occs]}')
-    return len(selected)
+K_LEVELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
+            39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
 
 
 # ── Refmac helpers ────────────────────────────────────────────────────────────
 
-def _run_one(xyzin, xyzout, hklout, fobs_mtz, ncyc, weight_matrix, tmpdir):
+def _run_one(xyzin, xyzout, hklout, fobs_mtz, ncyc, weight_matrix, tmpdir,
+             damp=None, fp_col='FP', occ_refine=False):
     """Single refmac run. Returns (R, Rfree, log_text)."""
-    occ_kw = generate_occ_groups(xyzin)
-    kw  = b'LABIN FP=FP SIGFP=SIGFP FPART1=Fpart PHIP1=PHIpart FREE=FreeR_flag\n'
+    if damp is None:
+        damp = min(0.5, 0.5 / weight_matrix) if weight_matrix > 1.0 else 0.5
+    kw  = f'LABIN FP={fp_col} FPART1=Fpart PHIP1=PHIpart FREE=FreeR_flag\n'.encode()
     kw += b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT DELFWT=DELFWT PHDELWT=PHDELWT\n'
-    kw += b'solvent no\nscpart 1\ndamp 0.5 0.5\nmake hout Y\nmake hydr Y\n'
+    kw += f'solvent no\nscpart 1\ndamp {damp:.4f} {damp:.4f}\nmake hout Y\nmake hydr Y\n'.encode()
     kw += f'weight matrix {weight_matrix}\nNCYC {ncyc}\n'.encode()
-    kw += occ_kw
+    if occ_refine:
+        kw += generate_occ_groups(xyzin)
     kw += b'END\n'
     log = run(
         [REFMAC5,
@@ -158,29 +70,45 @@ def _run_one(xyzin, xyzout, hklout, fobs_mtz, ncyc, weight_matrix, tmpdir):
     return r, rf, log
 
 
-def run_weightsnap(starthere_pdb, fobs_mtz, tmpdir):
-    """Three-stage weight-snap: NCYC10@wm10 → NCYC10@wm0.01 → NCYC50@wm0.5.
+# Each stage: (ncyc, weight_matrix, occ_refine)
+# Settle geometry first (no occ), then refine occupancies at higher weights.
+WEIGHT_STAGES = (
+    (10, 0.01,  False),
+    (10, 0.1,   False),
+    (10, 1.0,   False),
+    (10, 10.0,  True),
+    (10, 0.5,   True),
+)
 
-    Returns (r_init, rf_init, r_final, rf_final, elapsed_s, final_mtz_path).
+
+def run_weightsnap(starthere_pdb, fobs_mtz, tmpdir, stages=WEIGHT_STAGES,
+                   fp_col='FP'):
+    """Multi-stage weight-snap refinement.
+
+    Default: 0.01→0.1→1→10→0.5, building up X-ray weight then settling.
+    Returns (r_init, rf_init, r_final, rf_final, elapsed_s, final_mtz, final_pdb).
     """
     t0 = time.time()
-    pdb_a, pdb_b, pdb_c = tmpdir/'_a.pdb', tmpdir/'_b.pdb', tmpdir/'_c.pdb'
-    mtz_a, mtz_b, mtz_c = tmpdir/'_a.mtz', tmpdir/'_b.mtz', tmpdir/'_c.mtz'
-
-    r1, rf1, log1 = _run_one(starthere_pdb, pdb_a, mtz_a, fobs_mtz, 10,  10,   tmpdir)
-    if not pdb_a.exists():
-        (tmpdir / '_refmac_stage1.log').write_text(log1)
-        raise RuntimeError(f'refmac stage1 failed; log saved to {tmpdir}/_refmac_stage1.log\n'
-                           + log1[-3000:])
-    r2, rf2, log2 = _run_one(pdb_a,         pdb_b, mtz_b, fobs_mtz, 10,  0.01, tmpdir)
-    if not pdb_b.exists():
-        (tmpdir / '_refmac_stage2.log').write_text(log2)
-        raise RuntimeError(f'refmac stage2 failed; log saved to {tmpdir}/_refmac_stage2.log\n'
-                           + log2[-3000:])
-    r3, rf3, log3 = _run_one(pdb_b,         pdb_c, mtz_c, fobs_mtz, 50,  0.5,  tmpdir)
-
+    r_init = rf_init = None
+    all_logs = []
+    xyzin = starthere_pdb
+    for si, stage in enumerate(stages):
+        ncyc, wm, occ = (stage + (False,))[:3]
+        label = f'_stage{si}'
+        xyzout = tmpdir / f'{label}.pdb'
+        hklout = tmpdir / f'{label}.mtz'
+        r, rf, log = _run_one(xyzin, xyzout, hklout, fobs_mtz, ncyc, wm, tmpdir,
+                               fp_col=fp_col, occ_refine=occ)
+        if not xyzout.exists():
+            (tmpdir / f'{label}.log').write_text(log)
+            raise RuntimeError(f'refmac stage {si} (wm={wm}) failed; '
+                               f'log saved to {tmpdir}/{label}.log\n' + log[-3000:])
+        if r_init is None:
+            r_init, rf_init = r, rf
+        xyzin = xyzout
+        all_logs.append(f'\n{"="*60}\n Stage {si}  wm={wm}  ncyc={ncyc}\n{"="*60}\n' + log)
     elapsed = time.time() - t0
-    return r1, rf1, r3, rf3, elapsed, (mtz_c if mtz_c.exists() else None), (pdb_c if pdb_c.exists() else None)
+    return r_init, rf_init, r, rf, elapsed, (hklout if hklout.exists() else None), (xyzout if xyzout.exists() else None), ''.join(all_logs)
 
 
 # ── Worker: run one k level ───────────────────────────────────────────────────
@@ -200,12 +128,13 @@ def run_one_k(max_k, pdb_path, fobs_mtz, outdir):
                                 ref_pdb=pdb_path, out_pdb=starthere_pdb,
                                 workdir=k_dir)
     print(f'[k={max_k}] Running weight-snap refinement...')
-    r_i, rf_i, r_f, rf_f, elapsed, final_mtz, final_pdb = run_weightsnap(
+    r_i, rf_i, r_f, rf_f, elapsed, final_mtz, final_pdb, refmac_log = run_weightsnap(
         starthere_pdb, fobs_mtz, k_dir)
     if final_mtz and final_mtz.exists():
         final_mtz.rename(k_dir / 'refmacout.mtz')
     if final_pdb and final_pdb.exists():
         final_pdb.rename(k_dir / 'refmacout.pdb')
+    (k_dir / 'refmac.log').write_text(refmac_log)
 
     result = dict(max_k=max_k, n_alt=n_alt, elapsed=elapsed,
                   r_init=r_i, rf_init=rf_i, r_final=r_f, rf_final=rf_f)

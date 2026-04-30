@@ -16,6 +16,7 @@ Run with:
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -27,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import gemmi
 
-SCRIPT_DIR = Path(__file__).parent
+SCRIPT_DIR = Path(__file__).resolve().parent
 REFMAC5    = Path('/programs/ccp4-8.0/bin/refmac5')
 DMIN       = 0.965
 
@@ -330,12 +331,16 @@ def heavy_atom_max_dev(reskey, conf_data, chain_names):
 
 def dev_to_nconf(dev):
     """Map per-residue heavy-atom max deviation (Å) to number of altloc groups."""
-    if dev < 1.5:
+    if dev < 1.0:
         return 3
-    elif dev < 3.5:
+    elif dev < 1.5:
         return 8
-    else:
+    elif dev < 3.0:
         return 16
+    elif dev < 4.0:
+        return 32
+    else:
+        return 48
 
 
 def ca_max_spread(reskey, conf_data, chain_names):
@@ -668,7 +673,7 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             else:
                 k = min(n_conf, dev_to_nconf(res_devs.get(reskey, 0.0)))
                 if max_k is not None:
-                    k = min(n_conf, max_k)   # max_k overrides dev_to_nconf in both directions
+                    k = min(k, max_k)
                 all_groups, bouq_voccs = split_by_maximin(all_anames, k)
             multi = len(all_groups) > 1
             if multi:
@@ -679,50 +684,23 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
             chain_out.add_residue(res_out)
             continue
 
-        # ── Regular residues: separate MC/SC processing ──────────────────────
-        spread_for_mc = ca_max_spread(reskey, conf_data, chain_names)
-        mc_mode = mc_bouq if spread_for_mc > mc_bouq_threshold else mc_ord
-        mc_k = int(mc_mode.split('_k')[1]) if '_k' in mc_mode else 1
-        if max_k is not None:
-            mc_k = min(n_conf, max_k)
-        mc_multi = (mc_k > 1 and n_conf >= 2)
-        if mc_multi:
-            mc_groups, mc_voccs = split_by_maximin(mc_anames, mc_k)
-            n_altloc_res += 1
-        else:
-            mc_groups, mc_voccs = [all_idx], None
-            mc_k = 1
-
-        mc_letters = mc_k if mc_multi else 0
-        mc_labels  = ALL_ALT_LABELS[:mc_letters] if mc_multi else ALL_ALT_LABELS
-        atoms_from_groups(mc_anames, mc_groups, multi_altloc=mc_multi, labels=mc_labels,
-                          group_occs=mc_voccs)
-
-        if not sc_anames:
-            chain_out.add_residue(res_out)
-            continue
-
-        sc_max_k  = len(ALL_ALT_LABELS) - mc_letters
-        sc_labels = ALL_ALT_LABELS[mc_letters:]
-
+        # ── Regular residues: unified MC+SC processing (same altloc labels) ──
         mode = sc_ord
-        if mode == 'adaptive':
-            k = 1
-        else:
-            k = int(mode.split('_k')[1]) if '_k' in mode else 1
+        k = int(mode.split('_k')[1]) if '_k' in mode else 1
         if max_k is not None:
-            k = min(n_conf, max_k)
-        k = min(k, sc_max_k)
+            k = min(k, max_k)
+        k = min(k, n_conf)
         if k <= 1:
-            atoms_from_groups(sc_anames, [all_idx], multi_altloc=False, labels=sc_labels)
+            atoms_from_groups(all_anames, [all_idx], multi_altloc=False,
+                              labels=ALL_ALT_LABELS)
             chain_out.add_residue(res_out)
             continue
-        sc_groups, sc_voccs = split_by_maximin(sc_anames, k)
-        multi = len(sc_groups) > 1
+        all_groups, all_voccs = split_by_maximin(all_anames, k)
+        multi = len(all_groups) > 1
         if multi:
             n_altloc_res += 1
-        atoms_from_groups(sc_anames, sc_groups, multi_altloc=multi, labels=sc_labels,
-                          group_occs=sc_voccs)
+        atoms_from_groups(all_anames, all_groups, multi_altloc=multi,
+                          labels=ALL_ALT_LABELS, group_occs=all_voccs)
 
         chain_out.add_residue(res_out)
 
@@ -734,6 +712,787 @@ def build_reduced_pdb(st_orig, chain_names, conf_data, strategy,
     _write_pdb_direct(st_out, out_pdb)
     print(f'    bouquet residues: {n_bouquet}  altloc residues: {n_altloc_res}')
     return out_pdb, n_bouquet, n_altloc_res
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Whole-chain maximin condensation (k=N chain selection via combine_pdbs_runme.com)
+# ─────────────────────────────────────────────────────────────────────────────
+
+COMBINE_PDBS = SCRIPT_DIR / 'combine_pdbs_runme.com'
+
+
+def select_chains_maximin(chain_names, conf_data, k):
+    """Select k representative chains by maximin over per-chain CA centroid.
+
+    Returns (selected_chain_names, voronoi_occs) where each occ = fraction
+    of the 48 conformers assigned to that representative.
+    """
+    n = len(chain_names)
+    k = min(k, n)
+    centroids = np.zeros((n, 3))
+    for i, cn in enumerate(chain_names):
+        pts = [[a.pos.x, a.pos.y, a.pos.z]
+               for rd in conf_data[cn].values()
+               for a in [rd['atoms'].get('CA')] if a]
+        if pts:
+            centroids[i] = np.mean(pts, axis=0)
+    selected_idx = _maximin_select(centroids, k)
+    sel_pts = centroids[selected_idx]
+    assign = np.argmin(
+        np.linalg.norm(centroids[:, None] - sel_pts[None], axis=2), axis=1)
+    w = 1.0 / n
+    return ([chain_names[i] for i in selected_idx],
+            [float((assign == gi).sum()) * w for gi in range(k)])
+
+
+def _write_chain_pdb(chain_name, occ, conf_data, ref_chain_data,
+                     cell, spacegroup_hm, outpath):
+    """Write one conformer chain as a PDB with chain_id = altloc = chain_name."""
+    lines = [f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
+             f"{cell.alpha:7.2f}{cell.beta:7.2f}{cell.gamma:7.2f}"
+             f" {spacegroup_hm:<11s}1\n"]
+    serial = 1
+    rd_this = conf_data[chain_name]
+    for reskey, ref_rd in ref_chain_data.items():
+        if reskey not in rd_this:
+            continue
+        rd = rd_this[reskey]
+        resname = rd['resname']
+        is_het = resname in ('HOH', 'WAT', 'H2O')
+        rec = 'HETATM' if is_het else 'ATOM  '
+        seqnum = ref_rd['seqid'].num
+        icode = ref_rd['seqid'].icode if ref_rd['seqid'].icode != ' ' else ' '
+        for aname, ref_atom in ref_rd['atoms'].items():
+            atom = rd['atoms'].get(aname, ref_atom)
+            elem = atom.element.name.upper()
+            name4 = f' {aname:<3s}' if len(elem) == 1 and len(aname) < 4 else f'{aname:<4s}'
+            lines.append(
+                f'{rec}{serial:5d} {name4}{chain_name}'
+                f'{resname:<3s} {chain_name:1s}'
+                f'{seqnum:4d}{icode:1s}   '
+                f'{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}'
+                f'{occ:6.2f}{atom.b_iso:6.2f}'
+                f'          {elem:>2s}\n'
+            )
+            serial += 1
+    lines.append('END\n')
+    Path(outpath).write_text(''.join(lines))
+
+
+def write_full_conf_pdb(conf_data, chain_names, st_for_hoh,
+                        flood_pos, flood_occ, cell, spacegroup_hm, out_pdb):
+    """Write truth PDB: all protein conformers from conf_data + HOH + flood waters.
+
+    Each conformer chain gets occ = 1/n_chains.  HOH-only chains are copied
+    verbatim from st_for_hoh.  Flood waters are written as chain W.
+    """
+    n = len(chain_names)
+    occ_each = 1.0 / n
+    cryst = (f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
+             f"{cell.alpha:7.2f}{cell.beta:7.2f}{cell.gamma:7.2f}"
+             f" {spacegroup_hm:<11s}1\n")
+    lines = [cryst]
+    serial = 1
+    ref_chain_data = conf_data[chain_names[0]]
+
+    for cn in chain_names:
+        rd_this = conf_data[cn]
+        for reskey, ref_rd in ref_chain_data.items():
+            if reskey not in rd_this:
+                continue
+            rd = rd_this[reskey]
+            resname = rd['resname']
+            is_het = resname in ('HOH', 'WAT', 'H2O')
+            rec = 'HETATM' if is_het else 'ATOM  '
+            seqnum = ref_rd['seqid'].num
+            icode = ref_rd['seqid'].icode if ref_rd['seqid'].icode != ' ' else ' '
+            for aname, ref_atom in ref_rd['atoms'].items():
+                atom = rd['atoms'].get(aname, ref_atom)
+                elem = atom.element.name.upper()
+                name4 = f' {aname:<3s}' if len(elem) == 1 and len(aname) < 4 else f'{aname:<4s}'
+                lines.append(
+                    f'{rec}{serial:5d} {name4}{cn}'
+                    f'{resname:<3s} {cn:1s}'
+                    f'{seqnum:4d}{icode:1s}   '
+                    f'{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}'
+                    f'{occ_each:6.2f}{atom.b_iso:6.2f}'
+                    f'          {elem:>2s}\n'
+                )
+                serial += 1
+
+    for chain in st_for_hoh[0]:
+        if not all(res.name in ('HOH', 'WAT', 'H2O') for res in chain):
+            continue
+        for res in chain:
+            seqnum = res.seqid.num
+            icode = res.seqid.icode if res.seqid.icode != ' ' else ' '
+            for atom in res:
+                elem = atom.element.name.upper()
+                name4 = f' {atom.name:<3s}' if len(elem) == 1 and len(atom.name) < 4 else f'{atom.name:<4s}'
+                lines.append(
+                    f'HETATM{serial:5d} {name4} '
+                    f'HOH {chain.name:1s}'
+                    f'{seqnum:4d}{icode:1s}   '
+                    f'{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}'
+                    f'{atom.occ:6.2f}{atom.b_iso:6.2f}'
+                    f'          {elem:>2s}\n'
+                )
+                serial += 1
+
+    for i, (x, y, z) in enumerate(flood_pos):
+        lines.append(
+            f'HETATM{serial:5d}  O   HOH W{i+1:4d}    '
+            f'{x:8.3f}{y:8.3f}{z:8.3f}'
+            f'{flood_occ:6.2f}{20.0:6.2f}'
+            f'           O\n'
+        )
+        serial += 1
+
+    lines.append('END\n')
+    Path(out_pdb).write_text(''.join(lines))
+
+
+def build_starthere_pdb(chain_names, conf_data, st_orig, k, ref_pdb, out_pdb, workdir):
+    """Select k chains by maximin; concatenate chain PDBs directly.
+
+    Returns n_chains selected.
+    """
+    selected, occs = select_chains_maximin(chain_names, conf_data, k)
+    ref_chain_data = conf_data[chain_names[0]]
+    all_lines = []
+    cryst_written = False
+    for cn, occ in zip(selected, occs):
+        p = Path(workdir) / f'_chain_{cn}.pdb'
+        _write_chain_pdb(cn, occ, conf_data, ref_chain_data,
+                         st_orig.cell, st_orig.spacegroup_hm, p)
+        for line in p.read_text().splitlines(keepends=True):
+            if line.startswith('CRYST1'):
+                if not cryst_written:
+                    all_lines.append(line)
+                    cryst_written = True
+            elif not line.startswith('END'):
+                all_lines.append(line)
+    all_lines.append('END\n')
+    Path(out_pdb).write_text(''.join(all_lines))
+    print(f'    k={k}: selected {selected}')
+    return len(selected)
+
+
+def _select_residue_maximin(chain_names, conf_data, reskey, k):
+    """Select k chains by maximin on a single residue's heavy-atom centroid."""
+    coords, valid = [], []
+    for cn in chain_names:
+        rd = conf_data[cn].get(reskey)
+        if rd is None:
+            continue
+        pts = [[a.pos.x, a.pos.y, a.pos.z]
+               for a in rd['atoms'].values()
+               if a.element.name not in ('H', 'D')]
+        if pts:
+            coords.append(np.mean(pts, axis=0))
+            valid.append(cn)
+    if not valid:
+        return chain_names[:k]
+    k = min(k, len(valid))
+    idx = _maximin_select(np.array(coords), k)
+    return [valid[i] for i in idx]
+
+
+_SLOT_CHAINS = list('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
+
+
+def build_varconf_pdb(chain_names, conf_data, st_orig, out_pdb, workdir, max_k=None,
+                      water_pdb=None, limit_o=True):
+    """Build variable-conformer-count PDB using chain_id=altloc format.
+
+    Per-residue maximin selects the best k_r source chains independently for
+    each residue.  Output uses canonical slot chain_ids (A, B, C, …) so each
+    output chain is a complete peptide with consistent covalent connectivity.
+    max_k caps the per-residue conformer count (None = no cap).
+    water_pdb: path to PDB containing HETATM water records to append verbatim.
+
+    Returns (slot_chains_used, res_k) where res_k maps reskey → k.
+    """
+    ref_chain = chain_names[0]
+    ref_chain_data = conf_data[ref_chain]
+    residue_keys = list(ref_chain_data.keys())
+
+    res_devs = {rk: heavy_atom_max_dev(rk, conf_data, chain_names)
+                for rk in residue_keys}
+    cap = min(len(chain_names), max_k) if max_k is not None else len(chain_names)
+    res_k = {rk: min(cap, dev_to_nconf(res_devs[rk]))
+             for rk in residue_keys}
+
+    # Carbonyl O of residue r forms the peptide bond with N of residue r+1.
+    # Limit O to the same slots as r+1 so inter-residue geometry restraints exist.
+    next_reskey = {rk: residue_keys[j + 1]
+                   for j, rk in enumerate(residue_keys) if j + 1 < len(residue_keys)}
+    if limit_o:
+        res_k_O = {rk: min(res_k[rk], res_k[next_reskey[rk]]) if rk in next_reskey else res_k[rk]
+                   for rk in residue_keys}
+    else:
+        res_k_O = res_k  # no O-limiting: O appears in all chains (exposes blowup bug)
+
+    k_max = max(res_k.values())
+    slot_names = _SLOT_CHAINS[:k_max]
+
+    # Per-residue maximin: for each residue independently select k_r source chains
+    per_res_sel = {rk: _select_residue_maximin(chain_names, conf_data, rk, res_k[rk])
+                   for rk in residue_keys}
+
+    cryst = (f"CRYST1{st_orig.cell.a:9.3f}{st_orig.cell.b:9.3f}{st_orig.cell.c:9.3f}"
+             f"{st_orig.cell.alpha:7.2f}{st_orig.cell.beta:7.2f}{st_orig.cell.gamma:7.2f}"
+             f" {st_orig.spacegroup_hm:<11s}1\n")
+    all_lines = [cryst]
+    serial = 1
+
+    for slot_i, slot_cn in enumerate(slot_names):
+        for reskey, ref_rd in ref_chain_data.items():
+            if slot_i >= res_k[reskey]:
+                continue
+            src_cn = per_res_sel[reskey][slot_i]
+            rd_this = conf_data[src_cn]
+            if reskey not in rd_this:
+                continue
+            rd = rd_this[reskey]
+            resname = rd['resname']
+            is_het = resname in ('HOH', 'WAT', 'H2O')
+            rec = 'HETATM' if is_het else 'ATOM  '
+            seqnum = ref_rd['seqid'].num
+            icode = ref_rd['seqid'].icode if ref_rd['seqid'].icode != ' ' else ' '
+            for aname, ref_atom in ref_rd['atoms'].items():
+                eff_k = res_k_O[reskey] if (aname == 'O' and not is_het) else res_k[reskey]
+                if slot_i >= eff_k:
+                    continue
+                occ = 1.0 / eff_k
+                atom = rd['atoms'].get(aname, ref_atom)
+                elem = atom.element.name.upper()
+                name4 = f' {aname:<3s}' if len(elem) == 1 and len(aname) < 4 else f'{aname:<4s}'
+                all_lines.append(
+                    f'{rec}{serial:5d} {name4}{slot_cn}'
+                    f'{resname:<3s} {slot_cn:1s}'
+                    f'{seqnum:4d}{icode:1s}   '
+                    f'{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}'
+                    f'{occ:6.2f}{atom.b_iso:6.2f}'
+                    f'          {elem:>2s}\n'
+                )
+                serial += 1
+
+    if water_pdb is not None:
+        for wline in Path(water_pdb).read_text().splitlines(keepends=True):
+            if wline.startswith('HETATM') or wline.startswith('ATOM'):
+                all_lines.append(wline)
+    all_lines.append('END\n')
+    Path(out_pdb).write_text(''.join(all_lines))
+    print(f'    k_max={k_max}: {len(slot_names)} slot chains (per-residue maximin)')
+    print(f'    res_k distribution: ' +
+          ', '.join(f'{k}×{sum(1 for v in res_k.values() if v==k)}'
+                    for k in sorted(set(res_k.values()))))
+    return slot_names, res_k, per_res_sel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fo-Fc density probing and conformer rebuild
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MC_ATOMS = frozenset({'N', 'CA', 'C', 'O', 'CB'})
+
+
+def _probe_density_gemmi(grid, sigma, gemmi_res, sidechain_only=True):
+    """Return (min, max) Fo-Fc in sigma units over heavy atoms of a gemmi Residue.
+
+    Any atom exceeding a threshold triggers action — we don't average.
+    """
+    vals = []
+    for atom in gemmi_res:
+        if atom.element.name in ('H', 'D'):
+            continue
+        if sidechain_only and atom.name in _MC_ATOMS:
+            continue
+        vals.append(grid.interpolate_value(
+            gemmi.Position(atom.pos.x, atom.pos.y, atom.pos.z)))
+    if not vals:  # Gly or no sidechain: fall back to all heavy atoms
+        for atom in gemmi_res:
+            if atom.element.name not in ('H', 'D'):
+                vals.append(grid.interpolate_value(
+                    gemmi.Position(atom.pos.x, atom.pos.y, atom.pos.z)))
+    if not vals:
+        return 0.0, 0.0
+    return float(min(vals)) / sigma, float(max(vals)) / sigma
+
+
+def _probe_density_conf(grid, sigma, atom_dict, sidechain_only=True):
+    """Return (min, max) Fo-Fc in sigma units over atoms from a conf_data atom dict."""
+    vals = []
+    for aname, atom in atom_dict.items():
+        if atom.element.name in ('H', 'D'):
+            continue
+        if sidechain_only and aname in _MC_ATOMS:
+            continue
+        vals.append(grid.interpolate_value(
+            gemmi.Position(atom.pos.x, atom.pos.y, atom.pos.z)))
+    if not vals:
+        for aname, atom in atom_dict.items():
+            if atom.element.name not in ('H', 'D'):
+                vals.append(grid.interpolate_value(
+                    gemmi.Position(atom.pos.x, atom.pos.y, atom.pos.z)))
+    if not vals:
+        return 0.0, 0.0
+    return float(min(vals)) / sigma, float(max(vals)) / sigma
+
+
+def _find_disulfide_pairs(conf_data, chain_names, sg_dist=2.5):
+    """Return dict mapping each CYS reskey to its disulfide partner reskey."""
+    cn = chain_names[0]
+    cys_res = [(rk, rd) for rk, rd in conf_data[cn].items()
+               if rd['resname'] == 'CYS']
+    pairs = {}
+    for i, (rk1, rd1) in enumerate(cys_res):
+        sg1 = rd1['atoms'].get('SG')
+        if sg1 is None:
+            continue
+        for rk2, rd2 in cys_res[i + 1:]:
+            sg2 = rd2['atoms'].get('SG')
+            if sg2 is None:
+                continue
+            d = np.sqrt((sg1.pos.x - sg2.pos.x) ** 2 +
+                        (sg1.pos.y - sg2.pos.y) ** 2 +
+                        (sg1.pos.z - sg2.pos.z) ** 2)
+            if d < sg_dist:
+                pairs[rk1] = rk2
+                pairs[rk2] = rk1
+    return pairs
+
+
+# ── per_res_sel JSON persistence ─────────────────────────────────────────────
+
+def _rk_to_str(rk):
+    return f'{rk[0]}_{rk[1]}'
+
+
+def _str_to_rk(s):
+    num, icode = s.split('_', 1)
+    return (int(num), icode)
+
+
+def save_per_res_sel(per_res_sel, path):
+    """Serialise per_res_sel {(seqnum,icode): [chain,...]} → JSON file."""
+    Path(path).write_text(json.dumps(
+        {_rk_to_str(rk): chains for rk, chains in per_res_sel.items()},
+        indent=2))
+
+
+def load_per_res_sel(path):
+    """Load per_res_sel from JSON written by save_per_res_sel."""
+    return {_str_to_rk(k): v for k, v in json.loads(Path(path).read_text()).items()}
+
+
+# ── Density scoring ───────────────────────────────────────────────────────────
+
+def _load_slot_res(refmacout_pdb, hoh_names=('HOH', 'WAT', 'H2O')):
+    """Return slot_cn → {reskey: gemmi.Residue} from a refmacout PDB."""
+    st_ref = gemmi.read_structure(str(refmacout_pdb))
+    slot_res = {}
+    for ch in st_ref[0]:
+        rmap = {}
+        for res in ch:
+            if res.name in hoh_names:
+                continue
+            rk = (res.seqid.num, res.seqid.icode.strip())
+            rmap[rk] = res
+        slot_res[ch.name] = rmap
+    return slot_res
+
+
+def score_density_outliers(refmacout_pdb, refmacout_mtz,
+                            conf_data, chain_names,
+                            per_res_sel, residue_keys, ref_chain_data,
+                            neg_thresh=-3.0, pos_thresh=3.0):
+    """Score every prune/add candidate by its peak Fo-Fc excess.
+
+    Returns (candidates, sigma).  candidates is sorted by excess descending:
+      [{'action': 'prune'|'add', 'excess': float, 'score': float,
+        'rk': tuple, 'slot_i': int|None, 'gt48_cn': str,
+        'resname': str, 'dmin': float, 'dmax': float}, ...]
+    excess = how far past threshold (larger = higher priority).
+    """
+    HOH_NAMES = ('HOH', 'WAT', 'H2O')
+    mtz = gemmi.read_mtz_file(str(refmacout_mtz))
+    grid = mtz.transform_f_phi_to_map('DELFWT', 'PHDELWT', sample_rate=3.0)
+    sigma = float(np.array(grid).std())
+
+    slot_res = _load_slot_res(refmacout_pdb, HOH_NAMES)
+    slot_order = {cn: i for i, cn in enumerate(_SLOT_CHAINS)}
+
+    candidates = []
+
+    # Prune candidates: current (slot_i, rk) with any atom below neg_thresh.
+    for slot_cn, rmap in slot_res.items():
+        slot_i = slot_order.get(slot_cn)
+        if slot_i is None:
+            continue
+        for rk, gemmi_res in rmap.items():
+            if rk not in per_res_sel or slot_i >= len(per_res_sel[rk]):
+                continue
+            dmin, dmax = _probe_density_gemmi(grid, sigma, gemmi_res)
+            if dmin < neg_thresh:
+                gt48_cn = per_res_sel[rk][slot_i]
+                candidates.append({
+                    'action': 'prune', 'excess': neg_thresh - dmin,
+                    'score': dmin, 'rk': rk, 'slot_i': slot_i,
+                    'gt48_cn': gt48_cn, 'resname': gemmi_res.name,
+                    'dmin': dmin, 'dmax': dmax,
+                })
+
+    # Add candidates: gt48 conformers not in model with any atom above pos_thresh.
+    for rk in residue_keys:
+        current = set(per_res_sel.get(rk, []))
+        rd_ref = ref_chain_data.get(rk)
+        if rd_ref is None:
+            continue
+        resname = rd_ref['resname']
+        if resname in HOH_NAMES:
+            continue
+        for gt48_cn in chain_names:
+            if gt48_cn in current:
+                continue
+            rd = conf_data[gt48_cn].get(rk)
+            if rd is None:
+                continue
+            dmin, dmax = _probe_density_conf(grid, sigma, rd['atoms'])
+            if dmax > pos_thresh:
+                candidates.append({
+                    'action': 'add', 'excess': dmax - pos_thresh,
+                    'score': dmax, 'rk': rk, 'slot_i': None,
+                    'gt48_cn': gt48_cn, 'resname': resname,
+                    'dmin': dmin, 'dmax': dmax,
+                })
+
+    candidates.sort(key=lambda x: x['excess'], reverse=True)
+    return candidates, sigma
+
+
+def find_map_peak_candidate(refmacout_mtz, conf_data, chain_names,
+                             per_res_sel, residue_keys, ref_chain_data,
+                             min_sigma=1.0):
+    """Return the absent gt48 conformer with the highest Fo-Fc atom-density.
+
+    Samples DELFWT/PHDELWT at every atom of every absent conformer and picks
+    the one whose peak atom has the highest density.  min_sigma guards against
+    adding from flat noise.
+
+    Returns a candidate dict (same format as score_density_outliers) or None.
+    """
+    HOH_NAMES = ('HOH', 'WAT', 'H2O')
+    mtz  = gemmi.read_mtz_file(str(refmacout_mtz))
+    grid = mtz.transform_f_phi_to_map('DELFWT', 'PHDELWT', sample_rate=3.0)
+    sigma = float(np.array(grid).std())
+
+    best_dmax = min_sigma
+    best = None
+
+    for rk in residue_keys:
+        current = set(per_res_sel.get(rk, []))
+        rd_ref = ref_chain_data.get(rk)
+        if rd_ref is None:
+            continue
+        resname = rd_ref['resname']
+        if resname in HOH_NAMES:
+            continue
+        for gt48_cn in chain_names:
+            if gt48_cn in current:
+                continue
+            rd = conf_data[gt48_cn].get(rk)
+            if rd is None:
+                continue
+            dmin, dmax = _probe_density_conf(grid, sigma, rd['atoms'])
+            if dmax > best_dmax:
+                best_dmax = dmax
+                best = {
+                    'action': 'add', 'excess': dmax - 3.0,
+                    'score': dmax, 'rk': rk, 'slot_i': None,
+                    'gt48_cn': gt48_cn, 'resname': resname,
+                    'dmin': dmin, 'dmax': dmax,
+                    'peak_sigma': dmax,
+                }
+
+    return best
+
+
+def find_swap_candidate(refmacout_mtz, refmacout_pdb, peak_cand,
+                        per_res_sel, neg_thresh=-3.0):
+    """If the peak candidate's residue has a current slot below neg_thresh in
+    the Fo-Fc map (using refined coordinates), return a 'swap' candidate that
+    replaces that slot with the peak conformer in one top-N action.
+
+    Probes refined coords from refmacout_pdb (not gt48 coords) so the check
+    reflects the actual current model density, not the gt48 template.
+    Note: the new conformer's gt48 xyz must differ from remaining slots for
+    refmac to separate them in occupancy refinement.
+
+    Returns None if no slot is significantly negative.
+    """
+    rk      = peak_cand['rk']
+    current = per_res_sel.get(rk, [])
+    if not current:
+        return None
+
+    mtz   = gemmi.read_mtz_file(str(refmacout_mtz))
+    grid  = mtz.transform_f_phi_to_map('DELFWT', 'PHDELWT', sample_rate=3.0)
+    sigma = float(np.array(grid).std())
+
+    slot_res = _load_slot_res(str(refmacout_pdb))
+
+    worst_i    = None
+    worst_cn   = None
+    worst_dmin = 0.0  # only update if strictly below neg_thresh
+    for i, gt48_cn in enumerate(current):
+        slot_cn   = _SLOT_CHAINS[i]
+        gemmi_res = slot_res.get(slot_cn, {}).get(rk)
+        if gemmi_res is None:
+            continue
+        dmin, _ = _probe_density_gemmi(grid, sigma, gemmi_res)
+        if dmin < worst_dmin:
+            worst_dmin = dmin
+            worst_cn   = gt48_cn
+            worst_i    = i
+
+    if worst_cn is None or worst_dmin >= neg_thresh:
+        return None
+
+    return {
+        'action':      'swap',
+        'excess':      (-worst_dmin) + peak_cand['dmax'],
+        'score':       -worst_dmin,
+        'rk':          rk,
+        'slot_i':      worst_i,
+        'old_gt48_cn': worst_cn,
+        'gt48_cn':     peak_cand['gt48_cn'],
+        'resname':     peak_cand['resname'],
+        'dmin':        worst_dmin,
+        'dmax':        peak_cand['dmax'],
+    }
+
+
+# ── PDB writing for rebuilt models ───────────────────────────────────────────
+
+def _write_rebuilt_pdb(new_per_res_sel, orig_per_res_sel, slot_res,
+                       ref_chain_data, conf_data, residue_keys, st_orig,
+                       out_pdb, water_pdb=None):
+    """Write rebuilt multi-conformer PDB.
+
+    Conformers that were in orig_per_res_sel use slot_res (refmacout.pdb) coords.
+    New conformers (not in orig) use conf_data gt48 coords.
+    Returns new_res_k dict.
+    """
+    HOH_NAMES = ('HOH', 'WAT', 'H2O')
+    new_res_k = {rk: len(sel) for rk, sel in new_per_res_sel.items()}
+
+    next_reskey = {rk: residue_keys[j + 1]
+                   for j, rk in enumerate(residue_keys) if j + 1 < len(residue_keys)}
+    new_res_k_O = {rk: min(new_res_k[rk], new_res_k[next_reskey[rk]])
+                   if rk in next_reskey else new_res_k[rk]
+                   for rk in residue_keys}
+
+    k_max = max(new_res_k.values()) if new_res_k else 1
+    new_slot_names = _SLOT_CHAINS[:k_max]
+
+    # Map (rk, gt48_cn) → slot_cn in refmacout.pdb (based on orig_per_res_sel).
+    orig_gt48_to_slot = {}  # rk → {gt48_cn: slot_cn}
+    for rk, sel in orig_per_res_sel.items():
+        orig_gt48_to_slot[rk] = {cn: _SLOT_CHAINS[i] for i, cn in enumerate(sel)}
+
+    cryst = (f"CRYST1{st_orig.cell.a:9.3f}{st_orig.cell.b:9.3f}{st_orig.cell.c:9.3f}"
+             f"{st_orig.cell.alpha:7.2f}{st_orig.cell.beta:7.2f}{st_orig.cell.gamma:7.2f}"
+             f" {st_orig.spacegroup_hm:<11s}1\n")
+    all_lines = [cryst]
+    serial = 1
+
+    for slot_i, slot_cn in enumerate(new_slot_names):
+        for rk, ref_rd in ref_chain_data.items():
+            sel = new_per_res_sel.get(rk, [])
+            if slot_i >= len(sel):
+                continue
+            gt48_cn = sel[slot_i]
+            eff_k   = new_res_k[rk]
+            eff_k_O = new_res_k_O[rk]
+
+            resname = ref_rd['resname']
+            is_het  = resname in HOH_NAMES
+            rec     = 'HETATM' if is_het else 'ATOM  '
+            seqnum  = ref_rd['seqid'].num
+            icode   = ref_rd['seqid'].icode if ref_rd['seqid'].icode != ' ' else ' '
+
+            # Coordinate source: refined if this gt48_cn was in orig_per_res_sel.
+            orig_slot_cn = orig_gt48_to_slot.get(rk, {}).get(gt48_cn)
+            ref_slot_r   = slot_res.get(orig_slot_cn, {}).get(rk) if orig_slot_cn else None
+
+            for aname, ref_atom in ref_rd['atoms'].items():
+                is_O       = (aname == 'O' and not is_het)
+                eff_k_atom = eff_k_O if is_O else eff_k
+                if slot_i >= eff_k_atom:
+                    continue
+                occ = 1.0 / eff_k_atom
+
+                if ref_slot_r is not None:
+                    gatom = ref_slot_r.find_atom(aname, '\x00')
+                    if gatom is None:
+                        gatom = ref_slot_r.find_atom(aname, '*')
+                    src = (gatom if gatom is not None
+                           else conf_data[gt48_cn].get(rk, {}).get('atoms', {}).get(aname, ref_atom))
+                    x, y, z, b = src.pos.x, src.pos.y, src.pos.z, src.b_iso
+                else:
+                    src = conf_data[gt48_cn].get(rk, {}).get('atoms', {}).get(aname, ref_atom)
+                    x, y, z, b = src.pos.x, src.pos.y, src.pos.z, src.b_iso
+
+                elem  = ref_atom.element.name.upper()
+                name4 = f' {aname:<3s}' if len(elem) == 1 and len(aname) < 4 else f'{aname:<4s}'
+                all_lines.append(
+                    f'{rec}{serial:5d} {name4}{slot_cn}'
+                    f'{resname:<3s} {slot_cn:1s}'
+                    f'{seqnum:4d}{icode:1s}   '
+                    f'{x:8.3f}{y:8.3f}{z:8.3f}'
+                    f'{occ:6.2f}{b:6.2f}'
+                    f'          {elem:>2s}\n'
+                )
+                serial += 1
+
+    if water_pdb is not None:
+        for wline in Path(water_pdb).read_text().splitlines(keepends=True):
+            if wline.startswith('HETATM') or wline.startswith('ATOM'):
+                all_lines.append(wline)
+    all_lines.append('END\n')
+    Path(out_pdb).write_text(''.join(all_lines))
+    return new_res_k
+
+
+# ── Apply top-N rebuild ───────────────────────────────────────────────────────
+
+def apply_rebuild_topn(candidates, top_n, per_res_sel, orig_per_res_sel, slot_res,
+                       residue_keys, ref_chain_data, conf_data, ss_pairs, st_orig,
+                       out_pdb, water_pdb=None):
+    """Apply the top_n candidates (by excess) and write rebuilt PDB.
+
+    Returns (new_per_res_sel, new_res_k, actions_applied).
+    """
+    prune_by_rk = {}  # rk → set of gt48_cn to remove
+    add_by_rk   = {}  # rk → list of gt48_cn to add
+    actions_applied = []
+    n_done = 0
+
+    for cand in candidates:
+        if n_done >= top_n:
+            break
+        rk         = cand['rk']
+        partner_rk = ss_pairs.get(rk)
+
+        if cand['action'] == 'prune':
+            gt48_cn = cand['gt48_cn']
+            prune_by_rk.setdefault(rk, set()).add(gt48_cn)
+            actions_applied.append(cand)
+            n_done += 1
+            print(f'  PRUNE slot {_SLOT_CHAINS[cand["slot_i"]]} (gt48:{gt48_cn}) '
+                  f'res {rk[0]} {cand["resname"]}: '
+                  f'min={cand["dmin"]:.2f}σ max={cand["dmax"]:.2f}σ')
+            if partner_rk is not None:
+                prune_by_rk.setdefault(partner_rk, set()).add(gt48_cn)
+                print(f'  PRUNE SS-partner res {partner_rk[0]} gt48:{gt48_cn}')
+
+        elif cand['action'] == 'add':
+            gt48_cn = cand['gt48_cn']
+            # Skip if already queued for addition
+            if gt48_cn in add_by_rk.get(rk, []):
+                continue
+            add_by_rk.setdefault(rk, []).append(gt48_cn)
+            actions_applied.append(cand)
+            n_done += 1
+            print(f'  ADD   gt48:{gt48_cn} res {rk[0]} {cand["resname"]}: '
+                  f'max={cand["dmax"]:.2f}σ min={cand["dmin"]:.2f}σ')
+            if partner_rk is not None and conf_data[gt48_cn].get(partner_rk):
+                if gt48_cn not in add_by_rk.get(partner_rk, []):
+                    add_by_rk.setdefault(partner_rk, []).append(gt48_cn)
+                    print(f'  ADD   gt48:{gt48_cn} res {partner_rk[0]} (SS-partner)')
+
+        elif cand['action'] == 'swap':
+            old_cn = cand['old_gt48_cn']
+            new_cn = cand['gt48_cn']
+            if old_cn in prune_by_rk.get(rk, set()):
+                continue  # old slot already being pruned
+            if new_cn in add_by_rk.get(rk, []):
+                continue  # new conformer already being added
+            prune_by_rk.setdefault(rk, set()).add(old_cn)
+            add_by_rk.setdefault(rk, []).append(new_cn)
+            actions_applied.append(cand)
+            n_done += 1
+            print(f'  SWAP  slot {_SLOT_CHAINS[cand["slot_i"]]} '
+                  f'(gt48:{old_cn}→{new_cn}) res {rk[0]} {cand["resname"]}: '
+                  f'worst={cand["dmin"]:.2f}σ peak={cand["dmax"]:.2f}σ')
+            if partner_rk is not None:
+                if old_cn in per_res_sel.get(partner_rk, []):
+                    prune_by_rk.setdefault(partner_rk, set()).add(old_cn)
+                if conf_data[new_cn].get(partner_rk) and \
+                        new_cn not in add_by_rk.get(partner_rk, []):
+                    add_by_rk.setdefault(partner_rk, []).append(new_cn)
+                    print(f'  SWAP  SS-partner res {partner_rk[0]} '
+                          f'gt48:{old_cn}→{new_cn}')
+
+    # Build new_per_res_sel.
+    new_per_res_sel = {}
+    for rk in residue_keys:
+        sel      = list(per_res_sel.get(rk, []))
+        prune    = prune_by_rk.get(rk, set())
+        sel      = [cn for cn in sel if cn not in prune]
+        existing = set(sel)
+        for cn in add_by_rk.get(rk, []):
+            if cn not in existing:
+                sel.append(cn)
+                existing.add(cn)
+        new_per_res_sel[rk] = sel
+
+    new_res_k = _write_rebuilt_pdb(
+        new_per_res_sel, orig_per_res_sel, slot_res,
+        ref_chain_data, conf_data, residue_keys, st_orig,
+        out_pdb, water_pdb)
+    return new_per_res_sel, new_res_k, actions_applied
+
+
+# ── rebuild_conformers (applies ALL outliers; kept for backward compat) ───────
+
+def rebuild_conformers(refmacout_pdb, refmacout_mtz,
+                       conf_data, chain_names, per_res_sel,
+                       residue_keys, ref_chain_data, st_orig,
+                       out_pdb, water_pdb=None,
+                       neg_thresh=-3.0, pos_thresh=3.0):
+    """Prune negative-density conformers; add positive-density ones from gt48.
+
+    Applies ALL outliers (no top-N limit).
+    Returns (new_per_res_sel, new_res_k, n_pruned, n_added).
+    """
+    ss_pairs = _find_disulfide_pairs(conf_data, chain_names)
+    print('  Disulfide pairs: ' +
+          ', '.join(f'{a[0]}-{b[0]}' for a, b in sorted(ss_pairs.items()) if a < b))
+
+    candidates, sigma = score_density_outliers(
+        refmacout_pdb, refmacout_mtz, conf_data, chain_names,
+        per_res_sel, residue_keys, ref_chain_data,
+        neg_thresh=neg_thresh, pos_thresh=pos_thresh)
+    n_prune = sum(1 for c in candidates if c['action'] == 'prune')
+    n_add   = sum(1 for c in candidates if c['action'] == 'add')
+    print(f'  Fo-Fc sigma={sigma:.4f} e/Å³  outliers: {n_prune} prune, {n_add} add')
+
+    slot_res = _load_slot_res(refmacout_pdb)
+    new_per_res_sel, new_res_k, actions = apply_rebuild_topn(
+        candidates, top_n=len(candidates),
+        per_res_sel=per_res_sel, orig_per_res_sel=per_res_sel,
+        slot_res=slot_res, residue_keys=residue_keys,
+        ref_chain_data=ref_chain_data, conf_data=conf_data,
+        ss_pairs=ss_pairs, st_orig=st_orig, out_pdb=out_pdb, water_pdb=water_pdb)
+
+    n_pruned = sum(1 for a in actions if a['action'] == 'prune')
+    n_added  = sum(1 for a in actions if a['action'] == 'add')
+    print(f'  Rebuilt: {n_pruned} pruned, {n_added} added  '
+          f'(neg<{neg_thresh}σ, pos>{pos_thresh}σ)')
+    return new_per_res_sel, new_res_k, n_pruned, n_added
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -820,13 +1579,106 @@ def fofc_extrema_report(mtz_path, pdb_path, search_radius=3.0):
 def generate_occ_groups(pdb_path):
     """Generate refmac occupancy group keywords from altloc structure of pdb_path.
 
-    MC altlocs (uppercase) and SC altlocs (lowercase) are treated as separate
-    complete groups so each set sums to occupancy 1.0 independently.
+    Multi-chain conformer format (chain_id == altloc):
+        Per-residue, per-chain groups.  O atoms are handled separately when they
+        appear in fewer chains than the rest of the residue (due to the O-limiting
+        strategy that requires residue r+1 to exist).
+
+        For each residue r:
+          - If all chains that have any atom also have O: one 'alts complete' group
+            per chain for the whole residue.
+          - Otherwise: two independent 'alts complete' blocks —
+              (a) O atom only, over the subset of chains that have O
+              (b) all non-O atoms, enumerated explicitly, over all chains
+
+    Single-chain altloc format:
+        MC altlocs and SC altlocs treated as separate complete groups per residue.
+
     Returns bytes ready to append to refmac keyword input.
     """
+    HOH_NAMES = ('HOH', 'WAT', 'H2O')
     st = gemmi.read_structure(str(pdb_path))
     lines = ['occupancy refine']
     gid = 1
+
+    prot_chains = [ch for ch in st[0]
+                   if any(res.name not in HOH_NAMES for res in ch)]
+
+    # Detect multi-chain conformer format: chain names are single alphabetic
+    # letters (slot chains A-Z, a-z) and at least two chains share some residues.
+    is_multichain = False
+    if len(prot_chains) >= 2:
+        slot_like = all(len(ch.name) == 1 and ch.name.isalpha()
+                        for ch in prot_chains)
+        if slot_like:
+            def _rknums(ch):
+                return {res.seqid.num for res in ch if res.name not in HOH_NAMES}
+            ref_rk = _rknums(prot_chains[0])
+            has_overlap = any(ref_rk & _rknums(ch) for ch in prot_chains[1:])
+            is_multichain = has_overlap
+
+    if is_multichain:
+        # Collect per-residue atom inventory across all chains.
+        # res_info: seqnum_key → {chain_name: set(atom_names)}
+        res_info = {}
+        res_order = []
+        for ch in prot_chains:
+            for res in ch:
+                if res.name in HOH_NAMES:
+                    continue
+                key = (res.seqid.num, res.seqid.icode.strip())
+                if key not in res_info:
+                    res_info[key] = {}
+                    res_order.append(key)
+                res_info[key][ch.name] = {a.name for a in res}
+
+        for key in res_order:
+            chain_atoms = res_info[key]
+            resnum = key[0]
+            icode = key[1]
+            res_id = f'{resnum}{icode}' if icode else str(resnum)
+            all_chains = sorted(chain_atoms.keys())
+            o_chains = [c for c in all_chains if 'O' in chain_atoms[c]]
+
+            if len(o_chains) == len(all_chains):
+                # Simple case: O present in every chain — one group per chain.
+                group_ids = []
+                for cn in all_chains:
+                    lines.append(f'occupancy group id {gid} chain {cn}'
+                                 f' residue {res_id}')
+                    group_ids.append(gid)
+                    gid += 1
+                lines.append('occupancy group alts complete ' +
+                              ' '.join(map(str, group_ids)))
+            else:
+                # O missing from some chains: two independent complete blocks.
+                # (a) O-only group over o_chains
+                if o_chains:
+                    o_ids = []
+                    for cn in o_chains:
+                        lines.append(f'occupancy group id {gid} chain {cn}'
+                                     f' residue {res_id} atom O')
+                        o_ids.append(gid)
+                        gid += 1
+                    lines.append('occupancy group alts complete ' +
+                                 ' '.join(map(str, o_ids)))
+                # (b) Non-O atoms: one group per chain, atoms listed explicitly.
+                non_o_ids = []
+                for cn in all_chains:
+                    non_o_atoms = sorted(chain_atoms[cn] - {'O'})
+                    if not non_o_atoms:
+                        continue
+                    for aname in non_o_atoms:
+                        lines.append(f'occupancy group id {gid} chain {cn}'
+                                     f' residue {res_id} atom {aname}')
+                    non_o_ids.append(gid)
+                    gid += 1
+                if non_o_ids:
+                    lines.append('occupancy group alts complete ' +
+                                 ' '.join(map(str, non_o_ids)))
+        return ('\n'.join(lines) + '\n').encode()
+
+    # Single-chain altloc format: group MC and SC altlocs per residue.
     for chain in st[0]:
         for res in chain:
             resnum = res.seqid.num
@@ -849,6 +1701,38 @@ def generate_occ_groups(pdb_path):
                 lines.append('occupancy group alts complete ' +
                               ' '.join(map(str, group_ids)))
     return ('\n'.join(lines) + '\n').encode()
+
+
+def run_refmac_quick(xyzin, fobs_mtz, ncyc, weight_matrix, tmpdir,
+                     occ_refine=True, fp_col='FP'):
+    """Single refmac call for iterative rebuild rounds.
+
+    Returns (R, Rfree, log_text, out_mtz|None, out_pdb|None).
+    """
+    xyzin    = Path(xyzin).resolve()
+    fobs_mtz = Path(fobs_mtz).resolve()
+    damp = min(0.5, 0.5 / weight_matrix) if weight_matrix > 1.0 else 0.5
+    kw  = f'LABIN FP={fp_col} FPART1=Fpart PHIP1=PHIpart FREE=FreeR_flag\n'.encode()
+    kw += b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT DELFWT=DELFWT PHDELWT=PHDELWT\n'
+    kw += f'solvent no\nscpart 1\ndamp {damp:.4f} {damp:.4f}\nmake hout Y\nmake hydr Y\n'.encode()
+    kw += f'weight matrix {weight_matrix}\nNCYC {ncyc}\n'.encode()
+    if occ_refine:
+        kw += generate_occ_groups(xyzin)
+    kw += b'END\n'
+
+    xyzout = tmpdir / '_quick_out.pdb'
+    hklout = tmpdir / '_quick_out.mtz'
+    log = run(
+        [REFMAC5,
+         'XYZIN', xyzin, 'XYZOUT', xyzout,
+         'HKLIN', fobs_mtz, 'HKLOUT', hklout,
+         'LIBOUT', tmpdir / '_quick.lib'],
+        input_bytes=kw, cwd=tmpdir, check=False,
+    )
+    r, rf = parse_rfactors(log)
+    return (r, rf, log,
+            hklout if hklout.exists() else None,
+            xyzout if xyzout.exists() else None)
 
 
 def run_refmac(starthere_pdb, fobs_mtz, ncyc, tmpdir):
@@ -917,8 +1801,8 @@ STRATEGIES = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--pdb',    default='1aho/refmacout_minRfree.pdb')
-    ap.add_argument('--mtz',    default='1aho/refme_minRfree.mtz')
+    ap.add_argument('--pdb',    default='1aho/gt48.pdb')
+    ap.add_argument('--mtz',    default='1aho/gt48.mtz')
     ap.add_argument('--outdir', default='1aho/explore_fusion')
     ap.add_argument('--strategies', nargs='*',
                     help='Subset of strategy names (default: all)')
@@ -953,7 +1837,7 @@ def main():
               f'{len(conf_data[chain_names[0]])} residues in ref chain')
 
         print('\nLoading density map for conformer scoring...')
-        refmac_mtz = pdb_path.parent / 'refmacout_minRfree.mtz'
+        refmac_mtz = pdb_path.parent / 'gt48.mtz'
         density_grid = load_density_map(str(refmac_mtz))
 
         # Header

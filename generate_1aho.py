@@ -37,10 +37,10 @@ import gemmi
 sys.path.insert(0, str(Path(__file__).parent))
 from explore_1aho_fusion import (
     parse_conformers,
-    build_reduced_pdb,
+    build_starthere_pdb,
+    write_full_conf_pdb,
     generate_occ_groups,
     parse_rfactors,
-    load_density_map,
     MAINCHAIN_ATOMS,
 )
 
@@ -50,14 +50,11 @@ DMIN       = 0.965
 SAMPLE_RATE = 3.0
 
 # Default 1AHO source files (relative to SCRIPT_DIR or absolute)
-DEFAULT_PDB     = SCRIPT_DIR / '1aho' / 'refmacout_minRfree.pdb'
-DEFAULT_MTZ     = SCRIPT_DIR / '1aho' / 'refme_minRfree.mtz'
+DEFAULT_PDB     = SCRIPT_DIR / '1aho' / 'gt48.pdb'
+DEFAULT_MTZ     = SCRIPT_DIR / '1aho' / 'gt48.mtz'
 DEFAULT_OBS_MTZ = SCRIPT_DIR / '1aho' / '1aho.mtz'   # real data: valid HKL mask + FreeR_flag
 
-# Strategy S8: best from exploration
-S8_STRATEGY = ('cluster_k3', 'cluster_k8', 'cluster_k3', 'adaptive')
-S8_BOUQ_THR = 1.5
-S8_MC_THR   = 0.5
+DEFAULT_K_CONFORMERS = 32
 
 # Flood water calibration: occ * sqrt(n_flood) = FLOOD_LINE_K gives Rfree ~11%
 # Grid fit: Rfree = 0.0129 * occ*sqrt(nf) + 0.0417  (R²=0.989)
@@ -178,27 +175,12 @@ def swap_conformer_assignments(conf_data, chain_names, residue_keys, swaps_per_r
     return conf_data2
 
 
-def set_sulfur_aniso(st, rng):
-    """Set random anisotropic U_ij for all S atoms in place.
-
-    Eigenvalues are distributed around U_iso with ~40% spread; trace preserved.
-    """
-    S_elem = gemmi.Element('S')
-    for chain in st[0]:
-        for res in chain:
-            for atom in res:
-                if atom.element == S_elem:
-                    u_iso = atom.b_iso / (8.0 * np.pi ** 2)
-                    v = rng.normal(0.0, 0.4 * u_iso, 3)
-                    v -= v.mean()
-                    evals = np.maximum(u_iso + v, 0.01 * u_iso)
-                    M = rng.normal(0.0, 1.0, (3, 3))
-                    Q, _ = np.linalg.qr(M)
-                    U = Q @ np.diag(evals) @ Q.T
-                    atom.aniso = gemmi.SMat33f(
-                        float(U[0, 0]), float(U[1, 1]), float(U[2, 2]),
-                        float(U[0, 1]), float(U[0, 2]), float(U[1, 2]),
-                    )
+def _swap_two(conf_data, chain_names, residue_keys, swaps_per_residue, seed):
+    """Convenience wrapper: swap with given seed, return new conf_data."""
+    return swap_conformer_assignments(
+        conf_data, chain_names, residue_keys, swaps_per_residue,
+        np.random.default_rng(seed),
+    )
 
 
 def add_hoh_chains_to_pdb(st_source, pdb_path):
@@ -225,10 +207,12 @@ def build_sample_mtz(truth_full_pdb, refme_path, obs_mtz_path, tmpdir, suffix=''
     Returns (fobs_mtz_path, truth_mtz_path).
     """
     truth_sf_mtz = tmpdir / f'_truth_sf{suffix}.mtz'
-    subprocess.run(
+    r = subprocess.run(
         ['gemmi', 'sfcalc', f'--dmin={DMIN}', f'--to-mtz={truth_sf_mtz}', str(truth_full_pdb)],
-        capture_output=True, check=True,
+        capture_output=True,
     )
+    if r.returncode != 0:
+        raise RuntimeError(f'gemmi sfcalc failed:\n{r.stderr.decode()[-2000:]}')
 
     prot  = gemmi.read_mtz_file(str(truth_sf_mtz))
     refme = gemmi.read_mtz_file(str(refme_path))
@@ -367,7 +351,8 @@ def mtz_to_ccp4(mtz_path, f_col, phi_col, out_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_sample(
-    sample_idx, outdir, pdb_path, mtz_path, obs_mtz_path, density_grid,
+    sample_idx, outdir, pdb_path, mtz_path, obs_mtz_path,
+    k_conformers=DEFAULT_K_CONFORMERS,
     shift_scale=DEFAULT_SHIFT_SCALE,
     n_flood=DEFAULT_N_FLOOD,
     flood_occ=DEFAULT_FLOOD_OCC,
@@ -394,7 +379,8 @@ def generate_sample(
         log_nf = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
         n_flood = int(np.round(np.exp(log_nf)))
         flood_occ = float(FLOOD_LINE_K / np.sqrt(n_flood))
-    ccp4_scr = Path(os.environ.get('CCP4_SCR', '/tmp'))
+    ccp4_scr = Path(os.environ.get('CCP4_SCR', '/tmp')) / outdir.name
+    ccp4_scr.mkdir(parents=True, exist_ok=True)
     for stale in ccp4_scr.glob(f'1aho_{sample_idx:05d}_*'):
         if stale.is_dir():
             shutil.rmtree(stale, ignore_errors=True)
@@ -412,19 +398,21 @@ def generate_sample(
         # 1. Load original 48-conformer structure, apply jiggle (waters unchanged)
         st_orig = gemmi.read_structure(str(pdb_path))
         st_jig  = jiggle_structure(st_orig, shift_scale, rng_seed)
-        set_sulfur_aniso(st_jig, np.random.default_rng(rng_seed + 2))
         jig_pdb = tmpdir / 'jiggled.pdb'
         st_jig.write_pdb(str(jig_pdb))
         t = _t('jiggle', t)
 
-        # 2. Parse jiggled conformers (protein chains only)
+        # 2. Parse jiggled conformers; apply swaps.
+        #    swap A (seed+5) → conf_data_truth: the correct conformer arrangement.
+        #    swap B (seed+6) → conf_data_model: derived from truth, so swaps_per_residue
+        #    controls only the truth↔model delta, not absolute disorder from original.
+        #    When swaps_per_residue=0 both equal the original conf_data.
         st_jig_r, chain_names, conf_data = parse_conformers(jig_pdb)
-        if swaps_per_residue > 0.0:
-            residue_keys = list(conf_data[chain_names[0]].keys())
-            conf_data = swap_conformer_assignments(
-                conf_data, chain_names, residue_keys, swaps_per_residue,
-                np.random.default_rng(rng_seed + 5),
-            )
+        residue_keys = list(conf_data[chain_names[0]].keys())
+        conf_data_truth = _swap_two(conf_data, chain_names, residue_keys,
+                                    swaps_per_residue, rng_seed + 5)
+        conf_data_model = _swap_two(conf_data_truth, chain_names, residue_keys,
+                                    swaps_per_residue, rng_seed + 6)
         t = _t('parse', t)
 
         # 3. Flood waters: place random HOH positions avoiding existing atoms
@@ -438,28 +426,26 @@ def generate_sample(
             seed=rng_seed + 1,
         )
 
-        # 4. Build truth_full.pdb = jiggled protein + 258 structural waters + flood waters
-        st_truth = add_flood_chain(st_jig, flood_pos, flood_occ, chain_name='W')
+        # 4. Build truth_full.pdb from conf_data_truth + structural HOH + flood waters.
+        #    Truth reflects swap A's conformer assignment hypothesis.
         truth_pdb = tmpdir / 'truth_full.pdb'
-        st_truth.write_pdb(str(truth_pdb))
+        write_full_conf_pdb(conf_data_truth, chain_names, st_jig_r,
+                            flood_pos, flood_occ,
+                            st_jig_r.cell, st_jig_r.spacegroup_hm, truth_pdb)
         t = _t('flood_waters', t)
 
         # 5. Build fobs.mtz (FP = |F_truth + F_bulk|) and truth.mtz (sfcalc of truth_full.pdb)
         fobs_mtz, truth_mtz = build_sample_mtz(truth_pdb, mtz_path, obs_mtz_path, tmpdir)
         t = _t('build_mtz', t)
 
-        # 6. Build partial model using S8 strategy + append 258 structural waters
+        # 6. Build partial model: select k_conformers chains by maximin, combine via ref atom order
         starthere_pdb = tmpdir / 'starthere.pdb'
-        _, n_bouq, n_alt = build_reduced_pdb(
-            st_jig_r, chain_names, conf_data,
-            strategy=S8_STRATEGY,
-            density_grid=density_grid,
-            bouquet_threshold=S8_BOUQ_THR,
-            mc_bouq_threshold=S8_MC_THR,
-            out_pdb=starthere_pdb, tmpdir=tmpdir,
-            rng=np.random.default_rng(rng_seed + 3),
+        n_alt = build_starthere_pdb(
+            chain_names, conf_data_model, st_jig_r,
+            k=k_conformers, ref_pdb=pdb_path,
+            out_pdb=starthere_pdb, workdir=tmpdir,
         )
-        # Add structural waters (from jiggled model — identical to original since HOH not jiggled)
+        # Add structural waters (from jiggled model — HOH not jiggled)
         add_hoh_chains_to_pdb(st_jig_r, starthere_pdb)
         t = _t('build_partial', t)
 
@@ -505,7 +491,6 @@ def generate_sample(
             n_flood=n_flood,
             flood_occ=flood_occ,
             ncyc=ncyc,
-            n_bouquet_residues=n_bouq,
             n_altloc_residues=n_alt,
             rwork=rwork,
             rfree=rfree,
@@ -545,6 +530,7 @@ def generate_sample(
 def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood,
                        flood_occ, vary_flood, ncyc, swaps_per_residue,
                        max_array, seed, partition,
+                       k_conformers=DEFAULT_K_CONFORMERS,
                        account=None, qos=None, time='00:20:00'):
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     me     = Path(__file__).resolve()
@@ -580,6 +566,7 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
         f'  --shift-scale {shift_scale} \\',
     ] + flood_args + [
         f'  --ncyc {ncyc} \\',
+        f'  --k-conformers {k_conformers} \\',
         f'  --swaps-per-residue {swaps_per_residue} \\',
         f'  --seed {seed}',
         '',
@@ -624,6 +611,8 @@ def main():
                     help='SLURM QOS (e.g. lr_normal)')
     ap.add_argument('--time',        default='00:20:00',
                     help='SLURM walltime per task (default: 00:20:00)')
+    ap.add_argument('--k-conformers', type=int, default=DEFAULT_K_CONFORMERS,
+                    help='Number of conformer chains in partial model (default: %d)' % DEFAULT_K_CONFORMERS)
     ap.add_argument('--submit',      action='store_true')
     ap.add_argument('--debug',       action='store_true')
     args = ap.parse_args()
@@ -639,18 +628,14 @@ def main():
             args.nsamples, outdir, pdb_path, mtz_path, obs_mtz_path,
             args.shift_scale, args.n_flood, args.flood_occ, args.vary_flood,
             args.ncyc, args.swaps_per_residue, args.max_array, args.seed, args.partition,
+            k_conformers=args.k_conformers,
             account=args.account, qos=args.qos, time=args.time,
         )
         return
 
-    # Pre-load shared density grid (fixed from original refmacout_minRfree.mtz)
-    refmac_mtz = pdb_path.parent / 'refmacout_minRfree.mtz'
-    print(f'Loading density grid from {refmac_mtz}...')
-    density_grid = load_density_map(str(refmac_mtz))
-
     common_kw = dict(
         pdb_path=pdb_path, mtz_path=mtz_path, obs_mtz_path=obs_mtz_path,
-        density_grid=density_grid,
+        k_conformers=args.k_conformers,
         shift_scale=args.shift_scale, n_flood=args.n_flood,
         flood_occ=args.flood_occ, vary_flood=args.vary_flood,
         ncyc=args.ncyc, swaps_per_residue=args.swaps_per_residue,
