@@ -32,6 +32,7 @@ Workflow:
 
 import argparse
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -207,6 +208,24 @@ def make_swap_pdb(base_atoms, idx, swaps):
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
+
+MOLPROBIFY = Path.home() / 'Develop' / 'molprobify_runme.com'
+
+def run_molprobity(pdb_path, tdir):
+    """Run molprobify_runme.com on pdb_path (absolute), return wE float or None."""
+    if not MOLPROBIFY.exists():
+        return None
+    try:
+        proc = subprocess.run(
+            [str(MOLPROBIFY), str(pdb_path.resolve())],
+            cwd=str(tdir), capture_output=True, text=True, timeout=1800)
+        for line in proc.stdout.splitlines():
+            if 'weighted energy (wE):' in line:
+                return float(line.split(':')[-1].strip())
+    except Exception as e:
+        print(f'  molprobify error: {e}')
+    return None
+
 
 def compute_metrics(trial_mtz_path, gt48_mtz_path):
     """RMSD (electrons) and R-true between |FC_ALL_LS| and |Fgt|.
@@ -413,7 +432,11 @@ def run_trial(trial, base_atoms, header_lines, atom_idx,
     if out_mtz.exists() and truth_mtz:
         rmsd_e, r_true = compute_metrics(out_mtz, truth_mtz)
 
-    res = dict(trial, r=r, rf=rf, rmsd_e=rmsd_e, r_true=r_true,
+    wE = None
+    if out_pdb.exists():
+        wE = run_molprobity(out_pdb, tdir)
+
+    res = dict(trial, r=r, rf=rf, rmsd_e=rmsd_e, r_true=r_true, wE=wE,
                status='ok' if r is not None else 'refmac_failed')
     rjson.write_text(json.dumps(res))
     return res
@@ -430,8 +453,10 @@ def collate(outdir):
     bl_r    = bl.get('r')
     bl_rf   = bl.get('rf')
     bl_rmsd = bl.get('rmsd_e')
+    bl_wE   = bl.get('wE')
     rmsd_str = f'{bl_rmsd:.4f}' if bl_rmsd is not None else 'N/A'
-    print(f'Baseline (no-swap): R={bl_r:.4f}  Rf={bl_rf:.4f}  rmsd_e={rmsd_str}')
+    wE_str   = f'{bl_wE:.3f}' if bl_wE is not None else 'N/A'
+    print(f'Baseline (no-swap): R={bl_r:.4f}  Rf={bl_rf:.4f}  rmsd_e={rmsd_str}  wE={wE_str}')
 
     trials_json = outdir / 'trials.json'
     trials = json.loads(trials_json.read_text())
@@ -450,6 +475,7 @@ def collate(outdir):
             continue
         res['delta_rf']    = res['rf'] - bl_rf if bl_rf else None
         res['delta_rmsd_e'] = (res['rmsd_e'] - bl_rmsd) if (res.get('rmsd_e') is not None and bl_rmsd is not None) else None
+        res['delta_wE']    = (res['wE'] - bl_wE) if (res.get('wE') is not None and bl_wE is not None) else None
         results.append(res)
 
     if n_miss:
@@ -467,18 +493,99 @@ def collate(outdir):
         suffix = f' +{len(swaps)-4}more' if len(swaps) > 4 else ''
         return '  '.join(parts) + suffix
 
-    hdr = f'{"tid":>7}  {"R":>7}  {"Rf":>7}  {"ΔRf":>7}  {"rmsd_e":>7}  {"Δrmsd_e":>8}'
-    print(f'\nTop 20 by ΔRf:')
-    print(hdr)
-    print('-' * len(hdr))
-    for res in results[:20]:
-        label = _swap_label(res.get('swaps', []))
-        print(f'{res["trial_id"]:>7}  '
-              f'{res.get("r") or 0:7.4f}  {res.get("rf") or 0:7.4f}  '
-              f'{res.get("delta_rf") or 0:+7.4f}  '
-              f'{res.get("rmsd_e") or 0:7.4f}  '
-              f'{res.get("delta_rmsd_e") or 0:+8.4f}  {label}')
+    def _print_table(title, rows):
+        hdr = f'{"tid":>7}  {"R":>7}  {"Rf":>7}  {"ΔRf":>7}  {"rmsd_e":>7}  {"Δrmsd_e":>8}  {"wE":>7}  {"ΔwE":>7}'
+        print(f'\n{title}')
+        print(hdr)
+        print('-' * len(hdr))
+        for res in rows[:20]:
+            label = _swap_label(res.get('swaps', []))
+            wE_val  = res.get('wE')
+            dwE_val = res.get('delta_wE')
+            wE_s  = f'{wE_val:7.3f}' if wE_val is not None else '    N/A'
+            dwE_s = f'{dwE_val:+7.3f}' if dwE_val is not None else '    N/A'
+            print(f'{res["trial_id"]:>7}  '
+                  f'{res.get("r") or 0:7.4f}  {res.get("rf") or 0:7.4f}  '
+                  f'{res.get("delta_rf") or 0:+7.4f}  '
+                  f'{res.get("rmsd_e") or 0:7.4f}  '
+                  f'{res.get("delta_rmsd_e") or 0:+8.4f}  '
+                  f'{wE_s}  {dwE_s}  {label}')
+
+    _print_table('Top 20 by ΔRf:', results[:20])
+
+    by_wE = [r for r in results if r.get('wE') is not None]
+    by_wE.sort(key=lambda x: x['wE'])
+    _print_table('Top 20 by wE:', by_wE)
+
+    find_compatible_combos(by_wE)
+
     print(f'\nSummary → {outdir}/summary.json')
+
+
+def find_compatible_combos(by_wE, top_n=20, max_gap=1):
+    """Find non-overlapping swap combinations among top-wE trials.
+
+    Two trials are compatible if no residue in one is within max_gap
+    sequence positions of any residue in the other.  Prints the best
+    compatible pairs and triples ranked by combined ΔwE.
+    """
+    top = [r for r in by_wE if r.get('swaps') and r.get('delta_wE') is not None][:top_n]
+    if len(top) < 2:
+        return
+
+    # Only show combos if trials are small enough to be interpretable
+    max_swaps = max(len(r['swaps']) for r in top)
+    if max_swaps > 8:
+        print(f'\n(Compatible-combo search skipped: trials have up to {max_swaps} swaps)')
+        return
+
+    def res_set(trial):
+        return set(s['rk'][0] for s in trial['swaps'])
+
+    def compatible(r1, r2):
+        for a in res_set(r1):
+            for b in res_set(r2):
+                if abs(a - b) <= max_gap:
+                    return False
+        return True
+
+    def short_label(trial):
+        return '+'.join(f'{s["resname"]}{s["rk"][0]}{s["move_type"]}'
+                        for s in trial['swaps'])
+
+    pairs = []
+    for i, t1 in enumerate(top):
+        for t2 in top[i+1:]:
+            if compatible(t1, t2):
+                pairs.append((t1['delta_wE'] + t2['delta_wE'], t1, t2))
+    pairs.sort(key=lambda x: x[0])
+
+    triples = []
+    for i, t1 in enumerate(top):
+        for j, t2 in enumerate(top[i+1:], i+1):
+            if not compatible(t1, t2):
+                continue
+            for t3 in top[j+1:]:
+                if compatible(t1, t3) and compatible(t2, t3):
+                    triples.append((
+                        t1['delta_wE'] + t2['delta_wE'] + t3['delta_wE'],
+                        t1, t2, t3))
+    triples.sort(key=lambda x: x[0])
+
+    if pairs:
+        print(f'\nCompatible pairs (top 5 by combined ΔwE):')
+        for dwE, t1, t2 in pairs[:5]:
+            print(f'  t{t1["trial_id"]:03d}+t{t2["trial_id"]:03d}  ΔwE≈{dwE:+.3f}'
+                  f'  [{short_label(t1)}] + [{short_label(t2)}]')
+
+    if triples:
+        print(f'\nCompatible triples (top 3 by combined ΔwE):')
+        for dwE, t1, t2, t3 in triples[:3]:
+            print(f'  t{t1["trial_id"]:03d}+t{t2["trial_id"]:03d}+t{t3["trial_id"]:03d}'
+                  f'  ΔwE≈{dwE:+.3f}')
+            print(f'    [{short_label(t1)}]')
+            print(f'    [{short_label(t2)}]')
+            print(f'    [{short_label(t3)}]')
 
 
 # ── SLURM submission ──────────────────────────────────────────────────────────
@@ -534,6 +641,166 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
         print(f'  Batch {b} (trials {start}–{end}): {r.stdout.strip() or r.stderr.strip()}')
 
 
+def rescore_trial(outdir, trial_id):
+    """Run molprobify on an existing trial's refmacout.pdb and update result.json."""
+    tdir  = outdir / f'trial_{trial_id:05d}'
+    rjson = tdir / 'result.json'
+    pdb   = tdir / 'refmacout.pdb'
+    if not rjson.exists() or not pdb.exists():
+        return
+    res = json.loads(rjson.read_text())
+    if res.get('wE') is not None:
+        return  # already scored
+    wE = run_molprobity(pdb, tdir)
+    if wE is not None:
+        res['wE'] = wE
+        rjson.write_text(json.dumps(res))
+        print(f'trial {trial_id:05d}: wE={wE:.3f}')
+
+
+def rescore_submit(outdir, partition, account, qos):
+    """Submit SLURM array to run molprobify on all existing trials in outdir."""
+    outdir = Path(outdir).resolve()
+    trials = json.loads((outdir / 'trials.json').read_text())
+    n      = len(trials)
+    script = Path(__file__).resolve()
+    n_batches = (n + MAX_ARRAY - 1) // MAX_ARRAY
+
+    for b in range(n_batches):
+        start = b * MAX_ARRAY
+        end   = min(start + MAX_ARRAY - 1, n - 1)
+        sh    = outdir / f'_rescore_batch{b}.sh'
+        log   = outdir / f'slurm_rescore_b{b}_%a.out'
+        lines = ['#!/bin/bash',
+                 '#SBATCH --job-name=rescore',
+                 f'#SBATCH --partition={partition}',
+                 '#SBATCH --ntasks=1',
+                 f'#SBATCH --array={start}-{end}',
+                 f'#SBATCH --output={log}',
+                 '#SBATCH --export=ALL']
+        if account:
+            lines.append(f'#SBATCH --account={account}')
+        if qos:
+            lines.append(f'#SBATCH --qos={qos}')
+        lines += [f'cd {SCRIPT_DIR}',
+                  f'ccp4-python {script} --rescore-task $SLURM_ARRAY_TASK_ID --outdir {outdir}']
+        sh.write_text('\n'.join(lines) + '\n')
+        r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
+        print(f'  Batch {b} (trials {start}–{end}): {r.stdout.strip() or r.stderr.strip()}')
+
+
+def targeted_submit(outdir, partition, account, qos):
+    """Submit a small array of hand-chosen wE-optimised swap combinations.
+
+    Building blocks come from the top group-wE improvers found in
+    swapscan_opt5/spr_0p06.  All use varconf_opt6.pdb as the base.
+
+    Groups (non-overlapping residue sets):
+      A = t147: {ASP9,VAL10,PHE15,GLN37}  ΔwE=-1.333
+      B = t135: {ASN19,CYS26,GLY31,PRO60} ΔwE=-1.317
+      C = t116: {ASP3,GLY4,GLU24,ARG62}   ΔwE=-1.313
+      D = t239: {CYS26,PRO41,HIS54,GLY59} ΔwE=-1.240  (shares CYS26 with B)
+      E = t033: {ASN19,THR27,ARG62,HIS64} ΔwE=-1.227  (shares with B,C)
+    """
+    outdir   = Path(outdir).resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    base_pdb  = str(SCRIPT_DIR / '1aho' / 'varconf_opt6.pdb')
+    fobs_mtz  = str(SCRIPT_DIR / '1aho' / 'refme.mtz')
+    truth_mtz = str(SCRIPT_DIR / '1aho' / 'gt48.mtz')
+    ncyc, weight = 50, 0.5
+
+    # Exact swap dicts extracted from swapscan_opt5/spr_0p06 result.json files
+    # Group A — t147: ASP9, VAL10, PHE15, GLN37
+    A = [
+        {'move_type': 'o',  'chain_s': 'A', 'chain_t': 'D', 'rk': [15, ''], 'rk_next': [16, ''], 'rk_partner': None, 'resname': 'PHE'},
+        {'move_type': 'sc', 'chain_s': 'A', 'chain_t': 'G', 'rk': [37, ''], 'rk_next': [38, ''], 'rk_partner': None, 'resname': 'GLN'},
+        {'move_type': 'sc', 'chain_s': 'E', 'chain_t': 'N', 'rk': [10, ''], 'rk_next': [11, ''], 'rk_partner': None, 'resname': 'VAL'},
+        {'move_type': 'o',  'chain_s': 'E', 'chain_t': 'L', 'rk': [9,  ''], 'rk_next': [10, ''], 'rk_partner': None, 'resname': 'ASP'},
+    ]
+    # Group B — t135: GLY31, CYS26, ASN19, PRO60
+    B = [
+        {'move_type': 'sc',  'chain_s': 'A', 'chain_t': 'B', 'rk': [31, ''], 'rk_next': [32, ''], 'rk_partner': None, 'resname': 'GLY'},
+        {'move_type': 'pep', 'chain_s': 'A', 'chain_t': 'B', 'rk': [26, ''], 'rk_next': [27, ''], 'rk_partner': None, 'resname': 'CYS'},
+        {'move_type': 'sc',  'chain_s': 'A', 'chain_t': 'C', 'rk': [19, ''], 'rk_next': [20, ''], 'rk_partner': None, 'resname': 'ASN'},
+        {'move_type': 'pep', 'chain_s': 'A', 'chain_t': 'H', 'rk': [60, ''], 'rk_next': [61, ''], 'rk_partner': None, 'resname': 'PRO'},
+    ]
+    # Group C — t116: GLU24, ARG62, GLY4, ASP3
+    C = [
+        {'move_type': 'o', 'chain_s': 'I', 'chain_t': 'M', 'rk': [24, ''], 'rk_next': [25, ''], 'rk_partner': None, 'resname': 'GLU'},
+        {'move_type': 'o', 'chain_s': 'A', 'chain_t': 'E', 'rk': [62, ''], 'rk_next': [63, ''], 'rk_partner': None, 'resname': 'ARG'},
+        {'move_type': 'o', 'chain_s': 'A', 'chain_t': 'B', 'rk': [4,  ''], 'rk_next': [5,  ''], 'rk_partner': None, 'resname': 'GLY'},
+        {'move_type': 'o', 'chain_s': 'A', 'chain_t': 'E', 'rk': [3,  ''], 'rk_next': [4,  ''], 'rk_partner': None, 'resname': 'ASP'},
+    ]
+    # Group D — t239: CYS26, GLY59, HIS54, PRO41  (shares CYS26 with B)
+    D = [
+        {'move_type': 'o',   'chain_s': 'A', 'chain_t': 'C', 'rk': [26, ''], 'rk_next': [27, ''], 'rk_partner': None, 'resname': 'CYS'},
+        {'move_type': 'o',   'chain_s': 'B', 'chain_t': 'C', 'rk': [59, ''], 'rk_next': [60, ''], 'rk_partner': None, 'resname': 'GLY'},
+        {'move_type': 'sc',  'chain_s': 'A', 'chain_t': 'C', 'rk': [54, ''], 'rk_next': [55, ''], 'rk_partner': None, 'resname': 'HIS'},
+        {'move_type': 'pep', 'chain_s': 'J', 'chain_t': 'M', 'rk': [41, ''], 'rk_next': [42, ''], 'rk_partner': None, 'resname': 'PRO'},
+    ]
+    # Group E — t033: THR27, HIS64, ARG62, ASN19  (shares with B,C)
+    E = [
+        {'move_type': 'o', 'chain_s': 'C', 'chain_t': 'D', 'rk': [27, ''], 'rk_next': [28, ''], 'rk_partner': None, 'resname': 'THR'},
+        {'move_type': 'o', 'chain_s': 'G', 'chain_t': 'O', 'rk': [64, ''], 'rk_next': None,     'rk_partner': None, 'resname': 'HIS'},
+        {'move_type': 'o', 'chain_s': 'H', 'chain_t': 'M', 'rk': [62, ''], 'rk_next': [63, ''], 'rk_partner': None, 'resname': 'ARG'},
+        {'move_type': 'sc', 'chain_s': 'B', 'chain_t': 'C', 'rk': [19, ''], 'rk_next': [20, ''], 'rk_partner': None, 'resname': 'ASN'},
+    ]
+
+    # Combinations: label → swap list
+    # A+B+C are fully non-overlapping: {9,10,15,37} | {19,26,31,60} | {3,4,24,62}
+    combos = [
+        ('baseline',    []),
+        ('A',           A),
+        ('B',           B),
+        ('C',           C),
+        ('D',           D),
+        ('A+B',         A + B),
+        ('A+C',         A + C),
+        ('B+C',         B + C),
+        ('A+D',         A + D),
+        ('A+B+C',       A + B + C),
+        ('A+B+D',       A + B + D),
+        ('A+C+D',       A + C + D),
+        ('A+B+C+D',     A + B + C + D),
+    ]
+
+    trials = [{'trial_id': i, 'label': label, 'swaps': swaps}
+              for i, (label, swaps) in enumerate(combos)]
+
+    cfg = {'base_pdb': base_pdb, 'fobs_mtz': fobs_mtz, 'truth_mtz': truth_mtz,
+           'ncyc': ncyc, 'weight': weight, 'targeted': True}
+    (outdir / 'config.json').write_text(json.dumps(cfg, indent=2))
+    (outdir / 'trials.json').write_text(json.dumps(trials, indent=2))
+
+    print(f'Targeted trials: {len(trials)} combos → {outdir}')
+    for t in trials:
+        res_tags = '+'.join(f'{s["resname"]}{s["rk"][0]}{s["move_type"]}'
+                            for s in t['swaps']) or '(baseline)'
+        print(f'  {t["trial_id"]:3d}  {t["label"]:<30}  {res_tags}')
+
+    script     = Path(__file__).resolve()
+    n          = len(trials)
+    sh         = outdir / '_targeted_batch.sh'
+    log        = outdir / 'slurm_%a.out'
+    lines = ['#!/bin/bash',
+             '#SBATCH --job-name=targeted',
+             f'#SBATCH --partition={partition}',
+             '#SBATCH --ntasks=1',
+             f'#SBATCH --array=0-{n-1}',
+             f'#SBATCH --output={log}',
+             '#SBATCH --export=ALL']
+    if account:
+        lines.append(f'#SBATCH --account={account}')
+    if qos:
+        lines.append(f'#SBATCH --qos={qos}')
+    lines += [f'cd {SCRIPT_DIR}',
+              f'ccp4-python {script} --task $SLURM_ARRAY_TASK_ID --outdir {outdir}']
+    sh.write_text('\n'.join(lines) + '\n')
+    r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
+    print(f'Submitted: {r.stdout.strip() or r.stderr.strip()}')
+
+
 def submit_sweep(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
                  ncyc, weight, partition, account, qos,
                  spr_values, n_trials=1000, seed=42):
@@ -573,15 +840,44 @@ def main():
     ap.add_argument('--n-trials',    type=int, default=1000,
                     help='Number of random trials per spr value (default 1000)')
     ap.add_argument('--seed',        type=int, default=42)
-    ap.add_argument('--submit',      action='store_true')
-    ap.add_argument('--task',        type=int, default=None)
-    ap.add_argument('--collate',     action='store_true')
+    ap.add_argument('--submit',        action='store_true')
+    ap.add_argument('--task',          type=int, default=None)
+    ap.add_argument('--collate',       action='store_true')
+    ap.add_argument('--rescore-task',  type=int, default=None,
+                    help='Run molprobify on trial N (called by SLURM)')
+    ap.add_argument('--rescore-submit', action='store_true',
+                    help='Submit SLURM array to rescore all trials in --outdir')
+    ap.add_argument('--targeted-submit', action='store_true',
+                    help='Submit hand-chosen wE-optimised swap combinations')
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
 
     if args.collate:
-        collate(outdir)
+        subdirs = sorted(outdir.glob('spr_*/'))
+        if subdirs:
+            for sd in subdirs:
+                print(f'\n{"="*60}\n{sd.name}\n{"="*60}')
+                collate(sd)
+        else:
+            collate(outdir)
+        return
+
+    if args.rescore_task is not None:
+        rescore_trial(outdir, args.rescore_task)
+        return
+
+    if args.rescore_submit:
+        # Accept a glob of spr_* subdirs if outdir is a sweep parent
+        subdirs = sorted(outdir.glob('spr_*/'))
+        targets = subdirs if subdirs else [outdir]
+        for td in targets:
+            print(f'\n── rescoring {td} ──')
+            rescore_submit(td, args.partition, args.account, args.qos)
+        return
+
+    if args.targeted_submit:
+        targeted_submit(outdir, args.partition, args.account, args.qos)
         return
 
     if args.task is not None:
@@ -597,7 +893,7 @@ def main():
                         outdir, ncyc=cfg['ncyc'], weight=cfg['weight'])
         n_sw = len(trial.get('swaps', []))
         print(f'trial {args.task}: {n_sw} swaps  '
-              f'R={res.get("r")}  Rf={res.get("rf")}  rmsd_e={res.get("rmsd_e")}')
+              f'R={res.get("r")}  Rf={res.get("rf")}  rmsd_e={res.get("rmsd_e")}  wE={res.get("wE")}')
         return
 
     if args.submit:

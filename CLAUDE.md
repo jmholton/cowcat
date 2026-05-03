@@ -163,6 +163,78 @@ Next: generate 9× 1000-sample batches (seeds 100–900) → pack each → retra
 
 ---
 
+## 1AHO Varconf Optimisation (swapscan_varconf.py)
+
+`swapscan_varconf.py` randomly trials chain-letter swap moves on a varconf PDB, runs refmac NCYC=50, and measures Rfree + rmsd_e (RMSD between |FC_ALL_LS| and LS-scaled |Fgt|) + wE (molprobify geometry score, lower=better).
+
+**Optimisation trajectory** (each built on the previous, starting from gt48.pdb / varconf_opt3.pdb):
+
+| File | Description | rmsd_e | Rf | wE |
+|------|-------------|--------|-----|-----|
+| `1aho/varconf_opt1.pdb` | Baseline (gt48 condensed to k=32) | 2.3522 | — | — |
+| `1aho/varconf_opt2.pdb` | sc H→L ARG62 | 2.3522 | — | — |
+| `1aho/varconf_opt3.pdb` | +2 more swaps | 2.3334 | 0.0398 | — |
+| `1aho/varconf_opt4.pdb` | spr_0p12 t189 (8 swaps, from swapscan_spr_fine) | 2.3187 | 0.0398 | 161.933 |
+| `1aho/varconf_opt5.pdb` | targeted t13: GLU32+LYS50+PHE15+VAL10+TYR42+ARG18 | 2.3395 | 0.0398 | 155.495 |
+| `1aho/varconf_opt6.pdb` | swapscan_opt5 spr_0p06 t28: LYS2+ARG18+THR27+GLU24 | 2.3431 | 0.0395 | 154.349 |
+
+**Scoring metrics:**
+- **rmsd_e**: lower = better agreement with ground-truth structure factors
+- **wE (weighted energy)**: `molprobify_runme.com` output — sum of weighted phenix geometry deviations (ramalyze, rotalyze, omegalyze, cbetadev, etc.). Lower = better geometry. Started at ~161.5, now ~154.
+- `molprobify_runme.com` is at `~/Develop/molprobify_runme.com`; takes ~5–10 min per run on the 10101-atom 23-chain varconf structure. Runs inline in every trial (no separate rescore needed).
+
+**Standard workflow per round (Lawrencium):**
+```bash
+# 1. Submit sweep from current opt PDB (4 spr values × 250 = 1000 jobs)
+ccp4-python swapscan_varconf.py --submit \
+    --pdb 1aho/varconf_optN.pdb --fobs 1aho/refme.mtz --truth 1aho/gt48.mtz \
+    --outdir 1aho/swapscan_optN --sweep-spr 0.063,0.094,0.125,0.188 \
+    --n-trials 250 --ncyc 50 \
+    --partition lr6 --account pc_als831 --qos lr_normal
+
+# 2. Collate when done — prints ΔRf table, wE table, AND compatible combos
+ccp4-python swapscan_varconf.py --collate --outdir 1aho/swapscan_optN
+
+# 3. Save winner as next opt PDB
+cp 1aho/swapscan_optN/spr_0pXX/trial_NNNNN/swap.pdb 1aho/varconf_opt{N+1}.pdb
+
+# 4. Update targeted_submit() in swapscan_varconf.py:
+#    - set base_pdb to varconf_opt{N+1}.pdb
+#    - replace building blocks + combos with groups from combo-finder output
+# Then submit:
+ccp4-python swapscan_varconf.py --targeted-submit --outdir 1aho/swapscan_targeted_opt{N+1} \
+    --partition lr6 --account pc_als831 --qos lr_normal
+
+# 5. Collate targeted results; save best as next opt PDB; repeat
+```
+
+**Compatible-combo detection** (automatic in `--collate`):
+- After each per-subdir collation, `find_compatible_combos()` scans the top-20 wE trials
+- Two trials are compatible if no swap residue in one is within 1 sequence position of any in the other
+- Skipped automatically if trials have >8 swaps (too complex to interpret)
+- Prints top-5 compatible pairs and top-3 compatible triples ranked by combined ΔwE
+- Use the printed groups to populate `targeted_submit()` for the next targeted round
+
+**Other CLI modes:**
+```bash
+# Rescore old runs that predate molprobify integration
+ccp4-python swapscan_varconf.py --rescore-submit --outdir 1aho/swapscan_spr_fine \
+    --partition lr6 --account pc_als831 --qos lr_normal
+```
+
+**Lawrencium notes:**
+- Partition `lr6`, account `pc_als831`, QOS `lr_normal`; no special time limit needed (lr_normal default is generous)
+- molprobify calls phenix tools — verify phenix is on PATH after `setup_ccp4` on compute nodes before first run
+- MaxArraySize 1001: our 251-trial batches fit in a single array job with no splitting needed
+- Home directory (`~/Develop/molprobify_runme.com`) is NFS-mounted and accessible from compute nodes
+
+**Gotchas:**
+- wE and rmsd_e are in tension: high-spr trials improve wE but hurt rmsd_e/Rf. Low-spr (0.063–0.094) gives best balance.
+- `targeted_submit()` has hardcoded base PDB and building blocks — update both when advancing to a new opt PDB.
+- spr=2× previous optimal swaps is a good rule of thumb for the sweep range upper bound.
+
+---
+
 ## Known Gotchas
 
 - **Blank chain from randompdb.com**: omit `chain` keyword from refmac occupancy group entirely.
