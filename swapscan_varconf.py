@@ -490,6 +490,16 @@ def enumerate_trials(base_atoms, move_types, spr=1.0, n_trials=1000, seed=42):
     return trials
 
 
+def enumerate_trials_exhaust(base_atoms, move_types):
+    """One trial per unique single swap — exhaustive enumeration of the catalog."""
+    catalog = _build_swap_catalog(base_atoms, move_types)
+    print(f'  {len(catalog)} unique single-swap trials (exhaustive)')
+    trials = [{'trial_id': 0, 'swaps': []}]   # trial 0 = no-swap baseline
+    for i, sw in enumerate(catalog, 1):
+        trials.append({'trial_id': i, 'swaps': [sw]})
+    return trials
+
+
 # ── Single trial ──────────────────────────────────────────────────────────────
 
 def run_trial(trial, base_atoms, header_lines, atom_idx,
@@ -690,7 +700,7 @@ def find_compatible_combos(by_wE, top_n=20, max_gap=1):
 
 def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
            ncyc, weight, partition, account, qos,
-           spr=1.0, n_trials=1000, seed=42):
+           spr=1.0, n_trials=1000, seed=42, exhaust=False):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -700,16 +710,20 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
     print(f'  {len(base_atoms)} atoms, '
           f'{len(set(a["chain"] for a in base_atoms))} chains')
 
-    print(f'Enumerating trials (move types: {move_types}, spr={spr}, {n_trials} trials)...')
-    trials = enumerate_trials(base_atoms, move_types, spr=spr,
-                              n_trials=n_trials, seed=seed)
+    if exhaust:
+        print(f'Enumerating trials (move types: {move_types}, exhaustive single-swap)...')
+        trials = enumerate_trials_exhaust(base_atoms, move_types)
+    else:
+        print(f'Enumerating trials (move types: {move_types}, spr={spr}, {n_trials} trials)...')
+        trials = enumerate_trials(base_atoms, move_types, spr=spr,
+                                  n_trials=n_trials, seed=seed)
     print(f'  {len(trials)} trials')
     (outdir / 'trials.json').write_text(json.dumps(trials, indent=2))
 
     cfg = {'base_pdb': str(Path(base_pdb).resolve()),
            'fobs_mtz': str(Path(fobs_mtz).resolve()),
            'truth_mtz': str(Path(truth_mtz).resolve()) if truth_mtz else None,
-           'ncyc': ncyc, 'weight': weight, 'spr': spr}
+           'ncyc': ncyc, 'weight': weight, 'spr': spr, 'exhaust': exhaust}
     (outdir / 'config.json').write_text(json.dumps(cfg, indent=2))
 
     script     = Path(__file__).resolve()
@@ -941,6 +955,8 @@ def main():
     ap.add_argument('--n-trials',    type=int, default=1000,
                     help='Number of random trials per spr value (default 1000)')
     ap.add_argument('--seed',        type=int, default=42)
+    ap.add_argument('--exhaust',        action='store_true',
+                    help='Enumerate every unique single swap (one trial per catalog entry)')
     ap.add_argument('--submit',        action='store_true')
     ap.add_argument('--task',          type=int, default=None)
     ap.add_argument('--collate',       action='store_true')
@@ -1015,6 +1031,8 @@ def main():
         if args.sweep_spr:
             spr_values = [float(v) for v in args.sweep_spr.split(',')]
             submit_sweep(outdir, spr_values=spr_values, **kw)
+        elif args.exhaust:
+            submit(outdir, exhaust=True, **kw)
         else:
             submit(outdir, spr=args.spr, **kw)
         return
