@@ -228,7 +228,7 @@ def main():
     ap.add_argument('--pdb',       default=str(DEFAULT_PDB))
     ap.add_argument('--mtz',       default=str(DEFAULT_MTZ))
     ap.add_argument('--outdir',    default='1aho/explore_condensation')
-    ap.add_argument('--partition', default='debug')
+    ap.add_argument('--partition', default='lr6')
     ap.add_argument('--account')
     ap.add_argument('--qos')
     # Worker args

@@ -111,10 +111,10 @@ def write_atoms(atom_recs, header_lines, out_pdb):
 
 
 def atom_index(atom_recs):
-    """Return dict (chain, seqnum, icode, aname) → list-of-indices."""
+    """Return dict (chain, seqnum, icode, aname, altloc) → list-of-indices."""
     idx = {}
     for i, a in enumerate(atom_recs):
-        key = (a['chain'], a['seqnum'], a['icode'], a['aname'])
+        key = (a['chain'], a['seqnum'], a['icode'], a['aname'], a['altloc'])
         idx.setdefault(key, []).append(i)
     return idx
 
@@ -123,10 +123,18 @@ def atom_index(atom_recs):
 
 def find_ss_pairs(base_atoms, ref_chain='A', sg_cutoff=2.5):
     """Return list of (rk_i, rk_j) CYS pairs with SG-SG < sg_cutoff in ref_chain."""
+    altloc_mode = any(a['altloc'].strip() for a in base_atoms
+                      if a['resname'] not in HOH_NAMES)
     sg_pos = {}
     for a in base_atoms:
-        if a['chain'] != ref_chain or a['resname'] != 'CYS' or a['aname'] != 'SG':
+        if a['resname'] != 'CYS' or a['aname'] != 'SG':
             continue
+        if altloc_mode:
+            if a['chain'] != ref_chain or a['altloc'] not in (' ', 'A'):
+                continue
+        else:
+            if a['chain'] != ref_chain:
+                continue
         sg_pos[(a['seqnum'], a['icode'])] = (a['x'], a['y'], a['z'])
     pairs = []
     rks = sorted(sg_pos)
@@ -150,13 +158,20 @@ def _swap_xyz(recs, i, j):
 
 def _apply_one_swap(recs, idx, sw):
     """Apply a single swap spec to recs (in-place). Returns number of atoms swapped."""
-    chain_s    = sw['chain_s']
-    chain_t    = sw['chain_t']
-    move_type  = sw['move_type']
-    seqnum     = sw['rk'][0]
-    icode      = sw['rk'][1]
-    rk_next    = sw.get('rk_next')
-    rk_partner = sw.get('rk_partner')
+    altloc_mode = 'altloc_s' in sw
+    move_type   = sw['move_type']
+    seqnum      = sw['rk'][0]
+    icode       = sw['rk'][1]
+    rk_next     = sw.get('rk_next')
+    rk_partner  = sw.get('rk_partner')
+
+    if altloc_mode:
+        altloc_s = sw['altloc_s']
+        altloc_t = sw['altloc_t']
+        chain    = sw['chain']
+    else:
+        chain_s  = sw['chain_s']
+        chain_t  = sw['chain_t']
 
     if move_type == 'sc':
         atom_specs = [(seqnum, icode, None)]
@@ -178,16 +193,24 @@ def _apply_one_swap(recs, idx, sw):
     n = 0
     for (sn, ic, atom_set) in atom_specs:
         for aname_key in idx:
-            c, sn2, ic2, aname = aname_key
-            if c != chain_s or sn2 != sn or ic2 != ic:
-                continue
+            c, sn2, ic2, aname, alt = aname_key
+            if altloc_mode:
+                if c != chain or sn2 != sn or ic2 != ic or alt != altloc_s:
+                    continue
+            else:
+                if c != chain_s or sn2 != sn or ic2 != ic:
+                    continue
             if atom_set is None:
                 if aname in SC_BACKBONE_KEEP:
                     continue
             elif aname not in atom_set:
                 continue
-            s_idxs = idx.get((chain_s, sn, ic, aname), [])
-            t_idxs = idx.get((chain_t, sn, ic, aname), [])
+            if altloc_mode:
+                s_idxs = idx.get((chain,   sn, ic, aname, altloc_s), [])
+                t_idxs = idx.get((chain,   sn, ic, aname, altloc_t), [])
+            else:
+                s_idxs = idx.get((chain_s, sn, ic, aname, ' '), [])
+                t_idxs = idx.get((chain_t, sn, ic, aname, ' '), [])
             if not s_idxs or not t_idxs:
                 continue
             _swap_xyz(recs, s_idxs[0], t_idxs[0])
@@ -301,48 +324,107 @@ def run_baseline(base_pdb, fobs_mtz, truth_mtz, outdir, ncyc=50, weight=0.5):
 # ── Trial enumeration ─────────────────────────────────────────────────────────
 
 def _build_swap_catalog(base_atoms, move_types):
-    """All valid single-swap specs (no trial_id).  Each spec is a dict."""
-    chains_at_res = {}
-    resname_at    = {}
-    for a in base_atoms:
-        if a['resname'] in HOH_NAMES:
-            continue
-        rk = (a['seqnum'], a['icode'])
-        chains_at_res.setdefault(rk, set()).add(a['chain'])
-        resname_at[rk] = a['resname']
+    """All valid single-swap specs (no trial_id).  Each spec is a dict.
 
-    residue_keys = sorted(chains_at_res.keys())
-    rk_next_of   = {rk: residue_keys[i + 1]
-                    for i, rk in enumerate(residue_keys[:-1])}
-    ss_pairs = find_ss_pairs(base_atoms) if 'ss' in move_types else []
+    Auto-detects altloc mode (conformers as altloc labels within one chain)
+    vs chain mode (conformers as separate chains).
+    """
+    altloc_mode = any(a['altloc'].strip() for a in base_atoms
+                      if a['resname'] not in HOH_NAMES)
 
-    catalog = []
-    for move in move_types:
-        if move == 'ss':
-            for rk_i, rk_j in ss_pairs:
-                chains = sorted(chains_at_res.get(rk_i, set())
-                                & chains_at_res.get(rk_j, set()))
+    if altloc_mode:
+        # Conformers encoded as altloc labels within a single chain.
+        confs_at_res = {}   # (seqnum, icode) → set of altloc labels
+        resname_at   = {}
+        chain_of_res = {}
+        for a in base_atoms:
+            if a['resname'] in HOH_NAMES or not a['altloc'].strip():
+                continue
+            rk = (a['seqnum'], a['icode'])
+            confs_at_res.setdefault(rk, set()).add(a['altloc'])
+            resname_at[rk]  = a['resname']
+            chain_of_res[rk] = a['chain']
+
+        residue_keys = sorted(confs_at_res.keys())
+        rk_next_of   = {rk: residue_keys[i + 1]
+                        for i, rk in enumerate(residue_keys[:-1])}
+        ss_pairs = find_ss_pairs(base_atoms) if 'ss' in move_types else []
+
+        catalog = []
+        for move in move_types:
+            if move == 'ss':
+                for rk_i, rk_j in ss_pairs:
+                    alts  = sorted(confs_at_res.get(rk_i, set())
+                                   & confs_at_res.get(rk_j, set()))
+                    chain = chain_of_res.get(rk_i, 'A')
+                    for altloc_s, altloc_t in combinations(alts, 2):
+                        catalog.append({
+                            'move_type': 'ss',
+                            'altloc_s': altloc_s, 'altloc_t': altloc_t, 'chain': chain,
+                            'rk': list(rk_i), 'rk_next': None, 'rk_partner': list(rk_j),
+                            'resname': resname_at.get(rk_i, 'CYS'),
+                        })
+                continue
+            for rk in residue_keys:
+                alts = sorted(confs_at_res[rk])
+                if len(alts) < 2:
+                    continue
+                rk_next = rk_next_of.get(rk)
+                if move == 'pep' and rk_next is None:
+                    continue
+                chain = chain_of_res.get(rk, 'A')
+                for altloc_s, altloc_t in combinations(alts, 2):
+                    catalog.append({
+                        'move_type': move,
+                        'altloc_s': altloc_s, 'altloc_t': altloc_t, 'chain': chain,
+                        'rk': list(rk), 'rk_next': list(rk_next) if rk_next else None,
+                        'rk_partner': None, 'resname': resname_at[rk],
+                    })
+        return catalog
+
+    else:
+        # Conformers encoded as separate chains (original behaviour).
+        chains_at_res = {}
+        resname_at    = {}
+        for a in base_atoms:
+            if a['resname'] in HOH_NAMES:
+                continue
+            rk = (a['seqnum'], a['icode'])
+            chains_at_res.setdefault(rk, set()).add(a['chain'])
+            resname_at[rk] = a['resname']
+
+        residue_keys = sorted(chains_at_res.keys())
+        rk_next_of   = {rk: residue_keys[i + 1]
+                        for i, rk in enumerate(residue_keys[:-1])}
+        ss_pairs = find_ss_pairs(base_atoms) if 'ss' in move_types else []
+
+        catalog = []
+        for move in move_types:
+            if move == 'ss':
+                for rk_i, rk_j in ss_pairs:
+                    chains = sorted(chains_at_res.get(rk_i, set())
+                                    & chains_at_res.get(rk_j, set()))
+                    for chain_s, chain_t in combinations(chains, 2):
+                        catalog.append({
+                            'move_type': 'ss', 'chain_s': chain_s, 'chain_t': chain_t,
+                            'rk': list(rk_i), 'rk_next': None, 'rk_partner': list(rk_j),
+                            'resname': resname_at.get(rk_i, 'CYS'),
+                        })
+                continue
+            for rk in residue_keys:
+                chains = sorted(chains_at_res[rk])
+                if len(chains) < 2:
+                    continue
+                rk_next = rk_next_of.get(rk)
+                if move == 'pep' and rk_next is None:
+                    continue
                 for chain_s, chain_t in combinations(chains, 2):
                     catalog.append({
-                        'move_type': 'ss', 'chain_s': chain_s, 'chain_t': chain_t,
-                        'rk': list(rk_i), 'rk_next': None, 'rk_partner': list(rk_j),
-                        'resname': resname_at.get(rk_i, 'CYS'),
+                        'move_type': move, 'chain_s': chain_s, 'chain_t': chain_t,
+                        'rk': list(rk), 'rk_next': list(rk_next) if rk_next else None,
+                        'rk_partner': None, 'resname': resname_at[rk],
                     })
-            continue
-        for rk in residue_keys:
-            chains = sorted(chains_at_res[rk])
-            if len(chains) < 2:
-                continue
-            rk_next = rk_next_of.get(rk)
-            if move == 'pep' and rk_next is None:
-                continue
-            for chain_s, chain_t in combinations(chains, 2):
-                catalog.append({
-                    'move_type': move, 'chain_s': chain_s, 'chain_t': chain_t,
-                    'rk': list(rk), 'rk_next': list(rk_next) if rk_next else None,
-                    'rk_partner': None, 'resname': resname_at[rk],
-                })
-    return catalog
+        return catalog
 
 
 def enumerate_trials(base_atoms, move_types, spr=1.0, n_trials=1000, seed=42):
@@ -488,8 +570,12 @@ def collate(outdir):
     (outdir / 'summary.json').write_text(json.dumps(summary, indent=2))
 
     def _swap_label(swaps):
-        parts = [f'{s["move_type"]} {s["chain_s"]}→{s["chain_t"]} '
-                 f'{s["rk"][0]}{s["resname"]}' for s in swaps[:4]]
+        if swaps and 'altloc_s' in swaps[0]:
+            parts = [f'{s["move_type"]} {s["altloc_s"]}→{s["altloc_t"]} '
+                     f'{s["rk"][0]}{s["resname"]}' for s in swaps[:4]]
+        else:
+            parts = [f'{s["move_type"]} {s["chain_s"]}→{s["chain_t"]} '
+                     f'{s["rk"][0]}{s["resname"]}' for s in swaps[:4]]
         suffix = f' +{len(swaps)-4}more' if len(swaps) > 4 else ''
         return '  '.join(parts) + suffix
 
@@ -634,7 +720,8 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
             lines.append(f'#SBATCH --account={account}')
         if qos:
             lines.append(f'#SBATCH --qos={qos}')
-        lines += [f'cd {SCRIPT_DIR}',
+        lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
+                  f'cd {SCRIPT_DIR}',
                   f'ccp4-python {script} --task $SLURM_ARRAY_TASK_ID --outdir {outdir_abs}']
         sh.write_text('\n'.join(lines) + '\n')
         r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
@@ -682,7 +769,8 @@ def rescore_submit(outdir, partition, account, qos):
             lines.append(f'#SBATCH --account={account}')
         if qos:
             lines.append(f'#SBATCH --qos={qos}')
-        lines += [f'cd {SCRIPT_DIR}',
+        lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
+                  f'cd {SCRIPT_DIR}',
                   f'ccp4-python {script} --rescore-task $SLURM_ARRAY_TASK_ID --outdir {outdir}']
         sh.write_text('\n'.join(lines) + '\n')
         r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
@@ -794,7 +882,8 @@ def targeted_submit(outdir, partition, account, qos):
         lines.append(f'#SBATCH --account={account}')
     if qos:
         lines.append(f'#SBATCH --qos={qos}')
-    lines += [f'cd {SCRIPT_DIR}',
+    lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
+              f'cd {SCRIPT_DIR}',
               f'ccp4-python {script} --task $SLURM_ARRAY_TASK_ID --outdir {outdir}']
     sh.write_text('\n'.join(lines) + '\n')
     r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
@@ -830,7 +919,7 @@ def main():
                     help='Comma-separated list of move types: sc,pep,o,ss')
     ap.add_argument('--ncyc',        type=int,   default=50)
     ap.add_argument('--weight',      type=float, default=0.5)
-    ap.add_argument('--partition',   default='refmac')
+    ap.add_argument('--partition',   default='lr6')
     ap.add_argument('--account',     default=None)
     ap.add_argument('--qos',         default=None)
     ap.add_argument('--spr',         type=float, default=1.0,
