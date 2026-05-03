@@ -731,15 +731,16 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
     n_batches  = (len(trials) + MAX_ARRAY - 1) // MAX_ARRAY
 
     for b in range(n_batches):
-        start = b * MAX_ARRAY
-        end   = min(start + MAX_ARRAY - 1, len(trials) - 1)
+        start      = b * MAX_ARRAY
+        end        = min(start + MAX_ARRAY - 1, len(trials) - 1)
+        batch_size = end - start + 1
         sh    = outdir / f'_batch{b}.sh'
         log   = outdir_abs / f'slurm_b{b}_%a.out'
         lines = ['#!/bin/bash',
                  f'#SBATCH --job-name=swapscan',
                  f'#SBATCH --partition={partition}',
                  f'#SBATCH --ntasks=1',
-                 f'#SBATCH --array={start}-{end}',
+                 f'#SBATCH --array=0-{batch_size - 1}',
                  f'#SBATCH --output={log}',
                  '#SBATCH --export=ALL']
         if account:
@@ -748,7 +749,7 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
             lines.append(f'#SBATCH --qos={qos}')
         lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
                   f'cd {SCRIPT_DIR}',
-                  f'ccp4-python {script} --task $SLURM_ARRAY_TASK_ID --outdir {outdir_abs}']
+                  f'ccp4-python {script} --task $(( {start} + $SLURM_ARRAY_TASK_ID )) --outdir {outdir_abs}']
         sh.write_text('\n'.join(lines) + '\n')
         r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
         print(f'  Batch {b} (trials {start}–{end}): {r.stdout.strip() or r.stderr.strip()}')
