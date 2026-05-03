@@ -119,6 +119,15 @@ def atom_index(atom_recs):
     return idx
 
 
+def _chain_lookup(idx, chain, sn, ic, aname):
+    """Find any atoms matching (chain, sn, ic, aname) regardless of altloc."""
+    prefix = (chain, sn, ic, aname)
+    for key, idxs in idx.items():
+        if key[:4] == prefix:
+            return idxs
+    return []
+
+
 # ── Disulfide pair detection ─────────────────────────────────────────────────
 
 def find_ss_pairs(base_atoms, ref_chain='A', sg_cutoff=2.5):
@@ -209,8 +218,8 @@ def _apply_one_swap(recs, idx, sw):
                 s_idxs = idx.get((chain,   sn, ic, aname, altloc_s), [])
                 t_idxs = idx.get((chain,   sn, ic, aname, altloc_t), [])
             else:
-                s_idxs = idx.get((chain_s, sn, ic, aname, ' '), [])
-                t_idxs = idx.get((chain_t, sn, ic, aname, ' '), [])
+                s_idxs = _chain_lookup(idx, chain_s, sn, ic, aname)
+                t_idxs = _chain_lookup(idx, chain_t, sn, ic, aname)
             if not s_idxs or not t_idxs:
                 continue
             _swap_xyz(recs, s_idxs[0], t_idxs[0])
@@ -326,11 +335,14 @@ def run_baseline(base_pdb, fobs_mtz, truth_mtz, outdir, ncyc=50, weight=0.5):
 def _build_swap_catalog(base_atoms, move_types):
     """All valid single-swap specs (no trial_id).  Each spec is a dict.
 
-    Auto-detects altloc mode (conformers as altloc labels within one chain)
+    Auto-detects altloc mode (single protein chain with altloc labels)
     vs chain mode (conformers as separate chains).
     """
-    altloc_mode = any(a['altloc'].strip() for a in base_atoms
-                      if a['resname'] not in HOH_NAMES)
+    protein_chains = set(a['chain'] for a in base_atoms
+                         if a['resname'] not in HOH_NAMES)
+    altloc_mode = (len(protein_chains) == 1 and
+                   any(a['altloc'].strip() for a in base_atoms
+                       if a['resname'] not in HOH_NAMES))
 
     if altloc_mode:
         # Conformers encoded as altloc labels within a single chain.
