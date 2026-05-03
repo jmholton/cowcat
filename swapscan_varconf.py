@@ -507,8 +507,10 @@ def run_trial(trial, base_atoms, header_lines, atom_idx,
     tid   = trial['trial_id']
     tdir  = outdir / f'trial_{tid:05d}'
     tdir.mkdir(parents=True, exist_ok=True)
-    rjson = tdir / 'result.json'
-    if rjson.exists():
+    rjson    = tdir / 'result.json'
+    out_mtz  = tdir / 'refmacout.mtz'
+    out_pdb  = tdir / 'refmacout.pdb'
+    if rjson.exists() and out_mtz.exists():
         return json.loads(rjson.read_text())
 
     swapped, ok = make_swap_pdb(base_atoms, atom_idx, trial['swaps'])
@@ -533,6 +535,11 @@ def run_trial(trial, base_atoms, header_lines, atom_idx,
         wE = None
         if pdb_out and pdb_out.exists():
             wE = run_molprobity(pdb_out, td)
+
+        if mtz_out and mtz_out.exists():
+            shutil.copy2(mtz_out, out_mtz)
+        if pdb_out and pdb_out.exists():
+            shutil.copy2(pdb_out, out_pdb)
 
     res = dict(trial, r=r, rf=rf, rmsd_e=rmsd_e, r_true=r_true, wE=wE,
                status='ok' if r is not None else 'refmac_failed')
