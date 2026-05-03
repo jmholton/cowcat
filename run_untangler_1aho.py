@@ -21,12 +21,57 @@ import sys
 import shutil
 import argparse
 from pathlib import Path
+import gemmi
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 UNTANGLER_DIR = SCRIPT_DIR / 'untangler'
 AHO_DIR = SCRIPT_DIR / '1aho'
 
 PHENIX_BIN = Path('/programs/phenix-2.0-5936/phenix_bin')
+
+
+def inject_remark290(src: Path, dst: Path) -> None:
+    """Copy PDB, inserting REMARK 290 SMTRY block derived from CRYST1 if absent."""
+    text = src.read_text()
+    if 'REMARK 290 RELATED MOLECULES.' in text:
+        shutil.copy2(src, dst)
+        return
+
+    # Read cell + space group from CRYST1 via gemmi
+    st = gemmi.read_pdb(str(src))
+    cell = st.cell
+    sg = st.find_spacegroup()
+    if sg is None:
+        raise ValueError(f'Cannot determine space group from {src}')
+
+    # Build SMTRY lines in Cartesian Å (same convention as wwPDB REMARK 290)
+    smtry_lines = ['REMARK 290 RELATED MOLECULES.\n']
+    # trailing blank REMARK 290 resets parse_symmetries_from_pdb's at_symmetry_xformations flag
+    op_num = 0
+    for op in sg.operations():
+        op_num += 1
+        rot = op.rot  # 3×3 integer rotation (divide by DEN=24)
+        trn = op.tran  # 3-element integer translation (divide by DEN=24)
+        den = gemmi.Op.DEN
+        # Rotation matrix rows (unitless, fractional coords)
+        r = [[rot[i][j] / den for j in range(3)] for i in range(3)]
+        # Translation in fractional → Cartesian Å
+        t_frac = [trn[i] / den for i in range(3)]
+        cell_params = [cell.a, cell.b, cell.c]
+        t_cart = [t_frac[i] * cell_params[i] for i in range(3)]
+        for row in range(3):
+            smtry_lines.append(
+                f'REMARK 290   SMTRY{row+1}  {op_num:2d}'
+                f'  {r[row][0]:10.6f}  {r[row][1]:10.6f}  {r[row][2]:10.6f}'
+                f'  {t_cart[row]:14.5f}\n'
+            )
+    smtry_lines.append('REMARK 290\n')  # blank line resets parser state flag
+
+    # Insert block just before CRYST1 (or at top if not present)
+    cryst1_pos = text.find('CRYST1')
+    insert_at = cryst1_pos if cryst1_pos >= 0 else 0
+    new_text = text[:insert_at] + ''.join(smtry_lines) + text[insert_at:]
+    dst.write_text(new_text)
 
 
 def main():
@@ -52,7 +97,7 @@ def main():
     # Copy input files into untangler/data/ with their original names
     pdb_dst = data_dir / pdb_src.name
     mtz_dst = data_dir / mtz_src.name
-    shutil.copy2(pdb_src, pdb_dst)
+    inject_remark290(pdb_src, pdb_dst)
     shutil.copy2(mtz_src, mtz_dst)
     print(f'Input PDB : {pdb_dst.relative_to(UNTANGLER_DIR)}')
     print(f'Input MTZ : {mtz_dst.relative_to(UNTANGLER_DIR)}')
@@ -79,6 +124,12 @@ def main():
 
     from untangle import Untangler
     from LinearOptimizer.Input import ConstraintsHandler
+
+    # Route every phenix.refine call through SLURM so refinements run on
+    # cluster nodes rather than the login/submit node.
+    Untangler.refine_shell_file = os.path.join(
+        str(UNTANGLER_DIR), 'Refinement', 'Refine_slurm.sh'
+    )
 
     pdb_rel = str(pdb_dst.relative_to(UNTANGLER_DIR))
     mtz_rel = str(mtz_dst.relative_to(UNTANGLER_DIR))
