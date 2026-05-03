@@ -5,8 +5,9 @@ Usage:
     python3 run_untangler_1aho.py [--pdb 1aho/varconf_opt6.pdb] [--mtz 1aho/refme_minRfree.mtz]
 
 Untangler resolves 'tangled' conformer labels in multi-conformer structures by
-iteratively swapping altloc assignments to minimise geometry violations and
-crystallographic R factors. Uses phenix for refinement and geometry scoring.
+iteratively swapping altloc assignments to minimise geometry violations (wE)
+and crystallographic R factors. Uses phenix for refinement and geometry scoring.
+Evaluation is on wE alone — no ground-truth reference is used by default.
 
 Output PDB is written to untangler/output/<model>_loopEndN.pdb
 """
@@ -30,10 +31,8 @@ def main():
                         help='Input multi-conformer PDB (default: 1aho/varconf_opt6.pdb)')
     parser.add_argument('--mtz', default=str(AHO_DIR / 'refme_minRfree.mtz'),
                         help='MTZ with FP/SIGFP/FreeR_flag (default: 1aho/refme_minRfree.mtz)')
-    parser.add_argument('--reference', default=str(AHO_DIR / 'gt48.pdb'),
-                        help='Ground-truth PDB for tangle evaluation (optional)')
-    parser.add_argument('--no-reference', action='store_true',
-                        help='Skip tangle evaluation even if reference file exists')
+    parser.add_argument('--reference', default=None,
+                        help='Ground-truth PDB for tangle evaluation (optional; omit when no true reference exists)')
     args = parser.parse_args()
 
     pdb_src = Path(args.pdb).resolve()
@@ -49,7 +48,7 @@ def main():
     print(f'Input MTZ : {mtz_dst.relative_to(UNTANGLER_DIR)}')
 
     ref_argv = []
-    if not args.no_reference:
+    if args.reference is not None:
         ref_src = Path(args.reference).resolve()
         if ref_src.exists():
             ref_dst = data_dir / ref_src.name
