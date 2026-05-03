@@ -518,27 +518,21 @@ def run_trial(trial, base_atoms, header_lines, atom_idx,
         rjson.write_text(json.dumps(res))
         return res
 
-    swap_pdb = tdir / 'swap.pdb'
-    write_atoms(swapped, header_lines, swap_pdb)
-
-    out_mtz = tdir / 'refmacout.mtz'
-    out_pdb = tdir / 'refmacout.pdb'
     with tempfile.TemporaryDirectory(prefix=f'swap_{tid}_') as td:
+        td = Path(td)
+        swap_pdb = td / 'swap.pdb'
+        write_atoms(swapped, header_lines, swap_pdb)
+
         r, rf, log, mtz_out, pdb_out = run_refmac_quick(
-            swap_pdb, fobs_mtz, ncyc, weight, Path(td))
+            swap_pdb, fobs_mtz, ncyc, weight, td)
+
+        rmsd_e, r_true = (None, None)
+        if mtz_out and mtz_out.exists() and truth_mtz:
+            rmsd_e, r_true = compute_metrics(mtz_out, truth_mtz)
+
+        wE = None
         if pdb_out and pdb_out.exists():
-            shutil.copy2(pdb_out, out_pdb)
-        if mtz_out and mtz_out.exists():
-            shutil.copy2(mtz_out, out_mtz)
-        (tdir / 'refmac.log').write_text(log or '')
-
-    rmsd_e, r_true = (None, None)
-    if out_mtz.exists() and truth_mtz:
-        rmsd_e, r_true = compute_metrics(out_mtz, truth_mtz)
-
-    wE = None
-    if out_pdb.exists():
-        wE = run_molprobity(out_pdb, tdir)
+            wE = run_molprobity(pdb_out, td)
 
     res = dict(trial, r=r, rf=rf, rmsd_e=rmsd_e, r_true=r_true, wE=wE,
                status='ok' if r is not None else 'refmac_failed')
