@@ -124,6 +124,8 @@ def main():
 
     from untangle import Untangler
     from LinearOptimizer.Input import ConstraintsHandler
+    import LinearOptimizer.Solver as SolverMod
+    SolverMod.THREADS = 100
 
     # Route every phenix.refine call through SLURM so refinements run on
     # cluster nodes rather than the login/submit node.
