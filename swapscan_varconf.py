@@ -938,6 +938,109 @@ def submit_sweep(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
                spr=spr, n_trials=n_trials, seed=seed)
 
 
+# ── Geometry-targeted submission ──────────────────────────────────────────────
+
+def get_geometry_outliers(pdb_path, include_allowed=False):
+    """Run phenix.ramalyze + rotalyze; return set of seqnums with poor geometry.
+
+    By default only OUTLIER evaluations are included.  Pass include_allowed=True
+    to also include Ramachandran Allowed (borderline) residues.
+    """
+    bad = set()
+    for tool in ('phenix.ramalyze', 'phenix.rotalyze'):
+        try:
+            r = subprocess.run([tool, str(pdb_path)],
+                               capture_output=True, text=True, timeout=300)
+            for line in r.stdout.splitlines():
+                if ':' not in line:
+                    continue
+                parts = line.split(':')
+                head  = parts[0].split()
+                if len(head) < 2:
+                    continue
+                try:
+                    seqnum = int(head[1])
+                except ValueError:
+                    continue
+                evaluation = parts[-2].strip()
+                if 'OUTLIER' in evaluation:
+                    bad.add(seqnum)
+                elif include_allowed and 'Allowed' in evaluation:
+                    bad.add(seqnum)
+        except Exception as e:
+            print(f'  {tool} error: {e}')
+    return bad
+
+
+def geo_submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
+               ncyc, weight, partition, account, qos,
+               include_allowed=False):
+    """Submit swapscan restricted to geometry-outlier residues (ramalyze+rotalyze)."""
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print('Parsing base PDB...')
+    base_atoms, _ = parse_atoms(base_pdb)
+    print(f'  {len(base_atoms)} atoms')
+
+    print('Running phenix.ramalyze + rotalyze...')
+    bad_seqnums = get_geometry_outliers(base_pdb, include_allowed=include_allowed)
+    if not bad_seqnums:
+        print('No geometry outliers found — nothing to scan.')
+        return
+    print(f'  {len(bad_seqnums)} outlier residues: {sorted(bad_seqnums)}')
+
+    catalog  = _build_swap_catalog(base_atoms, move_types)
+    filtered = []
+    for sw in catalog:
+        rk_p = sw.get('rk_partner')
+        partner_sn = rk_p[0] if rk_p is not None else None
+        if sw['rk'][0] in bad_seqnums or (partner_sn is not None and partner_sn in bad_seqnums):
+            filtered.append(sw)
+    print(f'  {len(filtered)} targeted swaps (from {len(catalog)} total)')
+
+    trials = [{'trial_id': 0, 'swaps': []}]
+    for i, sw in enumerate(filtered, 1):
+        trials.append({'trial_id': i, 'swaps': [sw]})
+    print(f'  {len(trials)} trials (including no-swap baseline)')
+
+    (outdir / 'trials.json').write_text(json.dumps(trials, indent=2))
+    cfg = {'base_pdb': str(Path(base_pdb).resolve()),
+           'fobs_mtz': str(Path(fobs_mtz).resolve()),
+           'truth_mtz': str(Path(truth_mtz).resolve()) if truth_mtz else None,
+           'ncyc': ncyc, 'weight': weight, 'geo_submit': True,
+           'no_molprobify': False}
+    (outdir / 'config.json').write_text(json.dumps(cfg, indent=2))
+
+    script     = Path(__file__).resolve()
+    outdir_abs = outdir.resolve()
+    n_batches  = (len(trials) + MAX_ARRAY - 1) // MAX_ARRAY
+
+    for b in range(n_batches):
+        start      = b * MAX_ARRAY
+        end        = min(start + MAX_ARRAY - 1, len(trials) - 1)
+        batch_size = end - start + 1
+        sh    = outdir / f'_batch{b}.sh'
+        log   = outdir_abs / f'slurm_b{b}_%a.out'
+        lines = ['#!/bin/bash',
+                 '#SBATCH --job-name=geo_scan',
+                 f'#SBATCH --partition={partition}',
+                 '#SBATCH --ntasks=1',
+                 f'#SBATCH --array=0-{batch_size - 1}',
+                 f'#SBATCH --output={log}',
+                 '#SBATCH --export=ALL']
+        if account:
+            lines.append(f'#SBATCH --account={account}')
+        if qos:
+            lines.append(f'#SBATCH --qos={qos}')
+        lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
+                  f'cd {SCRIPT_DIR}',
+                  f'ccp4-python {script} --task $(( {start} + $SLURM_ARRAY_TASK_ID )) --outdir {outdir_abs}']
+        sh.write_text('\n'.join(lines) + '\n')
+        r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
+        print(f'  Batch {b} (trials {start}–{end}): {r.stdout.strip() or r.stderr.strip()}')
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -974,6 +1077,10 @@ def main():
                     help='Submit SLURM array to rescore all trials in --outdir')
     ap.add_argument('--targeted-submit', action='store_true',
                     help='Submit hand-chosen wE-optimised swap combinations')
+    ap.add_argument('--geo-submit', action='store_true',
+                    help='Submit swapscan restricted to residues with ramalyze/rotalyze OUTLIER geometry')
+    ap.add_argument('--include-allowed', action='store_true',
+                    help='With --geo-submit: also include Ramachandran Allowed residues')
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -1003,6 +1110,23 @@ def main():
 
     if args.targeted_submit:
         targeted_submit(outdir, args.partition, args.account, args.qos)
+        return
+
+    if args.geo_submit:
+        if not args.pdb or not args.fobs:
+            ap.error('--geo-submit requires --pdb and --fobs')
+        move_types = [m.strip() for m in args.move_types.split(',')]
+        geo_submit(outdir,
+                   base_pdb        = Path(args.pdb).resolve(),
+                   fobs_mtz        = Path(args.fobs).resolve(),
+                   truth_mtz       = Path(args.truth).resolve() if args.truth else None,
+                   move_types      = move_types,
+                   ncyc            = args.ncyc,
+                   weight          = args.weight,
+                   partition       = args.partition,
+                   account         = args.account,
+                   qos             = args.qos,
+                   include_allowed = args.include_allowed)
         return
 
     if args.task is not None:
