@@ -503,7 +503,8 @@ def enumerate_trials_exhaust(base_atoms, move_types):
 # ── Single trial ──────────────────────────────────────────────────────────────
 
 def run_trial(trial, base_atoms, header_lines, atom_idx,
-              fobs_mtz, truth_mtz, outdir, ncyc=50, weight=0.5):
+              fobs_mtz, truth_mtz, outdir, ncyc=50, weight=0.5,
+              no_molprobify=False):
     tid   = trial['trial_id']
     tdir  = outdir / f'trial_{tid:05d}'
     tdir.mkdir(parents=True, exist_ok=True)
@@ -533,7 +534,7 @@ def run_trial(trial, base_atoms, header_lines, atom_idx,
             rmsd_e, r_true = compute_metrics(mtz_out, truth_mtz)
 
         wE = None
-        if pdb_out and pdb_out.exists():
+        if not no_molprobify and pdb_out and pdb_out.exists():
             wE = run_molprobity(pdb_out, td)
 
         if mtz_out and mtz_out.exists():
@@ -701,7 +702,8 @@ def find_compatible_combos(by_wE, top_n=20, max_gap=1):
 
 def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
            ncyc, weight, partition, account, qos,
-           spr=1.0, n_trials=1000, seed=42, exhaust=False):
+           spr=1.0, n_trials=1000, seed=42, exhaust=False,
+           no_molprobify=False):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -724,7 +726,8 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
     cfg = {'base_pdb': str(Path(base_pdb).resolve()),
            'fobs_mtz': str(Path(fobs_mtz).resolve()),
            'truth_mtz': str(Path(truth_mtz).resolve()) if truth_mtz else None,
-           'ncyc': ncyc, 'weight': weight, 'spr': spr, 'exhaust': exhaust}
+           'ncyc': ncyc, 'weight': weight, 'spr': spr, 'exhaust': exhaust,
+           'no_molprobify': no_molprobify}
     (outdir / 'config.json').write_text(json.dumps(cfg, indent=2))
 
     script     = Path(__file__).resolve()
@@ -748,9 +751,10 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
             lines.append(f'#SBATCH --account={account}')
         if qos:
             lines.append(f'#SBATCH --qos={qos}')
+        no_mp_flag = ' --no-molprobify' if no_molprobify else ''
         lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
                   f'cd {SCRIPT_DIR}',
-                  f'ccp4-python {script} --task $(( {start} + $SLURM_ARRAY_TASK_ID )) --outdir {outdir_abs}']
+                  f'ccp4-python {script} --task $(( {start} + $SLURM_ARRAY_TASK_ID )) --outdir {outdir_abs}{no_mp_flag}']
         sh.write_text('\n'.join(lines) + '\n')
         r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
         print(f'  Batch {b} (trials {start}–{end}): {r.stdout.strip() or r.stderr.strip()}')
@@ -959,6 +963,8 @@ def main():
     ap.add_argument('--seed',        type=int, default=42)
     ap.add_argument('--exhaust',        action='store_true',
                     help='Enumerate every unique single swap (one trial per catalog entry)')
+    ap.add_argument('--no-molprobify', action='store_true',
+                    help='Skip molprobify (wE=None); ~10x faster. Use --rescore-submit afterwards on top candidates.')
     ap.add_argument('--submit',        action='store_true')
     ap.add_argument('--task',          type=int, default=None)
     ap.add_argument('--collate',       action='store_true')
@@ -1009,7 +1015,8 @@ def main():
 
         res = run_trial(trial, base_atoms, header_lines, idx,
                         cfg['fobs_mtz'], cfg.get('truth_mtz'),
-                        outdir, ncyc=cfg['ncyc'], weight=cfg['weight'])
+                        outdir, ncyc=cfg['ncyc'], weight=cfg['weight'],
+                        no_molprobify=cfg.get('no_molprobify', False))
         n_sw = len(trial.get('swaps', []))
         print(f'trial {args.task}: {n_sw} swaps  '
               f'R={res.get("r")}  Rf={res.get("rf")}  rmsd_e={res.get("rmsd_e")}  wE={res.get("wE")}')
@@ -1019,17 +1026,18 @@ def main():
         if not args.pdb or not args.fobs:
             ap.error('--submit requires --pdb and --fobs')
         move_types = [m.strip() for m in args.move_types.split(',')]
-        kw = dict(base_pdb   = Path(args.pdb).resolve(),
-                  fobs_mtz   = Path(args.fobs).resolve(),
-                  truth_mtz  = Path(args.truth).resolve() if args.truth else None,
-                  move_types = move_types,
-                  ncyc       = args.ncyc,
-                  weight     = args.weight,
-                  partition  = args.partition,
-                  account    = args.account,
-                  qos        = args.qos,
-                  n_trials   = args.n_trials,
-                  seed       = args.seed)
+        kw = dict(base_pdb       = Path(args.pdb).resolve(),
+                  fobs_mtz       = Path(args.fobs).resolve(),
+                  truth_mtz      = Path(args.truth).resolve() if args.truth else None,
+                  move_types     = move_types,
+                  ncyc           = args.ncyc,
+                  weight         = args.weight,
+                  partition      = args.partition,
+                  account        = args.account,
+                  qos            = args.qos,
+                  n_trials       = args.n_trials,
+                  seed           = args.seed,
+                  no_molprobify  = args.no_molprobify)
         if args.sweep_spr:
             spr_values = [float(v) for v in args.sweep_spr.split(',')]
             submit_sweep(outdir, spr_values=spr_values, **kw)
