@@ -857,10 +857,12 @@ def _add_collapsed_atom(res_out, atoms):
     res_out.add_atom(a_out)
 
 
-def _reduce_conformers(by_name, sc_names, max_confs=3):
-    """Drop lowest-occupancy conformers until ≤ max_confs altlocs remain.
+def _reduce_conformers(by_name, sc_names, max_confs=3, rng=None):
+    """Reduce to ≤ max_confs altloc conformers; returns (updated_by_name, label_list).
 
-    Returns (updated_by_name, remaining_label_list).
+    When rng is provided and more than max_confs conformers are present, selects
+    max_confs randomly (uniform, without replacement) instead of always keeping the
+    highest-occupancy ones.  Occupancies of survivors are renormalised to sum to 1.
     """
     labels = sorted({a.altloc for name in sc_names
                      for a in by_name.get(name, ())
@@ -868,18 +870,24 @@ def _reduce_conformers(by_name, sc_names, max_confs=3):
     if len(labels) <= max_confs:
         return by_name, labels
 
-    # Mean occupancy per conformer label
+    # Mean occupancy per conformer label (used for renormalisation regardless of mode)
     occ_by_label = {}
     for l in labels:
         occs = [a.occ for name in sc_names
                 for a in by_name.get(name, ()) if a.altloc == l]
         occ_by_label[l] = float(np.mean(occs)) if occs else 0.0
 
-    # Drop lowest-occupancy conformers until ≤ max_confs remain
-    while len(labels) > max_confs:
-        drop_l = min(labels, key=lambda l: occ_by_label[l])
-        labels.remove(drop_l)
-        del occ_by_label[drop_l]
+    if rng is not None:
+        # Random selection: sample max_confs labels uniformly
+        chosen = rng.choice(labels, size=max_confs, replace=False).tolist()
+        labels = sorted(chosen)
+        occ_by_label = {l: occ_by_label[l] for l in labels}
+    else:
+        # Default: drop lowest-occupancy conformers until ≤ max_confs remain
+        while len(labels) > max_confs:
+            drop_l = min(labels, key=lambda l: occ_by_label[l])
+            labels.remove(drop_l)
+            del occ_by_label[drop_l]
 
     # Renormalize surviving occupancies to sum to 1.0
     total = sum(occ_by_label.values())
@@ -908,7 +916,7 @@ def _reduce_conformers(by_name, sc_names, max_confs=3):
     return new_by_name, labels
 
 
-def step8_build_mixed_model(truth_full_pdb, tmpdir, rng):
+def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, label_scramble_prob=1.0):
     """Build a mixed single/multi-conformer model → starthere.pdb.
 
     For each residue:
@@ -966,9 +974,10 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng):
             else:
                 by_name, present = _reduce_conformers(by_name, sc_names, max_confs=3)
 
-                # Scramble altloc labels per residue
+                # Scramble altloc labels per residue (throttled by label_scramble_prob)
                 shuffled = list(present)
-                rng.shuffle(shuffled)
+                if label_scramble_prob >= 1.0 or rng.random() < label_scramble_prob:
+                    rng.shuffle(shuffled)
                 label_map = dict(zip(present, shuffled))
 
                 for name in sc_names:
@@ -1161,7 +1170,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                     flood_avoid_fullocc=True, flood_occ=None,
                     shift_scale=0.5, n_altlocs=2, missing_fraction=0.05,
                     never_collected_fraction=0.05, extra_b=0.0,
-                    seed=None, debug=False):
+                    label_scramble_prob=1.0, seed=None, debug=False):
     """Run the full pipeline for one sample. Returns (sample_idx, ok, info).
 
     If debug=True, the entire tmpdir is copied to sample_dir/debug/ before
@@ -1261,7 +1270,8 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         t = _t('refme_mtz', t)
 
         # 9: Build mixed single/multi-conformer model → starthere.pdb
-        step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng)
+        step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng,
+                                 label_scramble_prob=label_scramble_prob)
         t = _t('build_mixed_model', t)
 
         # 10a: NCYC 0 probe to detect geometry clashes
@@ -1276,7 +1286,8 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             # Recalculate truth.mtz from corrected ground truth (H already present).
             _sfcalc_with_bulksolv(tmpdir / 'truth_full.pdb', tmpdir / 'truth.mtz', tmpdir)
             # Rebuild starthere.pdb from corrected truth_full.pdb.
-            step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng)
+            step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng,
+                                     label_scramble_prob=label_scramble_prob)
             t = _t('clash_correction', t)
 
         # 10b: Full NCYC 20 refinement
@@ -1331,9 +1342,10 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             never_collected_fraction=never_collected_fraction,
             n_reflections_never_collected=n_never,
             extra_b=extra_b,
+            label_scramble_prob=label_scramble_prob,
             cell=list(CELL),
             dmin=DMIN,
-            grid_shape=[60, 60, 60],
+            grid_shape=[round(CELL[i] * SAMPLE_RATE / DMIN) for i in range(3)],
             step_timings=timings,
         )
         (sample_dir / 'metadata.json').write_text(json.dumps(meta, indent=2))
@@ -1366,9 +1378,9 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        flood_avoid_fullocc=True, shift_scale=0.5, n_altlocs=2,
                        missing_fraction=0.05, never_collected_fraction=0.05,
-                       extra_b=0.0, max_array=300, seed=None, flood_occ=None,
-                       cell=None, dmin=2.0, partition='debug', account=None,
-                       qos=None, time='00:10:00'):
+                       extra_b=0.0, label_scramble_prob=1.0, max_array=300,
+                       seed=None, flood_occ=None, cell=None, dmin=2.0,
+                       partition='debug', account=None, qos=None, time='00:10:00'):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     python  = sys.executable
@@ -1378,9 +1390,10 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     # parallel inside step5_jigglepdb_and_merge (ThreadPoolExecutor).
     cpus_per_task = max(n_altlocs, 2)
 
-    seed_line      = f'    --seed {seed} \\\n'          if seed      is not None else ''
-    flood_occ_line = f'    --flood-occ {flood_occ} \\\n' if flood_occ is not None else ''
-    extra_b_line   = f'    --extra-b {extra_b} \\\n'     if extra_b              else ''
+    seed_line      = f'    --seed {seed} \\\n'                     if seed                is not None else ''
+    flood_occ_line = f'    --flood-occ {flood_occ} \\\n'           if flood_occ           is not None else ''
+    extra_b_line   = f'    --extra-b {extra_b} \\\n'               if extra_b                         else ''
+    scramble_line  = f'    --label-scramble-prob {label_scramble_prob} \\\n' if label_scramble_prob < 1.0 else ''
     _cell = cell if cell is not None else (40.0, 40.0, 40.0)
     cell_line      = f'    --cell {_cell[0]} {_cell[1]} {_cell[2]} \\\n'
     dmin_line      = f'    --dmin {dmin} \\\n'
@@ -1409,7 +1422,7 @@ mkdir -p "${{CCP4_SCR:-/tmp}}"
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
     --never-collected-fraction {never_collected_fraction} \\
-{cell_line}{dmin_line}{flood_occ_line}{extra_b_line}{seed_line}"""
+{cell_line}{dmin_line}{flood_occ_line}{extra_b_line}{scramble_line}{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
@@ -1474,6 +1487,9 @@ def main():
                         help='P1 unit cell dimensions in Å (default: 40 40 40)')
     parser.add_argument('--dmin', type=float, default=2.0,
                         help='Resolution cutoff in Å (default: 2.0)')
+    parser.add_argument('--label-scramble-prob', type=float, default=1.0,
+                        help='Per-residue probability of scrambling altloc labels '
+                             '(0=never, 1=always; default 1.0)')
     parser.add_argument('--debug',      action='store_true',
                         help='Copy entire tmpdir to sample_dir/debug/ for inspection')
     parser.add_argument('--seed',       type=int, default=None,
@@ -1509,6 +1525,7 @@ def main():
             missing_fraction=args.missing_fraction,
             never_collected_fraction=args.never_collected_fraction,
             extra_b=args.extra_b,
+            label_scramble_prob=args.label_scramble_prob,
             seed=args.seed,
             debug=args.debug,
         )
@@ -1522,8 +1539,8 @@ def main():
             args.nresidues, args.nwaters, args.n_flood, args.flood_avoid_fullocc,
             args.shift_scale, args.n_altlocs, args.missing_fraction,
             args.never_collected_fraction,
-            extra_b=args.extra_b, max_array=args.max_array,
-            seed=args.seed, flood_occ=args.flood_occ,
+            extra_b=args.extra_b, label_scramble_prob=args.label_scramble_prob,
+            max_array=args.max_array, seed=args.seed, flood_occ=args.flood_occ,
             cell=CELL, dmin=DMIN,
             partition=args.partition, account=args.account, qos=args.qos,
             time=args.time,
@@ -1543,6 +1560,7 @@ def main():
                                            args.n_altlocs, args.missing_fraction,
                                            args.never_collected_fraction,
                                            extra_b=args.extra_b,
+                                           label_scramble_prob=args.label_scramble_prob,
                                            seed=args.seed, debug=args.debug)
             done += 1
             status = 'OK' if ok else 'ERR'
@@ -1556,7 +1574,7 @@ def main():
                             args.flood_avoid_fullocc, args.flood_occ,
                             args.shift_scale, args.n_altlocs, args.missing_fraction,
                             args.never_collected_fraction, args.extra_b,
-                            args.seed, args.debug): sid
+                            args.label_scramble_prob, args.seed, args.debug): sid
                 for sid in sample_ids
             }
             for fut in as_completed(futures):
