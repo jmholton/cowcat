@@ -76,13 +76,13 @@ def inject_remark290(src: Path, dst: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--pdb', default=str(AHO_DIR / 'under20_fitGT48.pdb'),
+    parser.add_argument('--pdb', default=str(AHO_DIR / 'conf3norm_fitGT48.pdb'),
                         help='Input PDB in single-chain altloc format (default: 1aho/under20_fitGT48.pdb)')
     parser.add_argument('--mtz', default=str(AHO_DIR / 'refme_minRfree.mtz'),
                         help='MTZ with FP/SIGFP/FreeR_flag (default: 1aho/refme_minRfree.mtz)')
     parser.add_argument('--reference', default=None,
                         help='Ground-truth PDB for tangle evaluation (optional)')
-    parser.add_argument('--altloc-subset-size', type=int, default=2,
+    parser.add_argument('--altloc-subset-size', type=int, default=3,
                         help='Number of altlocs considered simultaneously by ILP solver (default: 2)')
     parser.add_argument('--max-runs', type=int, default=5,
                         help='Max optimisation loops (default: 5)')
@@ -151,7 +151,7 @@ def main():
             ConstraintsHandler.BondConstraint: 0.1,
             ConstraintsHandler.AngleConstraint: 80,
             ConstraintsHandler.NonbondConstraint: 0.1,
-            ConstraintsHandler.ClashConstraint: 1e2,
+            ConstraintsHandler.ClashConstraint: 0,
             ConstraintsHandler.TwoAtomPenalty: 0,
         },
         solution_reference=solution_reference,

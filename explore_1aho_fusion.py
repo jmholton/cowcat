@@ -950,6 +950,9 @@ def build_varconf_pdb(chain_names, conf_data, st_orig, out_pdb, workdir, max_k=N
         for reskey, ref_rd in ref_chain_data.items():
             if slot_i >= res_k[reskey]:
                 continue
+            if slot_i >= len(per_res_sel[reskey]):
+                # residue exists in fewer chains than desired k
+                continue
             src_cn = per_res_sel[reskey][slot_i]
             rd_this = conf_data[src_cn]
             if reskey not in rd_this:
