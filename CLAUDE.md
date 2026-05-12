@@ -259,7 +259,7 @@ Three scripts implement increasingly sophisticated conformer-count reduction on 
 5. 4 rounds of refmac5-newhess weight-snap (NCYC 10 each at wm 0.01→0.1→1→10→0.5)
 6. Rounds ≥3 generate occupancy-group refmac keywords via `~/Develop/refmac_occupancy_setup.com` (instead of the built-in `generate_occ_groups`)
 
-**Threshold sets** map heavy-atom max-deviation (Å) to per-residue k:
+**Threshold sets** are defined in `condense_singlechain.py:THRESHOLD_SETS` (top of the file). To list available names from the CLI: `ccp4-python condense_singlechain.py --help` shows them under `--threshold-set`. Each set maps heavy-atom max-deviation (Å) to per-residue k:
 
 | set | (dev, k) brackets | bottom k |
 |---|---|---|
