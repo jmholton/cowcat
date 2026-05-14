@@ -1646,7 +1646,8 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        extra_b=0.0, altloc_swaps_per_res=1.0, vary_flood=False,
                        max_array=300, seed=None, flood_occ=None, cell=None,
                        dmin=2.0, spacegroup='P 1', partition='debug',
-                       account=None, qos=None, time='00:10:00'):
+                       account=None, qos=None, time='00:10:00',
+                       weight_matrix=None):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     python  = sys.executable
@@ -1660,6 +1661,7 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     flood_occ_line = f'    --flood-occ {flood_occ} \\\n'           if flood_occ           is not None else ''
     extra_b_line   = f'    --extra-b {extra_b} \\\n'               if extra_b                         else ''
     scramble_line  = f'    --altloc-swaps-per-res {altloc_swaps_per_res} \\\n' if altloc_swaps_per_res != 1.0 else ''
+    weight_line    = f'    --weight-matrix {weight_matrix} \\\n'              if weight_matrix is not None   else ''
     varflood_line  = f'    --vary-flood \\\n'                       if vary_flood                      else ''
     sg_line        = f'    --spacegroup "{spacegroup}" \\\n'        if spacegroup != 'P 1'             else ''
     _cell = cell if cell is not None else (40.0, 40.0, 40.0)
@@ -1690,7 +1692,7 @@ mkdir -p "${{CCP4_SCR:-/tmp}}"
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
     --never-collected-fraction {never_collected_fraction} \\
-{cell_line}{dmin_line}{sg_line}{flood_occ_line}{varflood_line}{extra_b_line}{scramble_line}{seed_line}"""
+{cell_line}{dmin_line}{sg_line}{flood_occ_line}{varflood_line}{extra_b_line}{scramble_line}{weight_line}{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
