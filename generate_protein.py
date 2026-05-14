@@ -69,6 +69,14 @@ UNIQUEIFY   = 'uniqueify'
 CELL        = (40.0, 40.0, 40.0)   # P1 unit cell (Å)
 DMIN        = 2.0                   # resolution cutoff (Å)
 SAMPLE_RATE = 3.0                   # oversampling → 60×60×60 grid for 40 Å cell
+SPACEGROUP  = 'P 1'                 # space group HM symbol
+
+# ── Flood water iso-Rfree calibration ──────────────────────────────────────────
+# Rfree = FLOOD_A * occ * sqrt(n_flood) + FLOOD_B  (calibrated on 1AHO grid)
+# Rfree ~11% lies on occ * sqrt(n_flood) = FLOOD_LINE_K
+FLOOD_LINE_K  = 5.27
+FLOOD_NF_MIN  = 700
+FLOOD_NF_MAX  = 4000
 BFAC_MU     = np.log(20.0)
 BFAC_SIGMA  = 0.7
 BFAC_MIN    = 5.0
@@ -87,7 +95,7 @@ BFAC_SC_MAX   = 120.0
 
 # Altloc displacement threshold (Å): side chains further than this
 # from their centroid stay as separate altloc atoms in the partial model
-ALTLOC_DIST_THRESHOLD = 1.2
+ALTLOC_DIST_THRESHOLD = 0.0
 
 # ── Amino acid natural frequencies (UniProt statistics) ────────────────────────
 _AA_DATA = [
@@ -201,11 +209,12 @@ def step2_build_sidechains(seq, rng, tmpdir):
     (tmpdir / 'side.pdb').write_bytes(result.stdout)
 
 
-def step3_setup_structure(tmpdir, rng, n_waters=10, n_flood=0, flood_avoid_fullocc=True, flood_occ=None):
+def step3_setup_structure(tmpdir, rng, n_waters=10):
     """Read side.pdb → set cell, centre, randomise B, add waters → built.pdb."""
     st = gemmi.read_structure(str(tmpdir / 'side.pdb'))
     st.cell = gemmi.UnitCell(CELL[0], CELL[1], CELL[2], 90, 90, 90)
-    st.spacegroup_hm = 'P 1'
+    st.spacegroup_hm = SPACEGROUP
+    is_p1 = (SPACEGROUP.replace(' ', '').upper() == 'P1')
 
     all_atoms = [a for model in st for chain in model
                  for res in chain for a in res]
@@ -222,11 +231,14 @@ def step3_setup_structure(tmpdir, rng, n_waters=10, n_flood=0, flood_avoid_fullo
                                     BFAC_SC_MIN, BFAC_SC_MAX))
         a.occ = 1.0
 
-    # Centre at (20, 20, 20)
+    # Centre at ASU centre: (a/2, b/2, c/2) for P1; (a/4, b/4, c/2) for others
     cx = sum(a.pos.x for a in all_atoms) / len(all_atoms)
     cy = sum(a.pos.y for a in all_atoms) / len(all_atoms)
     cz = sum(a.pos.z for a in all_atoms) / len(all_atoms)
-    dx, dy, dz = CELL[0]/2 - cx, CELL[1]/2 - cy, CELL[2]/2 - cz
+    tx = CELL[0]/2 if is_p1 else CELL[0]/4
+    ty = CELL[1]/2 if is_p1 else CELL[1]/4
+    tz = CELL[2]/2
+    dx, dy, dz = tx - cx, ty - cy, tz - cz
     for a in all_atoms:
         a.pos = gemmi.Position(a.pos.x + dx, a.pos.y + dy, a.pos.z + dz)
 
@@ -236,16 +248,22 @@ def step3_setup_structure(tmpdir, rng, n_waters=10, n_flood=0, flood_avoid_fullo
 
     existing = [(a.pos.x, a.pos.y, a.pos.z) for a in all_atoms]
 
+    # Ordered water placement bounds: ASU region for non-P1 to avoid symmetry-mate
+    # clashes in refinement; full cell for P1.
+    wo_x_hi = CELL[0]/2 - 2.0 if not is_p1 else CELL[0] - 2.0
+    wo_y_hi = CELL[1]/2 - 2.0 if not is_p1 else CELL[1] - 2.0
+    wo_z_hi = CELL[2] - 2.0
+    margin   = 2.0
+
     # ── Pass 1: full-occupancy waters (avoid all existing atoms + each other) ──
     water_chain = gemmi.Chain('W')
     added = 0
-    margin = 2.0
     for _ in range(100000):
         if added >= n_waters:
             break
-        x = float(rng.uniform(margin, CELL[0] - margin))
-        y = float(rng.uniform(margin, CELL[1] - margin))
-        z = float(rng.uniform(margin, CELL[2] - margin))
+        x = float(rng.uniform(margin, wo_x_hi))
+        y = float(rng.uniform(margin, wo_y_hi))
+        z = float(rng.uniform(margin, wo_z_hi))
         if all((x-px)**2 + (y-py)**2 + (z-pz)**2 >= 7.84   # 2.8² Å
                for px, py, pz in existing):
             res = gemmi.Residue()
@@ -266,42 +284,8 @@ def step3_setup_structure(tmpdir, rng, n_waters=10, n_flood=0, flood_avoid_fullo
     if added > 0:
         st[0].add_chain(water_chain)
 
-    # ── Pass 2: flood waters in chain 'F' (partial occ, random B) ──────────
-    # Chain 'F' is kept separate so _merge_altconfs can scale occupancies
-    # to flood_occ total rather than 1.0.
-    flood_added = 0
-    if n_flood > 0:
-        flood_chain = gemmi.Chain('F')
-        fullocc_positions = existing if flood_avoid_fullocc else []
-        for _ in range(n_flood * 20):
-            if flood_added >= n_flood:
-                break
-            x = float(rng.uniform(margin, CELL[0] - margin))
-            y = float(rng.uniform(margin, CELL[1] - margin))
-            z = float(rng.uniform(margin, CELL[2] - margin))
-            if flood_avoid_fullocc and not all(
-                    (x-px)**2 + (y-py)**2 + (z-pz)**2 >= 7.84
-                    for px, py, pz in fullocc_positions):
-                continue
-            b = float(np.clip(rng.lognormal(BFAC_SC_MU, BFAC_SC_SIGMA + 0.3),
-                               BFAC_SC_MIN, 120.0))
-            res = gemmi.Residue()
-            res.name = 'HOH'
-            res.seqid = gemmi.SeqId(flood_added + 1, ' ')
-            atom = gemmi.Atom()
-            atom.name = 'O'
-            atom.element = gemmi.Element('O')
-            atom.pos = gemmi.Position(x, y, z)
-            atom.occ = 1.0   # jigglepdb/merge_altconfs will rescale to flood_occ
-            atom.b_iso = b
-            res.add_atom(atom)
-            flood_chain.add_residue(res)
-            flood_added += 1
-        if flood_added > 0:
-            st[0].add_chain(flood_chain)
-
     st.write_pdb(str(tmpdir / 'built.pdb'))
-    return added, flood_added
+    return added
 
 
 def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0):
@@ -426,9 +410,28 @@ def step4b_selfref_b_factors(minimized_pdb, tmpdir):
     return out
 
 
-def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlocs=2, flood_occ=None):
+def _apply_flood_signs(pdb_path, rng):
+    """Randomly flip the occupancy sign of each chain-F (flood) water.
+
+    Half the flood waters get occ < 0 on average, creating negative peaks in
+    the difference map (mirrors spurious solvent in the partial model).
+    Sign is assigned per residue and applied uniformly across all its altlocs.
+    """
+    st = gemmi.read_structure(str(pdb_path))
+    for chain in st[0]:
+        if chain.name != 'F':
+            continue
+        for res in chain:
+            sign = float(rng.choice([-1, 1]))
+            for atom in res:
+                atom.occ = abs(atom.occ) * sign
+    st.write_pdb(str(pdb_path))
+
+
+def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlocs=2):
     """Run jigglepdb n_altlocs times, minimize each conformer independently in
-    parallel, then merge → multiconf.pdb (used directly as truth_full.pdb).
+    parallel, then combine → multiconf.pdb with N protein chains (A, B, … occ=1/N)
+    and N water chains (a, b, … occ=1/N).
 
     Each jigglepdb output is a single-conformer PDB, so phenix.geometry_minimization
     runs without altloc complexity and all n_altlocs jobs run concurrently.
@@ -461,7 +464,59 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
     with ThreadPoolExecutor(max_workers=n_altlocs) as pool:
         minimized_pdbs = list(pool.map(_minimize_one, conf_pdbs))
 
-    _merge_altconfs(minimized_pdbs, tmpdir / 'multiconf.pdb', rng=rng, flood_occ=flood_occ)
+    # Build multiconf.pdb in single-chain altloc form to match refmacout.pdb labeling:
+    #   chain A: protein, every atom has altloc A,B,…,N (occ=1/N each)
+    #   chain S: waters, every atom has altloc A,B,…,N (occ=1/N each)
+    # sfcalc sums altloc atoms with their occupancies. Flood waters added later as chain F.
+    CONF_LABELS  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    occ_per_conf = 1.0 / n_altlocs
+
+    confs       = [gemmi.read_structure(str(pdb)) for pdb in minimized_pdbs]
+    ref_st      = confs[0]
+    st_out      = gemmi.Structure()
+    st_out.cell          = ref_st.cell
+    st_out.spacegroup_hm = ref_st.spacegroup_hm
+    model_out   = gemmi.Model('1')
+
+    def _build_altloc_chain(out_name, in_chain_name):
+        in_chains = [next((ch for ch in c[0] if ch.name == in_chain_name), None)
+                     for c in confs]
+        if all(ch is None for ch in in_chains):
+            return None
+        n_res = max(len(ch) if ch else 0 for ch in in_chains)
+        ch_out = gemmi.Chain(out_name)
+        for ri in range(n_res):
+            ref_res = next((ch[ri] for ch in in_chains if ch and ri < len(ch)), None)
+            if ref_res is None:
+                continue
+            res_out = gemmi.Residue()
+            res_out.name        = ref_res.name
+            res_out.seqid       = ref_res.seqid
+            res_out.entity_type = ref_res.entity_type
+            for ci, chain in enumerate(in_chains):
+                if chain is None or ri >= len(chain):
+                    continue
+                for atom in chain[ri]:
+                    a_new         = gemmi.Atom()
+                    a_new.name    = atom.name
+                    a_new.element = atom.element
+                    a_new.pos     = atom.pos
+                    a_new.b_iso   = atom.b_iso
+                    a_new.occ     = occ_per_conf
+                    a_new.altloc  = CONF_LABELS[ci]
+                    res_out.add_atom(a_new)
+            ch_out.add_residue(res_out)
+        return ch_out
+
+    prot_chain = _build_altloc_chain('A', 'A')
+    if prot_chain is not None:
+        model_out.add_chain(prot_chain)
+    water_chain = _build_altloc_chain('S', 'W')
+    if water_chain is not None:
+        model_out.add_chain(water_chain)
+
+    st_out.add_model(model_out)
+    st_out.write_pdb(str(tmpdir / 'multiconf.pdb'))
 
 
 def _sample_correlated_protein_occs(chain_residues, n_conf, rng):
@@ -628,14 +683,17 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     # positions from the mask, giving an artificially low bulk-solvent scale.
     st_mask = gemmi.read_structure(str(pdb_path))
     for model in st_mask:
-        to_remove = [i for i, ch in enumerate(model) if ch.name in ('W', 'F')]
+        to_remove = [i for i, ch in enumerate(model)
+                     if ch.name in ('S', 'W', 'F') or ch.name.islower()]
         for i in reversed(to_remove):
             del model[i]
     mask_pdb = str(tmpdir / '_mask_input.pdb')
     st_mask.write_pdb(mask_pdb)
 
+    _sg = gemmi.find_spacegroup_by_name(SPACEGROUP)
+    sg_num = _sg.number if _sg else 1
     cavenv_kw = (
-        f'CELL {cell_kw}\nSYMM P1\nENVSOLVENT\n'
+        f'CELL {cell_kw}\nSYMM {sg_num}\nENVSOLVENT\n'
         f'GRID {grid_kw}\nRADMAX {solvent_radius}\n'
     ).encode()
     cv = subprocess.run(
@@ -857,10 +915,12 @@ def _add_collapsed_atom(res_out, atoms):
     res_out.add_atom(a_out)
 
 
-def _reduce_conformers(by_name, sc_names, max_confs=3):
-    """Drop lowest-occupancy conformers until ≤ max_confs altlocs remain.
+def _reduce_conformers(by_name, sc_names, max_confs=3, rng=None):
+    """Reduce to ≤ max_confs altloc conformers; returns (updated_by_name, label_list).
 
-    Returns (updated_by_name, remaining_label_list).
+    When rng is provided and more than max_confs conformers are present, selects
+    max_confs randomly (uniform, without replacement) instead of always keeping the
+    highest-occupancy ones.  Occupancies of survivors are renormalised to sum to 1.
     """
     labels = sorted({a.altloc for name in sc_names
                      for a in by_name.get(name, ())
@@ -868,18 +928,24 @@ def _reduce_conformers(by_name, sc_names, max_confs=3):
     if len(labels) <= max_confs:
         return by_name, labels
 
-    # Mean occupancy per conformer label
+    # Mean occupancy per conformer label (used for renormalisation regardless of mode)
     occ_by_label = {}
     for l in labels:
         occs = [a.occ for name in sc_names
                 for a in by_name.get(name, ()) if a.altloc == l]
         occ_by_label[l] = float(np.mean(occs)) if occs else 0.0
 
-    # Drop lowest-occupancy conformers until ≤ max_confs remain
-    while len(labels) > max_confs:
-        drop_l = min(labels, key=lambda l: occ_by_label[l])
-        labels.remove(drop_l)
-        del occ_by_label[drop_l]
+    if rng is not None:
+        # Random selection: sample max_confs labels uniformly
+        chosen = rng.choice(labels, size=max_confs, replace=False).tolist()
+        labels = sorted(chosen)
+        occ_by_label = {l: occ_by_label[l] for l in labels}
+    else:
+        # Default: drop lowest-occupancy conformers until ≤ max_confs remain
+        while len(labels) > max_confs:
+            drop_l = min(labels, key=lambda l: occ_by_label[l])
+            labels.remove(drop_l)
+            del occ_by_label[drop_l]
 
     # Renormalize surviving occupancies to sum to 1.0
     total = sum(occ_by_label.values())
@@ -908,83 +974,209 @@ def _reduce_conformers(by_name, sc_names, max_confs=3):
     return new_by_name, labels
 
 
-def step8_build_mixed_model(truth_full_pdb, tmpdir, rng):
+def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.0):
     """Build a mixed single/multi-conformer model → starthere.pdb.
 
+    Reads single-chain altloc multiconf format from truth_full.pdb:
+      chain A: protein, atoms have altloc A,B,…,N (occ=1/N each)
+      chain S: waters,  atoms have altloc A,B,…,N (occ=1/N each)
+      chain F: flood waters (skipped)
+
     For each residue:
-      - Main chain (N, CA, C, O, OXT): always collapse all altlocs to mean position.
-      - Side chain: if ANY atom across conformers is > ALTLOC_DIST_THRESHOLD Å from
-        the centroid, keep the FULL side chain as alternates (with scrambled labels).
-        Otherwise collapse the full side chain to mean positions.
-      - Waters: always collapse.
-    This mimics a realistic partial model where main-chain order is assumed and
-    only genuinely disordered side chains are modelled as altlocs.
+      - If max atom displacement across N altlocs > ALTLOC_DIST_THRESHOLD,
+        keep all atoms as altlocs (scrambled labels).
+      - Otherwise collapse to mean position.
+      - Waters (chain S): always collapsed to mean position at occ = 1/N.
     """
-    st_in  = gemmi.read_structure(str(truth_full_pdb))
+    CONF_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    st_in = gemmi.read_structure(str(truth_full_pdb))
+
+    prot_chain  = next((ch for ch in st_in[0] if ch.name == 'A'), None)
+    water_chain = next((ch for ch in st_in[0] if ch.name == 'S'), None)
+
+    if prot_chain is None:
+        raise RuntimeError('step8: no chain A (protein) found in truth_full.pdb')
+
+    # Determine n_conf from the first protein residue's altloc count
+    altloc_set = set()
+    for res in prot_chain:
+        for atom in res:
+            if atom.altloc and atom.altloc != '\x00':
+                altloc_set.add(atom.altloc)
+        if altloc_set:
+            break
+    n_conf = max(len(altloc_set), 1)
+
+    # Build per-residue dicts: each protein residue holds its own atom list (with altlocs)
+    def _seqid_str(res):
+        return str(res.seqid)
+
+    prot_residues = {}  # seqid_str → list of "synthetic" gemmi.Residue (one per altloc)
+    seqid_order   = []
+    for res in prot_chain:
+        k = _seqid_str(res)
+        if k in prot_residues:
+            continue
+        # Split atoms by altloc into N synthetic residues so downstream code
+        # (which iterates "residues" as per-conformer copies) keeps working.
+        by_alt = {}
+        for atom in res:
+            lbl = atom.altloc if (atom.altloc and atom.altloc != '\x00') else CONF_LABELS[0]
+            by_alt.setdefault(lbl, []).append(atom)
+        synth = []
+        for lbl in sorted(by_alt.keys()):
+            r2 = gemmi.Residue()
+            r2.name = res.name; r2.seqid = res.seqid; r2.entity_type = res.entity_type
+            for a in by_alt[lbl]:
+                a_copy = gemmi.Atom()
+                a_copy.name    = a.name
+                a_copy.element = a.element
+                a_copy.pos     = a.pos
+                a_copy.b_iso   = a.b_iso
+                a_copy.occ     = a.occ
+                a_copy.altloc  = '\x00'  # cleared so downstream re-labels
+                r2.add_atom(a_copy)
+            synth.append(r2)
+        prot_residues[k] = synth
+        seqid_order.append(k)
+
+    water_residues = {}
+    if water_chain is not None:
+        for res in water_chain:
+            k = _seqid_str(res)
+            # Each water residue's altloc atoms become "N residues, one atom each"
+            # to keep the existing reduction logic happy.
+            by_alt = {}
+            for atom in res:
+                lbl = atom.altloc if (atom.altloc and atom.altloc != '\x00') else CONF_LABELS[0]
+                by_alt.setdefault(lbl, []).append(atom)
+            synth = []
+            for lbl in sorted(by_alt.keys()):
+                r2 = gemmi.Residue()
+                r2.name = res.name; r2.seqid = res.seqid; r2.entity_type = res.entity_type
+                for a in by_alt[lbl]:
+                    a_copy = gemmi.Atom()
+                    a_copy.name    = a.name
+                    a_copy.element = a.element
+                    a_copy.pos     = a.pos
+                    a_copy.b_iso   = a.b_iso
+                    a_copy.occ     = a.occ
+                    a_copy.altloc  = '\x00'
+                    r2.add_atom(a_copy)
+                synth.append(r2)
+            water_residues.setdefault(k, []).extend(synth)
 
     st_out = gemmi.Structure()
-    st_out.cell         = st_in.cell
+    st_out.cell          = st_in.cell
     st_out.spacegroup_hm = st_in.spacegroup_hm
     model_out = gemmi.Model('1')
 
-    for chain_in in st_in[0]:
-        if chain_in.name == 'F':   # flood waters — excluded from partial model
+    # ── Protein chain → output as single chain A ──────────────────────────────
+    chain_out = gemmi.Chain('A')
+    for key in seqid_order:
+        residues = prot_residues.get(key, [])
+        if not residues:
             continue
-        chain_out = gemmi.Chain(chain_in.name)
-        for res_in in chain_in:
-            res_out = gemmi.Residue()
-            res_out.name        = res_in.name
-            res_out.seqid       = res_in.seqid
-            res_out.entity_type = res_in.entity_type
+        res0    = residues[0]
+        res_out = gemmi.Residue()
+        res_out.name        = res0.name
+        res_out.seqid       = res0.seqid
+        res_out.entity_type = res0.entity_type
 
-            is_solvent = res_in.name in ('HOH', 'WAT', 'H2O')
+        # Build by_name assigning conformer labels A, B, … so _reduce_conformers works
+        by_name = {}
+        for conf_i, res in enumerate(residues):
+            lbl = CONF_LABELS[conf_i]
+            for atom in res:
+                a_copy         = gemmi.Atom()
+                a_copy.name    = atom.name
+                a_copy.element = atom.element
+                a_copy.pos     = atom.pos
+                a_copy.b_iso   = atom.b_iso
+                a_copy.occ     = atom.occ
+                a_copy.altloc  = lbl
+                by_name.setdefault(atom.name, []).append(a_copy)
 
-            # Group atoms by name (one list per atom name, one entry per altloc)
-            by_name = {}
-            for atom in res_in:
-                by_name.setdefault(atom.name, []).append(atom)
+        all_names = list(by_name.keys())
 
-            if is_solvent:
-                for atoms in by_name.values():
-                    _add_collapsed_atom(res_out, atoms)
-                chain_out.add_residue(res_out)
-                continue
+        # Residue-wide spatial spread: max displacement of any atom from its centroid
+        res_spread = 0.0
+        for n in all_names:
+            atoms = by_name.get(n, [])
+            if len(atoms) > 1:
+                pos = np.array([[a.pos.x, a.pos.y, a.pos.z] for a in atoms])
+                centroid = pos.mean(axis=0)
+                dists = np.sqrt(((pos - centroid) ** 2).sum(axis=1))
+                res_spread = max(res_spread, float(dists.max()))
 
-            mc_names = [n for n in by_name if n in MAINCHAIN_ATOMS]
-            sc_names = [n for n in by_name if n not in MAINCHAIN_ATOMS]
-
-            # Main chain: always collapse
-            for name in mc_names:
+        if res_spread <= ALTLOC_DIST_THRESHOLD:
+            for name in all_names:
                 _add_collapsed_atom(res_out, by_name[name])
+        else:
+            by_name, present = _reduce_conformers(by_name, all_names, max_confs=min(n_conf, 3))
 
-            # Side chain: keep altlocs if any SC atom has multiple conformers;
-            # drop lowest-occupancy ones until ≤ 3 remain.
-            has_altloc = any(len(by_name.get(n, [])) > 1 for n in sc_names)
-            if not has_altloc:
-                for name in sc_names:
-                    _add_collapsed_atom(res_out, by_name[name])
-            else:
-                by_name, present = _reduce_conformers(by_name, sc_names, max_confs=3)
+            shuffled = list(present)
+            n_swaps = int(rng.poisson(altloc_swaps_per_res))
+            for _ in range(n_swaps):
+                i, j = rng.choice(len(shuffled), size=2, replace=False)
+                shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+            label_map = dict(zip(present, shuffled))
 
-                # Scramble altloc labels per residue
-                shuffled = list(present)
-                rng.shuffle(shuffled)
-                label_map = dict(zip(present, shuffled))
+            for name in all_names:
+                for atom in by_name.get(name, []):
+                    orig  = atom.altloc if (atom.altloc and atom.altloc != '\x00') else (present[0] if present else 'A')
+                    a_out         = gemmi.Atom()
+                    a_out.name    = atom.name
+                    a_out.element = atom.element
+                    a_out.pos     = atom.pos
+                    a_out.b_iso   = atom.b_iso
+                    a_out.occ     = atom.occ
+                    a_out.altloc  = label_map.get(orig, orig)
+                    res_out.add_atom(a_out)
 
-                for name in sc_names:
-                    for atom in by_name.get(name, []):
-                        orig = atom.altloc if (atom.altloc and atom.altloc != '\x00') else (present[0] if present else 'A')
-                        a_out = gemmi.Atom()
-                        a_out.name    = atom.name
-                        a_out.element = atom.element
-                        a_out.pos     = atom.pos
-                        a_out.b_iso   = atom.b_iso
-                        a_out.occ     = atom.occ
-                        a_out.altloc  = label_map.get(orig, orig)
-                        res_out.add_atom(a_out)
+        chain_out.add_residue(res_out)
+    model_out.add_chain(chain_out)
 
-            chain_out.add_residue(res_out)
-        model_out.add_chain(chain_out)
+    # ── Waters → keep all N conformer positions as altlocs in chain S ─────────
+    # Chain S: refmac_occupancy_setup.com treats segid=="S" as waters unconditionally
+    # (conf="w" → incomplete occ group per altloc), so each altloc gets independent
+    # free occupancy refinement.  Starting at occ=1/N for each altloc.
+    if water_residues:
+        water_occ = 1.0 / n_conf
+        water_chain_out = gemmi.Chain('S')
+        water_seqids = sorted(water_residues.keys(),
+                              key=lambda k: water_residues[k][0].seqid.num)
+        for key in water_seqids:
+            residues = water_residues[key]   # list of synthetic residues, one per altloc
+            res0    = residues[0]
+            res_out = gemmi.Residue()
+            res_out.name        = res0.name
+            res_out.seqid       = res0.seqid
+            res_out.entity_type = res0.entity_type
+            for ci, res in enumerate(residues):
+                lbl = CONF_LABELS[ci]
+                for atom in res:
+                    a_out         = gemmi.Atom()
+                    a_out.name    = atom.name
+                    a_out.element = atom.element
+                    a_out.pos     = atom.pos
+                    a_out.b_iso   = atom.b_iso
+                    a_out.occ     = water_occ
+                    a_out.altloc  = lbl
+                    res_out.add_atom(a_out)
+            water_chain_out.add_residue(res_out)
+        model_out.add_chain(water_chain_out)
+
+    # Strip H atoms before writing — riding H from phenix geommin have partial occ
+    # when collapsed (present in only k of N conformers → occ=k/N), which creates
+    # spurious incomplete groups in refmac_occupancy_setup.com.
+    # refmac MAKE HYDR A adds them back with correct occ relative to their heavy atom.
+    H = gemmi.Element('H')
+    for chain in model_out:
+        for res in chain:
+            to_del = [i for i, a in enumerate(res) if a.element == H]
+            for i in reversed(to_del):
+                del res[i]
 
     st_out.add_model(model_out)
     st_out.write_pdb(str(tmpdir / 'starthere.pdb'))
@@ -1084,47 +1276,75 @@ def step9_probe(tmpdir):
     return _parse_unused_links(probe_log)
 
 
-def step9_refmac(tmpdir):
-    """Full NCYC 20 refmac on starthere.pdb → refmacout.mtz / refmac.log.
+def step9_refmac(tmpdir, n_rounds=3, ncyc_per_round=20, weight_matrix=None):
+    """Run refmac in n_rounds sequential rounds of ncyc_per_round cycles each.
 
-    Assumes starthere.pdb and refme.mtz are already correct (clash detection
-    and ground-truth correction are done by the caller before this is called).
+    Round 1: starthere.pdb → refmacout.pdb / refmacout.mtz
+    Round k: previous refmacout.pdb → refmacout.pdb / refmacout.mtz
+    Occupancy setup is regenerated each round from the current input PDB.
+    All round logs are concatenated into refmac.log.
 
-    Returns log_text.
+    Returns the concatenated log text.
     """
-    def _build_occ_bytes():
-        run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), 'starthere.pdb'],
+    def _build_occ_bytes(xyzin):
+        run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), xyzin],
             cwd=tmpdir)
         b = (tmpdir / 'refmac_opts_occ.txt').read_bytes()
         return b if b.endswith(b'\n') else b + b'\n'
 
-    keywords = (
-        _build_occ_bytes() +
-        b'MAKE HYDR A NEWLIGAND NOEXIT\n'
-        b'NCYC 20\n'
-        b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
-        b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT '
-        b'DELFWT=DELFWT PHDELWT=PHDELWT\n'
-        b'MONI DIST 10\n'
-        b'END\n'
-    )
-    result = subprocess.run(
-        [str(REFMAC5),
-         'XYZIN',  'starthere.pdb',
-         'XYZOUT', 'refmacout.pdb',
-         'HKLIN',  'refme.mtz',
-         'HKLOUT', 'refmacout.mtz',
-         'LIBOUT',  'refmac.lib'],
-        input=keywords,
-        cwd=str(tmpdir),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    log_text = result.stdout.decode(errors='replace')
-    (tmpdir / 'refmac.log').write_text(log_text)
-    if result.returncode != 0:
-        raise RuntimeError(f'refmac5 failed:\n{log_text[-3000:]}')
-    return log_text
+    def _rwork_rfree(log):
+        for line in reversed(log.splitlines()):
+            if 'R factor' in line and rwork_re.search(line):
+                try:
+                    parts = line.split()
+                    return float(parts[-2]), float(parts[-1])
+                except Exception:
+                    pass
+        return None, None
+
+    import re
+    rwork_re = re.compile(r'\d\.\d{4}')
+
+    full_log = ''
+    xyzin = 'starthere.pdb'
+
+    for rnd in range(n_rounds):
+        xyzout = 'refmacout.pdb'
+        keywords = (
+            _build_occ_bytes(xyzin) +
+            b'MAKE HYDR A NEWLIGAND NOEXIT\n' +
+            f'NCYC {ncyc_per_round}\n'.encode() +
+            (f'WEIGHT MATRIX {weight_matrix}\n'.encode() if weight_matrix is not None else b'') +
+            b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
+            b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT '
+            b'DELFWT=DELFWT PHDELWT=PHDELWT\n'
+            b'MONI DIST 10\n'
+            b'END\n'
+        )
+        result = subprocess.run(
+            [str(REFMAC5),
+             'XYZIN',  xyzin,
+             'XYZOUT', xyzout,
+             'HKLIN',  'refme.mtz',
+             'HKLOUT', 'refmacout.mtz',
+             'LIBOUT',  'refmac.lib'],
+            input=keywords,
+            cwd=str(tmpdir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        log_text = result.stdout.decode(errors='replace')
+        full_log += f'\n{"="*60}\n refmac round {rnd+1}/{n_rounds}\n{"="*60}\n' + log_text
+        if result.returncode != 0:
+            (tmpdir / 'refmac.log').write_text(full_log)
+            raise RuntimeError(f'refmac5 round {rnd+1} failed:\n{log_text[-3000:]}')
+        rw, rf = _rwork_rfree(log_text)
+        r_str = f'R={rw:.4f} Rf={rf:.4f}' if rw is not None else 'R=n/a'
+        print(f'    refmac round {rnd+1}/{n_rounds}: {r_str}')
+        xyzin = xyzout  # feed output into next round
+
+    (tmpdir / 'refmac.log').write_text(full_log)
+    return full_log
 
 
 def step10_convert_maps(tmpdir, outdir):
@@ -1152,15 +1372,72 @@ def step10_convert_maps(tmpdir, outdir):
     mtz_to_ccp4(mtz_r, 'DELFWT',     'PHDELWT',      outdir / 'fofc.map')
     mtz_to_ccp4(mtz_r, 'FC_ALL_LS',  'PHIC_ALL_LS',  outdir / 'fc.map')
 
+    # True phased difference map: truth.map - fc.map
+    # This is the *correct* Fo-Fc the network is being trained to predict.
+    truth_grid = gemmi.read_ccp4_map(str(outdir / 'truth.map')).grid
+    fc_grid    = gemmi.read_ccp4_map(str(outdir / 'fc.map')).grid
+    diff_arr   = np.array(truth_grid, copy=False) - np.array(fc_grid, copy=False)
+    diff_grid  = gemmi.FloatGrid(diff_arr.astype(np.float32),
+                                 truth_grid.unit_cell, truth_grid.spacegroup)
+    diff_ccp4 = gemmi.Ccp4Map()
+    diff_ccp4.grid = diff_grid
+    diff_ccp4.update_ccp4_header()
+    diff_ccp4.write_ccp4_map(str(outdir / 'truediff.map'))
+
+
+def _generate_flood_waters(truth_full_pdb, rng, n_flood, flood_occ):
+    """Append chain F flood waters to truth_full.pdb, avoiding full-occ atoms.
+
+    Reads existing atom positions from truth_full.pdb (protein + ordered waters)
+    to avoid placing flood waters on top of real atoms (min separation 2.8 Å).
+    Returns the number of flood waters actually placed.
+    """
+    _occ = float(flood_occ) if flood_occ is not None else 0.1
+    st = gemmi.read_structure(str(truth_full_pdb))
+    existing = [(a.pos.x, a.pos.y, a.pos.z)
+                for chain in st[0] for res in chain for a in res]
+    margin = 2.0
+    flood_chain = gemmi.Chain('F')
+    added = 0
+    for _ in range(n_flood * 20):
+        if added >= n_flood:
+            break
+        x = float(rng.uniform(margin, CELL[0] - margin))
+        y = float(rng.uniform(margin, CELL[1] - margin))
+        z = float(rng.uniform(margin, CELL[2] - margin))
+        if any((x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 < 7.84
+               for px, py, pz in existing):
+            continue
+        b = float(np.clip(rng.lognormal(BFAC_SC_MU, BFAC_SC_SIGMA + 0.3),
+                          BFAC_SC_MIN, 120.0))
+        res = gemmi.Residue()
+        res.name  = 'HOH'
+        res.seqid = gemmi.SeqId(added + 1, ' ')
+        atom         = gemmi.Atom()
+        atom.name    = 'O'
+        atom.element = gemmi.Element('O')
+        atom.pos     = gemmi.Position(x, y, z)
+        atom.occ     = _occ
+        atom.b_iso   = b
+        res.add_atom(atom)
+        flood_chain.add_residue(res)
+        existing.append((x, y, z))
+        added += 1
+    if added > 0:
+        st[0].add_chain(flood_chain)
+    st.write_pdb(str(truth_full_pdb))
+    return added
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Sample orchestration
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
-                    flood_avoid_fullocc=True, flood_occ=None,
+                    flood_avoid_fullocc=True, flood_occ=None, vary_flood=False,
                     shift_scale=0.5, n_altlocs=2, missing_fraction=0.05,
                     never_collected_fraction=0.05, extra_b=0.0,
+                    altloc_swaps_per_res=1.0, weight_matrix=None,
                     seed=None, debug=False):
     """Run the full pipeline for one sample. Returns (sample_idx, ok, info).
 
@@ -1181,6 +1458,13 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             shutil.rmtree(stale, ignore_errors=True)
 
     rng = np.random.default_rng(seed=sample_idx if seed is None else seed)
+
+    if vary_flood and n_flood > 0:
+        rng_flood = np.random.default_rng(seed=(sample_idx if seed is None else seed) + 4)
+        log_nf  = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
+        n_flood = int(np.round(np.exp(log_nf)))
+        flood_occ = float(FLOOD_LINE_K / np.sqrt(n_flood))
+
     seq = list(rng.choice(AA_NAMES, size=n_residues, p=AA_PROBS))
 
     tmpdir = Path(tempfile.mkdtemp(prefix=f'prot_{sample_idx:05d}_',
@@ -1200,10 +1484,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         t = _t('build_seq', t)
 
         # 3: Set up structure (cell, waters, centre, B factors)
-        n_water_added, n_flood_added = step3_setup_structure(
-            tmpdir, rng, n_waters=n_waters,
-            n_flood=n_flood, flood_avoid_fullocc=flood_avoid_fullocc,
-            flood_occ=flood_occ)
+        n_water_added = step3_setup_structure(tmpdir, rng, n_waters=n_waters)
         t = _t('setup_struct', t)
 
         # 4: First geometry minimisation
@@ -1212,7 +1493,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 
         # 4c: Check .geo file for severe heavy-atom nonbond clashes (obs < ideal,
         #     LJ energy > 10).  Delete offenders NOW before building altlocs —
-        #     cheaper than re-running sfcalc/refmac later via step9_probe.
+        #     cheaper than re-running sfcalc/refmac later.
         geo_file = tmpdir / 'built_minimized.geo'
         geo_bad = _parse_geo_bad_nonbonds(geo_file)
         if geo_bad:
@@ -1226,15 +1507,22 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         selfref_pdb = step4b_selfref_b_factors(minimized_pdb, tmpdir)
         t = _t('selfref_bfac', t)
 
-        # 5: jigglepdb using refined B factors → altloc A/B/...
+        # 5: jigglepdb using refined B factors → N full chains in multiconf.pdb
         step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng,
-                                  shift_scale=shift_scale, n_altlocs=n_altlocs,
-                                  flood_occ=flood_occ)
+                                  shift_scale=shift_scale, n_altlocs=n_altlocs)
         t = _t('jiggle_and_merge', t)
 
         # 6: Each conformer was already minimized independently inside
         #    step5_jigglepdb_and_merge; multiconf.pdb is the truth structure.
         shutil.copy2(tmpdir / 'multiconf.pdb', tmpdir / 'truth_full.pdb')
+
+        # 6a: Inject flood waters into truth_full.pdb now that all protein/water
+        #     atoms are finalized; avoids their positions. Then flip half the signs.
+        n_flood_added = 0
+        if n_flood > 0:
+            n_flood_added = _generate_flood_waters(
+                tmpdir / 'truth_full.pdb', rng, n_flood, flood_occ)
+            _apply_flood_signs(tmpdir / 'truth_full.pdb', rng)
 
         # 6b: Apply extra_b to all truth atoms — broadens the target density,
         #     simulating lower effective resolution.  Modifies truth_full.pdb
@@ -1261,27 +1549,13 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         t = _t('refme_mtz', t)
 
         # 9: Build mixed single/multi-conformer model → starthere.pdb
-        step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng)
+        step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng,
+                                 altloc_swaps_per_res=altloc_swaps_per_res)
         t = _t('build_mixed_model', t)
 
-        # 10a: NCYC 0 probe to detect geometry clashes
-        clashing_residues_deleted = geo_bad | step9_probe(tmpdir)
-        t = _t('probe_ncyc0', t)
-        if clashing_residues_deleted:
-            # Delete clashing residues from GROUND TRUTH, not the partial model.
-            # They clash because the amorphous builder placed atoms in impossible
-            # geometry; the truth structure is wrong, not the refinement target.
-            _delete_residues_from_pdb(tmpdir / 'truth_full.pdb',
-                                      clashing_residues_deleted)
-            # Recalculate truth.mtz from corrected ground truth (H already present).
-            _sfcalc_with_bulksolv(tmpdir / 'truth_full.pdb', tmpdir / 'truth.mtz', tmpdir)
-            # Rebuild starthere.pdb from corrected truth_full.pdb.
-            step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng)
-            t = _t('clash_correction', t)
-
-        # 10b: Full NCYC 20 refinement
-        refmac_log = step9_refmac(tmpdir)
-        t = _t('refmac_ncyc20', t)
+        # 10: Full NCYC 20 refinement
+        refmac_log = step9_refmac(tmpdir, n_rounds=2, weight_matrix=weight_matrix)
+        t = _t('refmac_2x20', t)
 
         # Parse final Rwork from refmac log
         # "Overall R factor = 0.0201" appears once per cycle; last is final cycle.
@@ -1302,8 +1576,6 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         if (tmpdir / 'refmacout.mtz').exists():
             shutil.copy2(tmpdir / 'refmacout.mtz', sample_dir / 'refmacout.mtz')
         shutil.copy2(tmpdir / 'refmac.log',        sample_dir / 'refmac.log')
-        if (tmpdir / 'probe_refmac.log').exists():
-            shutil.copy2(tmpdir / 'probe_refmac.log', sample_dir / 'probe_refmac.log')
         for plog in tmpdir.glob('*.phenix.log'):
             shutil.copy2(plog, sample_dir / plog.name)
 
@@ -1324,16 +1596,21 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             n_waters_requested=n_waters,
             n_waters_added=n_water_added,
             n_flood_added=n_flood_added,
-            n_clashing_residues_deleted=len(clashing_residues_deleted),
+            n_clashing_residues_deleted=len(geo_bad),
             rwork_final=rwork,
             missing_fraction=missing_fraction,
             n_reflections_missing=n_missing,
             never_collected_fraction=never_collected_fraction,
             n_reflections_never_collected=n_never,
             extra_b=extra_b,
+            altloc_swaps_per_res=altloc_swaps_per_res,
+            vary_flood=vary_flood,
+            n_flood_actual=n_flood,
+            flood_occ_actual=flood_occ,
             cell=list(CELL),
+            spacegroup=SPACEGROUP,
             dmin=DMIN,
-            grid_shape=[60, 60, 60],
+            grid_shape=[round(CELL[i] * SAMPLE_RATE / DMIN) for i in range(3)],
             step_timings=timings,
         )
         (sample_dir / 'metadata.json').write_text(json.dumps(meta, indent=2))
@@ -1366,9 +1643,11 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        flood_avoid_fullocc=True, shift_scale=0.5, n_altlocs=2,
                        missing_fraction=0.05, never_collected_fraction=0.05,
-                       extra_b=0.0, max_array=300, seed=None, flood_occ=None,
-                       cell=None, dmin=2.0, partition='debug', account=None,
-                       qos=None, time='00:10:00'):
+                       extra_b=0.0, altloc_swaps_per_res=1.0, vary_flood=False,
+                       max_array=300, seed=None, flood_occ=None, cell=None,
+                       dmin=2.0, spacegroup='P 1', partition='debug',
+                       account=None, qos=None, time='00:10:00',
+                       weight_matrix=None):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     python  = sys.executable
@@ -1378,9 +1657,13 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     # parallel inside step5_jigglepdb_and_merge (ThreadPoolExecutor).
     cpus_per_task = max(n_altlocs, 2)
 
-    seed_line      = f'    --seed {seed} \\\n'          if seed      is not None else ''
-    flood_occ_line = f'    --flood-occ {flood_occ} \\\n' if flood_occ is not None else ''
-    extra_b_line   = f'    --extra-b {extra_b} \\\n'     if extra_b              else ''
+    seed_line      = f'    --seed {seed} \\\n'                     if seed                is not None else ''
+    flood_occ_line = f'    --flood-occ {flood_occ} \\\n'           if flood_occ           is not None else ''
+    extra_b_line   = f'    --extra-b {extra_b} \\\n'               if extra_b                         else ''
+    scramble_line  = f'    --altloc-swaps-per-res {altloc_swaps_per_res} \\\n' if altloc_swaps_per_res != 1.0 else ''
+    weight_line    = f'    --weight-matrix {weight_matrix} \\\n'              if weight_matrix is not None   else ''
+    varflood_line  = f'    --vary-flood \\\n'                       if vary_flood                      else ''
+    sg_line        = f'    --spacegroup "{spacegroup}" \\\n'        if spacegroup != 'P 1'             else ''
     _cell = cell if cell is not None else (40.0, 40.0, 40.0)
     cell_line      = f'    --cell {_cell[0]} {_cell[1]} {_cell[2]} \\\n'
     dmin_line      = f'    --dmin {dmin} \\\n'
@@ -1409,7 +1692,7 @@ mkdir -p "${{CCP4_SCR:-/tmp}}"
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
     --never-collected-fraction {never_collected_fraction} \\
-{cell_line}{dmin_line}{flood_occ_line}{extra_b_line}{seed_line}"""
+{cell_line}{dmin_line}{sg_line}{flood_occ_line}{varflood_line}{extra_b_line}{scramble_line}{weight_line}{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
@@ -1434,7 +1717,12 @@ def main():
     parser.add_argument('--outdir',     default='./data/data_protein')
     parser.add_argument('--nsamples',   type=int, default=100)
     parser.add_argument('--nresidues',  type=int, default=20)
-    parser.add_argument('--nwaters',    type=int, default=10)
+    parser.add_argument('--nwaters',    type=int, default=30)
+    parser.add_argument('--spacegroup', default='P 1',
+                        help='Space group HM symbol (default: "P 1"). '
+                             'For P2₁2₁2₁ use "P 21 21 21". '
+                             'Protein is centred in the ASU; waters/floods '
+                             'are restricted to the ASU region.')
     parser.add_argument('--workers',    type=int, default=1)
     parser.add_argument('--sample-id',  type=int, default=None,
                         help='Run a single sample (for SLURM array jobs)')
@@ -1454,6 +1742,10 @@ def main():
                         help='Number of partial-occ flood waters to add (default 0)')
     parser.add_argument('--flood-occ',   type=float, default=None,
                         help='Fixed occupancy for flood waters (default: random 0.1-0.8)')
+    parser.add_argument('--vary-flood', action='store_true', default=False,
+                        help='Per-sample: draw n_flood ~ LogUniform(%d,%d), '
+                             'set occ=%.2f/sqrt(n_flood) for Rfree~11%%' %
+                             (FLOOD_NF_MIN, FLOOD_NF_MAX, FLOOD_LINE_K))
     parser.add_argument('--flood-avoid-fullocc', action='store_true', default=True,
                         help='Flood waters avoid full-occ atoms (default True)')
     parser.add_argument('--no-flood-avoid-fullocc', dest='flood_avoid_fullocc',
@@ -1467,6 +1759,8 @@ def main():
                         help='Fraction of reflections collected but rejected (F→NaN, default 0.05)')
     parser.add_argument('--extra-b',  type=float, default=0.0,
                         help='Extra B factor added to all truth_full.pdb atoms before sfcalc')
+    parser.add_argument('--weight-matrix', type=float, default=None,
+                        help='refmac WEIGHT MATRIX value (default: auto)')
     parser.add_argument('--never-collected-fraction', type=float, default=0.05,
                         help='Fraction of reflections never measured (rows deleted, default 0.05)')
     parser.add_argument('--cell', nargs=3, type=float, default=[40.0, 40.0, 40.0],
@@ -1474,6 +1768,10 @@ def main():
                         help='P1 unit cell dimensions in Å (default: 40 40 40)')
     parser.add_argument('--dmin', type=float, default=2.0,
                         help='Resolution cutoff in Å (default: 2.0)')
+    parser.add_argument('--altloc-swaps-per-res', type=float, default=1.0,
+                        help='Expected number of random pairwise altloc swaps per residue '
+                             '(Poisson); 0=no scrambling, 1=~1 swap/res, >1=more scrambled '
+                             '(default: 1.0)')
     parser.add_argument('--debug',      action='store_true',
                         help='Copy entire tmpdir to sample_dir/debug/ for inspection')
     parser.add_argument('--seed',       type=int, default=None,
@@ -1486,9 +1784,10 @@ def main():
         format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    global CELL, DMIN
-    CELL = tuple(args.cell)
-    DMIN = args.dmin
+    global CELL, DMIN, SPACEGROUP
+    CELL       = tuple(args.cell)
+    DMIN       = args.dmin
+    SPACEGROUP = args.spacegroup
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1504,11 +1803,14 @@ def main():
             n_flood=args.n_flood,
             flood_avoid_fullocc=args.flood_avoid_fullocc,
             flood_occ=args.flood_occ,
+            vary_flood=args.vary_flood,
             shift_scale=args.shift_scale,
             n_altlocs=args.n_altlocs,
             missing_fraction=args.missing_fraction,
             never_collected_fraction=args.never_collected_fraction,
             extra_b=args.extra_b,
+            altloc_swaps_per_res=args.altloc_swaps_per_res,
+            weight_matrix=args.weight_matrix,
             seed=args.seed,
             debug=args.debug,
         )
@@ -1522,9 +1824,11 @@ def main():
             args.nresidues, args.nwaters, args.n_flood, args.flood_avoid_fullocc,
             args.shift_scale, args.n_altlocs, args.missing_fraction,
             args.never_collected_fraction,
-            extra_b=args.extra_b, max_array=args.max_array,
+            extra_b=args.extra_b, altloc_swaps_per_res=args.altloc_swaps_per_res,
+            weight_matrix=args.weight_matrix,
+            vary_flood=args.vary_flood, max_array=args.max_array,
             seed=args.seed, flood_occ=args.flood_occ,
-            cell=CELL, dmin=DMIN,
+            cell=CELL, dmin=DMIN, spacegroup=SPACEGROUP,
             partition=args.partition, account=args.account, qos=args.qos,
             time=args.time,
         )
@@ -1543,6 +1847,8 @@ def main():
                                            args.n_altlocs, args.missing_fraction,
                                            args.never_collected_fraction,
                                            extra_b=args.extra_b,
+                                           altloc_swaps_per_res=args.altloc_swaps_per_res,
+                                           vary_flood=args.vary_flood,
                                            seed=args.seed, debug=args.debug)
             done += 1
             status = 'OK' if ok else 'ERR'
@@ -1556,6 +1862,7 @@ def main():
                             args.flood_avoid_fullocc, args.flood_occ,
                             args.shift_scale, args.n_altlocs, args.missing_fraction,
                             args.never_collected_fraction, args.extra_b,
+                            args.altloc_swaps_per_res, args.vary_flood,
                             args.seed, args.debug): sid
                 for sid in sample_ids
             }

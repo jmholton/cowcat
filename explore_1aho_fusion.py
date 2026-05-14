@@ -29,7 +29,9 @@ import numpy as np
 import gemmi
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REFMAC5    = Path('/programs/ccp4-8.0/bin/refmac5')
+import shutil as _shutil
+REFMAC5    = _shutil.which('refmac5') or '/programs/ccp4-8.0/bin/refmac5'
+del _shutil
 DMIN       = 0.965
 
 MAINCHAIN_ATOMS = frozenset({'N', 'CA', 'C', 'O', 'OXT', 'H', 'HA', 'HA2', 'HA3'})

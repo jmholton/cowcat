@@ -111,22 +111,39 @@ def write_atoms(atom_recs, header_lines, out_pdb):
 
 
 def atom_index(atom_recs):
-    """Return dict (chain, seqnum, icode, aname) → list-of-indices."""
+    """Return dict (chain, seqnum, icode, aname, altloc) → list-of-indices."""
     idx = {}
     for i, a in enumerate(atom_recs):
-        key = (a['chain'], a['seqnum'], a['icode'], a['aname'])
+        key = (a['chain'], a['seqnum'], a['icode'], a['aname'], a['altloc'])
         idx.setdefault(key, []).append(i)
     return idx
+
+
+def _chain_lookup(idx, chain, sn, ic, aname):
+    """Find any atoms matching (chain, sn, ic, aname) regardless of altloc."""
+    prefix = (chain, sn, ic, aname)
+    for key, idxs in idx.items():
+        if key[:4] == prefix:
+            return idxs
+    return []
 
 
 # ── Disulfide pair detection ─────────────────────────────────────────────────
 
 def find_ss_pairs(base_atoms, ref_chain='A', sg_cutoff=2.5):
     """Return list of (rk_i, rk_j) CYS pairs with SG-SG < sg_cutoff in ref_chain."""
+    altloc_mode = any(a['altloc'].strip() for a in base_atoms
+                      if a['resname'] not in HOH_NAMES)
     sg_pos = {}
     for a in base_atoms:
-        if a['chain'] != ref_chain or a['resname'] != 'CYS' or a['aname'] != 'SG':
+        if a['resname'] != 'CYS' or a['aname'] != 'SG':
             continue
+        if altloc_mode:
+            if a['chain'] != ref_chain or a['altloc'] not in (' ', 'A'):
+                continue
+        else:
+            if a['chain'] != ref_chain:
+                continue
         sg_pos[(a['seqnum'], a['icode'])] = (a['x'], a['y'], a['z'])
     pairs = []
     rks = sorted(sg_pos)
@@ -150,13 +167,20 @@ def _swap_xyz(recs, i, j):
 
 def _apply_one_swap(recs, idx, sw):
     """Apply a single swap spec to recs (in-place). Returns number of atoms swapped."""
-    chain_s    = sw['chain_s']
-    chain_t    = sw['chain_t']
-    move_type  = sw['move_type']
-    seqnum     = sw['rk'][0]
-    icode      = sw['rk'][1]
-    rk_next    = sw.get('rk_next')
-    rk_partner = sw.get('rk_partner')
+    altloc_mode = 'altloc_s' in sw
+    move_type   = sw['move_type']
+    seqnum      = sw['rk'][0]
+    icode       = sw['rk'][1]
+    rk_next     = sw.get('rk_next')
+    rk_partner  = sw.get('rk_partner')
+
+    if altloc_mode:
+        altloc_s = sw['altloc_s']
+        altloc_t = sw['altloc_t']
+        chain    = sw['chain']
+    else:
+        chain_s  = sw['chain_s']
+        chain_t  = sw['chain_t']
 
     if move_type == 'sc':
         atom_specs = [(seqnum, icode, None)]
@@ -178,16 +202,24 @@ def _apply_one_swap(recs, idx, sw):
     n = 0
     for (sn, ic, atom_set) in atom_specs:
         for aname_key in idx:
-            c, sn2, ic2, aname = aname_key
-            if c != chain_s or sn2 != sn or ic2 != ic:
-                continue
+            c, sn2, ic2, aname, alt = aname_key
+            if altloc_mode:
+                if c != chain or sn2 != sn or ic2 != ic or alt != altloc_s:
+                    continue
+            else:
+                if c != chain_s or sn2 != sn or ic2 != ic:
+                    continue
             if atom_set is None:
                 if aname in SC_BACKBONE_KEEP:
                     continue
             elif aname not in atom_set:
                 continue
-            s_idxs = idx.get((chain_s, sn, ic, aname), [])
-            t_idxs = idx.get((chain_t, sn, ic, aname), [])
+            if altloc_mode:
+                s_idxs = idx.get((chain,   sn, ic, aname, altloc_s), [])
+                t_idxs = idx.get((chain,   sn, ic, aname, altloc_t), [])
+            else:
+                s_idxs = _chain_lookup(idx, chain_s, sn, ic, aname)
+                t_idxs = _chain_lookup(idx, chain_t, sn, ic, aname)
             if not s_idxs or not t_idxs:
                 continue
             _swap_xyz(recs, s_idxs[0], t_idxs[0])
@@ -301,48 +333,110 @@ def run_baseline(base_pdb, fobs_mtz, truth_mtz, outdir, ncyc=50, weight=0.5):
 # ── Trial enumeration ─────────────────────────────────────────────────────────
 
 def _build_swap_catalog(base_atoms, move_types):
-    """All valid single-swap specs (no trial_id).  Each spec is a dict."""
-    chains_at_res = {}
-    resname_at    = {}
-    for a in base_atoms:
-        if a['resname'] in HOH_NAMES:
-            continue
-        rk = (a['seqnum'], a['icode'])
-        chains_at_res.setdefault(rk, set()).add(a['chain'])
-        resname_at[rk] = a['resname']
+    """All valid single-swap specs (no trial_id).  Each spec is a dict.
 
-    residue_keys = sorted(chains_at_res.keys())
-    rk_next_of   = {rk: residue_keys[i + 1]
-                    for i, rk in enumerate(residue_keys[:-1])}
-    ss_pairs = find_ss_pairs(base_atoms) if 'ss' in move_types else []
+    Auto-detects altloc mode (single protein chain with altloc labels)
+    vs chain mode (conformers as separate chains).
+    """
+    protein_chains = set(a['chain'] for a in base_atoms
+                         if a['resname'] not in HOH_NAMES)
+    altloc_mode = (len(protein_chains) == 1 and
+                   any(a['altloc'].strip() for a in base_atoms
+                       if a['resname'] not in HOH_NAMES))
 
-    catalog = []
-    for move in move_types:
-        if move == 'ss':
-            for rk_i, rk_j in ss_pairs:
-                chains = sorted(chains_at_res.get(rk_i, set())
-                                & chains_at_res.get(rk_j, set()))
+    if altloc_mode:
+        # Conformers encoded as altloc labels within a single chain.
+        confs_at_res = {}   # (seqnum, icode) → set of altloc labels
+        resname_at   = {}
+        chain_of_res = {}
+        for a in base_atoms:
+            if a['resname'] in HOH_NAMES or not a['altloc'].strip():
+                continue
+            rk = (a['seqnum'], a['icode'])
+            confs_at_res.setdefault(rk, set()).add(a['altloc'])
+            resname_at[rk]  = a['resname']
+            chain_of_res[rk] = a['chain']
+
+        residue_keys = sorted(confs_at_res.keys())
+        rk_next_of   = {rk: residue_keys[i + 1]
+                        for i, rk in enumerate(residue_keys[:-1])}
+        ss_pairs = find_ss_pairs(base_atoms) if 'ss' in move_types else []
+
+        catalog = []
+        for move in move_types:
+            if move == 'ss':
+                for rk_i, rk_j in ss_pairs:
+                    alts  = sorted(confs_at_res.get(rk_i, set())
+                                   & confs_at_res.get(rk_j, set()))
+                    chain = chain_of_res.get(rk_i, 'A')
+                    for altloc_s, altloc_t in combinations(alts, 2):
+                        catalog.append({
+                            'move_type': 'ss',
+                            'altloc_s': altloc_s, 'altloc_t': altloc_t, 'chain': chain,
+                            'rk': list(rk_i), 'rk_next': None, 'rk_partner': list(rk_j),
+                            'resname': resname_at.get(rk_i, 'CYS'),
+                        })
+                continue
+            for rk in residue_keys:
+                alts = sorted(confs_at_res[rk])
+                if len(alts) < 2:
+                    continue
+                rk_next = rk_next_of.get(rk)
+                if move == 'pep' and rk_next is None:
+                    continue
+                chain = chain_of_res.get(rk, 'A')
+                for altloc_s, altloc_t in combinations(alts, 2):
+                    catalog.append({
+                        'move_type': move,
+                        'altloc_s': altloc_s, 'altloc_t': altloc_t, 'chain': chain,
+                        'rk': list(rk), 'rk_next': list(rk_next) if rk_next else None,
+                        'rk_partner': None, 'resname': resname_at[rk],
+                    })
+        return catalog
+
+    else:
+        # Conformers encoded as separate chains (original behaviour).
+        chains_at_res = {}
+        resname_at    = {}
+        for a in base_atoms:
+            if a['resname'] in HOH_NAMES:
+                continue
+            rk = (a['seqnum'], a['icode'])
+            chains_at_res.setdefault(rk, set()).add(a['chain'])
+            resname_at[rk] = a['resname']
+
+        residue_keys = sorted(chains_at_res.keys())
+        rk_next_of   = {rk: residue_keys[i + 1]
+                        for i, rk in enumerate(residue_keys[:-1])}
+        ss_pairs = find_ss_pairs(base_atoms) if 'ss' in move_types else []
+
+        catalog = []
+        for move in move_types:
+            if move == 'ss':
+                for rk_i, rk_j in ss_pairs:
+                    chains = sorted(chains_at_res.get(rk_i, set())
+                                    & chains_at_res.get(rk_j, set()))
+                    for chain_s, chain_t in combinations(chains, 2):
+                        catalog.append({
+                            'move_type': 'ss', 'chain_s': chain_s, 'chain_t': chain_t,
+                            'rk': list(rk_i), 'rk_next': None, 'rk_partner': list(rk_j),
+                            'resname': resname_at.get(rk_i, 'CYS'),
+                        })
+                continue
+            for rk in residue_keys:
+                chains = sorted(chains_at_res[rk])
+                if len(chains) < 2:
+                    continue
+                rk_next = rk_next_of.get(rk)
+                if move == 'pep' and rk_next is None:
+                    continue
                 for chain_s, chain_t in combinations(chains, 2):
                     catalog.append({
-                        'move_type': 'ss', 'chain_s': chain_s, 'chain_t': chain_t,
-                        'rk': list(rk_i), 'rk_next': None, 'rk_partner': list(rk_j),
-                        'resname': resname_at.get(rk_i, 'CYS'),
+                        'move_type': move, 'chain_s': chain_s, 'chain_t': chain_t,
+                        'rk': list(rk), 'rk_next': list(rk_next) if rk_next else None,
+                        'rk_partner': None, 'resname': resname_at[rk],
                     })
-            continue
-        for rk in residue_keys:
-            chains = sorted(chains_at_res[rk])
-            if len(chains) < 2:
-                continue
-            rk_next = rk_next_of.get(rk)
-            if move == 'pep' and rk_next is None:
-                continue
-            for chain_s, chain_t in combinations(chains, 2):
-                catalog.append({
-                    'move_type': move, 'chain_s': chain_s, 'chain_t': chain_t,
-                    'rk': list(rk), 'rk_next': list(rk_next) if rk_next else None,
-                    'rk_partner': None, 'resname': resname_at[rk],
-                })
-    return catalog
+        return catalog
 
 
 def enumerate_trials(base_atoms, move_types, spr=1.0, n_trials=1000, seed=42):
@@ -396,15 +490,28 @@ def enumerate_trials(base_atoms, move_types, spr=1.0, n_trials=1000, seed=42):
     return trials
 
 
+def enumerate_trials_exhaust(base_atoms, move_types):
+    """One trial per unique single swap — exhaustive enumeration of the catalog."""
+    catalog = _build_swap_catalog(base_atoms, move_types)
+    print(f'  {len(catalog)} unique single-swap trials (exhaustive)')
+    trials = [{'trial_id': 0, 'swaps': []}]   # trial 0 = no-swap baseline
+    for i, sw in enumerate(catalog, 1):
+        trials.append({'trial_id': i, 'swaps': [sw]})
+    return trials
+
+
 # ── Single trial ──────────────────────────────────────────────────────────────
 
 def run_trial(trial, base_atoms, header_lines, atom_idx,
-              fobs_mtz, truth_mtz, outdir, ncyc=50, weight=0.5):
+              fobs_mtz, truth_mtz, outdir, ncyc=50, weight=0.5,
+              no_molprobify=False):
     tid   = trial['trial_id']
     tdir  = outdir / f'trial_{tid:05d}'
     tdir.mkdir(parents=True, exist_ok=True)
-    rjson = tdir / 'result.json'
-    if rjson.exists():
+    rjson    = tdir / 'result.json'
+    out_mtz  = tdir / 'refmacout.mtz'
+    out_pdb  = tdir / 'refmacout.pdb'
+    if rjson.exists() and out_mtz.exists():
         return json.loads(rjson.read_text())
 
     swapped, ok = make_swap_pdb(base_atoms, atom_idx, trial['swaps'])
@@ -414,27 +521,26 @@ def run_trial(trial, base_atoms, header_lines, atom_idx,
         rjson.write_text(json.dumps(res))
         return res
 
-    swap_pdb = tdir / 'swap.pdb'
-    write_atoms(swapped, header_lines, swap_pdb)
-
-    out_mtz = tdir / 'refmacout.mtz'
-    out_pdb = tdir / 'refmacout.pdb'
     with tempfile.TemporaryDirectory(prefix=f'swap_{tid}_') as td:
+        td = Path(td)
+        swap_pdb = td / 'swap.pdb'
+        write_atoms(swapped, header_lines, swap_pdb)
+
         r, rf, log, mtz_out, pdb_out = run_refmac_quick(
-            swap_pdb, fobs_mtz, ncyc, weight, Path(td))
-        if pdb_out and pdb_out.exists():
-            shutil.copy2(pdb_out, out_pdb)
+            swap_pdb, fobs_mtz, ncyc, weight, td)
+
+        rmsd_e, r_true = (None, None)
+        if mtz_out and mtz_out.exists() and truth_mtz:
+            rmsd_e, r_true = compute_metrics(mtz_out, truth_mtz)
+
+        wE = None
+        if not no_molprobify and pdb_out and pdb_out.exists():
+            wE = run_molprobity(pdb_out, td)
+
         if mtz_out and mtz_out.exists():
             shutil.copy2(mtz_out, out_mtz)
-        (tdir / 'refmac.log').write_text(log or '')
-
-    rmsd_e, r_true = (None, None)
-    if out_mtz.exists() and truth_mtz:
-        rmsd_e, r_true = compute_metrics(out_mtz, truth_mtz)
-
-    wE = None
-    if out_pdb.exists():
-        wE = run_molprobity(out_pdb, tdir)
+        if pdb_out and pdb_out.exists():
+            shutil.copy2(pdb_out, out_pdb)
 
     res = dict(trial, r=r, rf=rf, rmsd_e=rmsd_e, r_true=r_true, wE=wE,
                status='ok' if r is not None else 'refmac_failed')
@@ -488,8 +594,12 @@ def collate(outdir):
     (outdir / 'summary.json').write_text(json.dumps(summary, indent=2))
 
     def _swap_label(swaps):
-        parts = [f'{s["move_type"]} {s["chain_s"]}→{s["chain_t"]} '
-                 f'{s["rk"][0]}{s["resname"]}' for s in swaps[:4]]
+        if swaps and 'altloc_s' in swaps[0]:
+            parts = [f'{s["move_type"]} {s["altloc_s"]}→{s["altloc_t"]} '
+                     f'{s["rk"][0]}{s["resname"]}' for s in swaps[:4]]
+        else:
+            parts = [f'{s["move_type"]} {s["chain_s"]}→{s["chain_t"]} '
+                     f'{s["rk"][0]}{s["resname"]}' for s in swaps[:4]]
         suffix = f' +{len(swaps)-4}more' if len(swaps) > 4 else ''
         return '  '.join(parts) + suffix
 
@@ -592,7 +702,8 @@ def find_compatible_combos(by_wE, top_n=20, max_gap=1):
 
 def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
            ncyc, weight, partition, account, qos,
-           spr=1.0, n_trials=1000, seed=42):
+           spr=1.0, n_trials=1000, seed=42, exhaust=False,
+           no_molprobify=False):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -602,16 +713,21 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
     print(f'  {len(base_atoms)} atoms, '
           f'{len(set(a["chain"] for a in base_atoms))} chains')
 
-    print(f'Enumerating trials (move types: {move_types}, spr={spr}, {n_trials} trials)...')
-    trials = enumerate_trials(base_atoms, move_types, spr=spr,
-                              n_trials=n_trials, seed=seed)
+    if exhaust:
+        print(f'Enumerating trials (move types: {move_types}, exhaustive single-swap)...')
+        trials = enumerate_trials_exhaust(base_atoms, move_types)
+    else:
+        print(f'Enumerating trials (move types: {move_types}, spr={spr}, {n_trials} trials)...')
+        trials = enumerate_trials(base_atoms, move_types, spr=spr,
+                                  n_trials=n_trials, seed=seed)
     print(f'  {len(trials)} trials')
     (outdir / 'trials.json').write_text(json.dumps(trials, indent=2))
 
     cfg = {'base_pdb': str(Path(base_pdb).resolve()),
            'fobs_mtz': str(Path(fobs_mtz).resolve()),
            'truth_mtz': str(Path(truth_mtz).resolve()) if truth_mtz else None,
-           'ncyc': ncyc, 'weight': weight, 'spr': spr}
+           'ncyc': ncyc, 'weight': weight, 'spr': spr, 'exhaust': exhaust,
+           'no_molprobify': no_molprobify}
     (outdir / 'config.json').write_text(json.dumps(cfg, indent=2))
 
     script     = Path(__file__).resolve()
@@ -619,23 +735,26 @@ def submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
     n_batches  = (len(trials) + MAX_ARRAY - 1) // MAX_ARRAY
 
     for b in range(n_batches):
-        start = b * MAX_ARRAY
-        end   = min(start + MAX_ARRAY - 1, len(trials) - 1)
+        start      = b * MAX_ARRAY
+        end        = min(start + MAX_ARRAY - 1, len(trials) - 1)
+        batch_size = end - start + 1
         sh    = outdir / f'_batch{b}.sh'
         log   = outdir_abs / f'slurm_b{b}_%a.out'
         lines = ['#!/bin/bash',
                  f'#SBATCH --job-name=swapscan',
                  f'#SBATCH --partition={partition}',
                  f'#SBATCH --ntasks=1',
-                 f'#SBATCH --array={start}-{end}',
+                 f'#SBATCH --array=0-{batch_size - 1}',
                  f'#SBATCH --output={log}',
                  '#SBATCH --export=ALL']
         if account:
             lines.append(f'#SBATCH --account={account}')
         if qos:
             lines.append(f'#SBATCH --qos={qos}')
-        lines += [f'cd {SCRIPT_DIR}',
-                  f'ccp4-python {script} --task $SLURM_ARRAY_TASK_ID --outdir {outdir_abs}']
+        no_mp_flag = ' --no-molprobify' if no_molprobify else ''
+        lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
+                  f'cd {SCRIPT_DIR}',
+                  f'ccp4-python {script} --task $(( {start} + $SLURM_ARRAY_TASK_ID )) --outdir {outdir_abs}{no_mp_flag}']
         sh.write_text('\n'.join(lines) + '\n')
         r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
         print(f'  Batch {b} (trials {start}–{end}): {r.stdout.strip() or r.stderr.strip()}')
@@ -682,7 +801,8 @@ def rescore_submit(outdir, partition, account, qos):
             lines.append(f'#SBATCH --account={account}')
         if qos:
             lines.append(f'#SBATCH --qos={qos}')
-        lines += [f'cd {SCRIPT_DIR}',
+        lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
+                  f'cd {SCRIPT_DIR}',
                   f'ccp4-python {script} --rescore-task $SLURM_ARRAY_TASK_ID --outdir {outdir}']
         sh.write_text('\n'.join(lines) + '\n')
         r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
@@ -794,7 +914,8 @@ def targeted_submit(outdir, partition, account, qos):
         lines.append(f'#SBATCH --account={account}')
     if qos:
         lines.append(f'#SBATCH --qos={qos}')
-    lines += [f'cd {SCRIPT_DIR}',
+    lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
+              f'cd {SCRIPT_DIR}',
               f'ccp4-python {script} --task $SLURM_ARRAY_TASK_ID --outdir {outdir}']
     sh.write_text('\n'.join(lines) + '\n')
     r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
@@ -815,6 +936,109 @@ def submit_sweep(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
         submit(subdir, base_pdb, fobs_mtz, truth_mtz, move_types,
                ncyc, weight, partition, account, qos,
                spr=spr, n_trials=n_trials, seed=seed)
+
+
+# ── Geometry-targeted submission ──────────────────────────────────────────────
+
+def get_geometry_outliers(pdb_path, include_allowed=False):
+    """Run phenix.ramalyze + rotalyze; return set of seqnums with poor geometry.
+
+    By default only OUTLIER evaluations are included.  Pass include_allowed=True
+    to also include Ramachandran Allowed (borderline) residues.
+    """
+    bad = set()
+    for tool in ('phenix.ramalyze', 'phenix.rotalyze'):
+        try:
+            r = subprocess.run([tool, str(pdb_path)],
+                               capture_output=True, text=True, timeout=300)
+            for line in r.stdout.splitlines():
+                if ':' not in line:
+                    continue
+                parts = line.split(':')
+                head  = parts[0].split()
+                if len(head) < 2:
+                    continue
+                try:
+                    seqnum = int(head[1])
+                except ValueError:
+                    continue
+                evaluation = parts[-2].strip()
+                if 'OUTLIER' in evaluation:
+                    bad.add(seqnum)
+                elif include_allowed and 'Allowed' in evaluation:
+                    bad.add(seqnum)
+        except Exception as e:
+            print(f'  {tool} error: {e}')
+    return bad
+
+
+def geo_submit(outdir, base_pdb, fobs_mtz, truth_mtz, move_types,
+               ncyc, weight, partition, account, qos,
+               include_allowed=False):
+    """Submit swapscan restricted to geometry-outlier residues (ramalyze+rotalyze)."""
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print('Parsing base PDB...')
+    base_atoms, _ = parse_atoms(base_pdb)
+    print(f'  {len(base_atoms)} atoms')
+
+    print('Running phenix.ramalyze + rotalyze...')
+    bad_seqnums = get_geometry_outliers(base_pdb, include_allowed=include_allowed)
+    if not bad_seqnums:
+        print('No geometry outliers found — nothing to scan.')
+        return
+    print(f'  {len(bad_seqnums)} outlier residues: {sorted(bad_seqnums)}')
+
+    catalog  = _build_swap_catalog(base_atoms, move_types)
+    filtered = []
+    for sw in catalog:
+        rk_p = sw.get('rk_partner')
+        partner_sn = rk_p[0] if rk_p is not None else None
+        if sw['rk'][0] in bad_seqnums or (partner_sn is not None and partner_sn in bad_seqnums):
+            filtered.append(sw)
+    print(f'  {len(filtered)} targeted swaps (from {len(catalog)} total)')
+
+    trials = [{'trial_id': 0, 'swaps': []}]
+    for i, sw in enumerate(filtered, 1):
+        trials.append({'trial_id': i, 'swaps': [sw]})
+    print(f'  {len(trials)} trials (including no-swap baseline)')
+
+    (outdir / 'trials.json').write_text(json.dumps(trials, indent=2))
+    cfg = {'base_pdb': str(Path(base_pdb).resolve()),
+           'fobs_mtz': str(Path(fobs_mtz).resolve()),
+           'truth_mtz': str(Path(truth_mtz).resolve()) if truth_mtz else None,
+           'ncyc': ncyc, 'weight': weight, 'geo_submit': True,
+           'no_molprobify': False}
+    (outdir / 'config.json').write_text(json.dumps(cfg, indent=2))
+
+    script     = Path(__file__).resolve()
+    outdir_abs = outdir.resolve()
+    n_batches  = (len(trials) + MAX_ARRAY - 1) // MAX_ARRAY
+
+    for b in range(n_batches):
+        start      = b * MAX_ARRAY
+        end        = min(start + MAX_ARRAY - 1, len(trials) - 1)
+        batch_size = end - start + 1
+        sh    = outdir / f'_batch{b}.sh'
+        log   = outdir_abs / f'slurm_b{b}_%a.out'
+        lines = ['#!/bin/bash',
+                 '#SBATCH --job-name=geo_scan',
+                 f'#SBATCH --partition={partition}',
+                 '#SBATCH --ntasks=1',
+                 f'#SBATCH --array=0-{batch_size - 1}',
+                 f'#SBATCH --output={log}',
+                 '#SBATCH --export=ALL']
+        if account:
+            lines.append(f'#SBATCH --account={account}')
+        if qos:
+            lines.append(f'#SBATCH --qos={qos}')
+        lines += ['mkdir -p "${CCP4_SCR:-/tmp}"',
+                  f'cd {SCRIPT_DIR}',
+                  f'ccp4-python {script} --task $(( {start} + $SLURM_ARRAY_TASK_ID )) --outdir {outdir_abs}']
+        sh.write_text('\n'.join(lines) + '\n')
+        r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
+        print(f'  Batch {b} (trials {start}–{end}): {r.stdout.strip() or r.stderr.strip()}')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -840,6 +1064,10 @@ def main():
     ap.add_argument('--n-trials',    type=int, default=1000,
                     help='Number of random trials per spr value (default 1000)')
     ap.add_argument('--seed',        type=int, default=42)
+    ap.add_argument('--exhaust',        action='store_true',
+                    help='Enumerate every unique single swap (one trial per catalog entry)')
+    ap.add_argument('--no-molprobify', action='store_true',
+                    help='Skip molprobify (wE=None); ~10x faster. Use --rescore-submit afterwards on top candidates.')
     ap.add_argument('--submit',        action='store_true')
     ap.add_argument('--task',          type=int, default=None)
     ap.add_argument('--collate',       action='store_true')
@@ -849,6 +1077,10 @@ def main():
                     help='Submit SLURM array to rescore all trials in --outdir')
     ap.add_argument('--targeted-submit', action='store_true',
                     help='Submit hand-chosen wE-optimised swap combinations')
+    ap.add_argument('--geo-submit', action='store_true',
+                    help='Submit swapscan restricted to residues with ramalyze/rotalyze OUTLIER geometry')
+    ap.add_argument('--include-allowed', action='store_true',
+                    help='With --geo-submit: also include Ramachandran Allowed residues')
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -880,6 +1112,23 @@ def main():
         targeted_submit(outdir, args.partition, args.account, args.qos)
         return
 
+    if args.geo_submit:
+        if not args.pdb or not args.fobs:
+            ap.error('--geo-submit requires --pdb and --fobs')
+        move_types = [m.strip() for m in args.move_types.split(',')]
+        geo_submit(outdir,
+                   base_pdb        = Path(args.pdb).resolve(),
+                   fobs_mtz        = Path(args.fobs).resolve(),
+                   truth_mtz       = Path(args.truth).resolve() if args.truth else None,
+                   move_types      = move_types,
+                   ncyc            = args.ncyc,
+                   weight          = args.weight,
+                   partition       = args.partition,
+                   account         = args.account,
+                   qos             = args.qos,
+                   include_allowed = args.include_allowed)
+        return
+
     if args.task is not None:
         cfg    = json.loads((outdir / 'config.json').read_text())
         trials = json.loads((outdir / 'trials.json').read_text())
@@ -890,7 +1139,8 @@ def main():
 
         res = run_trial(trial, base_atoms, header_lines, idx,
                         cfg['fobs_mtz'], cfg.get('truth_mtz'),
-                        outdir, ncyc=cfg['ncyc'], weight=cfg['weight'])
+                        outdir, ncyc=cfg['ncyc'], weight=cfg['weight'],
+                        no_molprobify=cfg.get('no_molprobify', False))
         n_sw = len(trial.get('swaps', []))
         print(f'trial {args.task}: {n_sw} swaps  '
               f'R={res.get("r")}  Rf={res.get("rf")}  rmsd_e={res.get("rmsd_e")}  wE={res.get("wE")}')
@@ -900,20 +1150,23 @@ def main():
         if not args.pdb or not args.fobs:
             ap.error('--submit requires --pdb and --fobs')
         move_types = [m.strip() for m in args.move_types.split(',')]
-        kw = dict(base_pdb   = Path(args.pdb).resolve(),
-                  fobs_mtz   = Path(args.fobs).resolve(),
-                  truth_mtz  = Path(args.truth).resolve() if args.truth else None,
-                  move_types = move_types,
-                  ncyc       = args.ncyc,
-                  weight     = args.weight,
-                  partition  = args.partition,
-                  account    = args.account,
-                  qos        = args.qos,
-                  n_trials   = args.n_trials,
-                  seed       = args.seed)
+        kw = dict(base_pdb       = Path(args.pdb).resolve(),
+                  fobs_mtz       = Path(args.fobs).resolve(),
+                  truth_mtz      = Path(args.truth).resolve() if args.truth else None,
+                  move_types     = move_types,
+                  ncyc           = args.ncyc,
+                  weight         = args.weight,
+                  partition      = args.partition,
+                  account        = args.account,
+                  qos            = args.qos,
+                  n_trials       = args.n_trials,
+                  seed           = args.seed,
+                  no_molprobify  = args.no_molprobify)
         if args.sweep_spr:
             spr_values = [float(v) for v in args.sweep_spr.split(',')]
             submit_sweep(outdir, spr_values=spr_values, **kw)
+        elif args.exhaust:
+            submit(outdir, exhaust=True, **kw)
         else:
             submit(outdir, spr=args.spr, **kw)
         return
