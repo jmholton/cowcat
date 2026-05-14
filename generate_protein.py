@@ -974,7 +974,7 @@ def _reduce_conformers(by_name, sc_names, max_confs=3, rng=None):
     return new_by_name, labels
 
 
-def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, label_scramble_prob=1.0):
+def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.0):
     """Build a mixed single/multi-conformer model → starthere.pdb.
 
     Reads single-chain altloc multiconf format from truth_full.pdb:
@@ -1113,11 +1113,13 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, label_scramble_prob=1.0
             for name in all_names:
                 _add_collapsed_atom(res_out, by_name[name])
         else:
-            by_name, present = _reduce_conformers(by_name, all_names, max_confs=n_conf)
+            by_name, present = _reduce_conformers(by_name, all_names, max_confs=min(n_conf, 3))
 
             shuffled = list(present)
-            if label_scramble_prob >= 1.0 or rng.random() < label_scramble_prob:
-                rng.shuffle(shuffled)
+            n_swaps = int(rng.poisson(altloc_swaps_per_res))
+            for _ in range(n_swaps):
+                i, j = rng.choice(len(shuffled), size=2, replace=False)
+                shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
             label_map = dict(zip(present, shuffled))
 
             for name in all_names:
@@ -1135,37 +1137,33 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, label_scramble_prob=1.0
         chain_out.add_residue(res_out)
     model_out.add_chain(chain_out)
 
-    # ── Waters → collapse N conformers to single chain S at occ=1/N ─────────
+    # ── Waters → keep all N conformer positions as altlocs in chain S ─────────
     # Chain S: refmac_occupancy_setup.com treats segid=="S" as waters unconditionally
-    # (conf="w" → incomplete occ group), giving clean free occupancy refinement.
-    # Starting at partial occupancy so refmac can refine toward the true value.
+    # (conf="w" → incomplete occ group per altloc), so each altloc gets independent
+    # free occupancy refinement.  Starting at occ=1/N for each altloc.
     if water_residues:
         water_occ = 1.0 / n_conf
         water_chain_out = gemmi.Chain('S')
         water_seqids = sorted(water_residues.keys(),
                               key=lambda k: water_residues[k][0].seqid.num)
         for key in water_seqids:
-            residues = water_residues[key]
-            all_atoms = [a for res in residues for a in res]
-            by_name_w = {}
-            for a in all_atoms:
-                by_name_w.setdefault(a.name, []).append(a)
+            residues = water_residues[key]   # list of synthetic residues, one per altloc
             res0    = residues[0]
             res_out = gemmi.Residue()
             res_out.name        = res0.name
             res_out.seqid       = res0.seqid
             res_out.entity_type = res0.entity_type
-            for atoms in by_name_w.values():
-                pos = np.array([[a.pos.x, a.pos.y, a.pos.z] for a in atoms])
-                cx, cy, cz = pos.mean(axis=0)
-                a_out         = gemmi.Atom()
-                a_out.name    = atoms[0].name
-                a_out.element = atoms[0].element
-                a_out.pos     = gemmi.Position(cx, cy, cz)
-                a_out.b_iso   = float(np.mean([a.b_iso for a in atoms]))
-                a_out.occ     = water_occ
-                a_out.altloc  = '\x00'
-                res_out.add_atom(a_out)
+            for ci, res in enumerate(residues):
+                lbl = CONF_LABELS[ci]
+                for atom in res:
+                    a_out         = gemmi.Atom()
+                    a_out.name    = atom.name
+                    a_out.element = atom.element
+                    a_out.pos     = atom.pos
+                    a_out.b_iso   = atom.b_iso
+                    a_out.occ     = water_occ
+                    a_out.altloc  = lbl
+                    res_out.add_atom(a_out)
             water_chain_out.add_residue(res_out)
         model_out.add_chain(water_chain_out)
 
@@ -1278,7 +1276,7 @@ def step9_probe(tmpdir):
     return _parse_unused_links(probe_log)
 
 
-def step9_refmac(tmpdir, n_rounds=3, ncyc_per_round=20):
+def step9_refmac(tmpdir, n_rounds=3, ncyc_per_round=20, weight_matrix=None):
     """Run refmac in n_rounds sequential rounds of ncyc_per_round cycles each.
 
     Round 1: starthere.pdb → refmacout.pdb / refmacout.mtz
@@ -1316,6 +1314,7 @@ def step9_refmac(tmpdir, n_rounds=3, ncyc_per_round=20):
             _build_occ_bytes(xyzin) +
             b'MAKE HYDR A NEWLIGAND NOEXIT\n' +
             f'NCYC {ncyc_per_round}\n'.encode() +
+            (f'WEIGHT MATRIX {weight_matrix}\n'.encode() if weight_matrix is not None else b'') +
             b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
             b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT '
             b'DELFWT=DELFWT PHDELWT=PHDELWT\n'
@@ -1438,7 +1437,8 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                     flood_avoid_fullocc=True, flood_occ=None, vary_flood=False,
                     shift_scale=0.5, n_altlocs=2, missing_fraction=0.05,
                     never_collected_fraction=0.05, extra_b=0.0,
-                    label_scramble_prob=1.0, seed=None, debug=False):
+                    altloc_swaps_per_res=1.0, weight_matrix=None,
+                    seed=None, debug=False):
     """Run the full pipeline for one sample. Returns (sample_idx, ok, info).
 
     If debug=True, the entire tmpdir is copied to sample_dir/debug/ before
@@ -1550,12 +1550,12 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 
         # 9: Build mixed single/multi-conformer model → starthere.pdb
         step8_build_mixed_model(tmpdir / 'truth_full.pdb', tmpdir, rng,
-                                 label_scramble_prob=label_scramble_prob)
+                                 altloc_swaps_per_res=altloc_swaps_per_res)
         t = _t('build_mixed_model', t)
 
         # 10: Full NCYC 20 refinement
-        refmac_log = step9_refmac(tmpdir)
-        t = _t('refmac_3x20', t)
+        refmac_log = step9_refmac(tmpdir, n_rounds=2, weight_matrix=weight_matrix)
+        t = _t('refmac_2x20', t)
 
         # Parse final Rwork from refmac log
         # "Overall R factor = 0.0201" appears once per cycle; last is final cycle.
@@ -1603,7 +1603,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             never_collected_fraction=never_collected_fraction,
             n_reflections_never_collected=n_never,
             extra_b=extra_b,
-            label_scramble_prob=label_scramble_prob,
+            altloc_swaps_per_res=altloc_swaps_per_res,
             vary_flood=vary_flood,
             n_flood_actual=n_flood,
             flood_occ_actual=flood_occ,
@@ -1643,7 +1643,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        flood_avoid_fullocc=True, shift_scale=0.5, n_altlocs=2,
                        missing_fraction=0.05, never_collected_fraction=0.05,
-                       extra_b=0.0, label_scramble_prob=1.0, vary_flood=False,
+                       extra_b=0.0, altloc_swaps_per_res=1.0, vary_flood=False,
                        max_array=300, seed=None, flood_occ=None, cell=None,
                        dmin=2.0, spacegroup='P 1', partition='debug',
                        account=None, qos=None, time='00:10:00'):
@@ -1659,7 +1659,7 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     seed_line      = f'    --seed {seed} \\\n'                     if seed                is not None else ''
     flood_occ_line = f'    --flood-occ {flood_occ} \\\n'           if flood_occ           is not None else ''
     extra_b_line   = f'    --extra-b {extra_b} \\\n'               if extra_b                         else ''
-    scramble_line  = f'    --label-scramble-prob {label_scramble_prob} \\\n' if label_scramble_prob < 1.0 else ''
+    scramble_line  = f'    --altloc-swaps-per-res {altloc_swaps_per_res} \\\n' if altloc_swaps_per_res != 1.0 else ''
     varflood_line  = f'    --vary-flood \\\n'                       if vary_flood                      else ''
     sg_line        = f'    --spacegroup "{spacegroup}" \\\n'        if spacegroup != 'P 1'             else ''
     _cell = cell if cell is not None else (40.0, 40.0, 40.0)
@@ -1757,6 +1757,8 @@ def main():
                         help='Fraction of reflections collected but rejected (F→NaN, default 0.05)')
     parser.add_argument('--extra-b',  type=float, default=0.0,
                         help='Extra B factor added to all truth_full.pdb atoms before sfcalc')
+    parser.add_argument('--weight-matrix', type=float, default=None,
+                        help='refmac WEIGHT MATRIX value (default: auto)')
     parser.add_argument('--never-collected-fraction', type=float, default=0.05,
                         help='Fraction of reflections never measured (rows deleted, default 0.05)')
     parser.add_argument('--cell', nargs=3, type=float, default=[40.0, 40.0, 40.0],
@@ -1764,9 +1766,10 @@ def main():
                         help='P1 unit cell dimensions in Å (default: 40 40 40)')
     parser.add_argument('--dmin', type=float, default=2.0,
                         help='Resolution cutoff in Å (default: 2.0)')
-    parser.add_argument('--label-scramble-prob', type=float, default=1.0,
-                        help='Per-residue probability of scrambling altloc labels '
-                             '(0=never, 1=always; default 1.0)')
+    parser.add_argument('--altloc-swaps-per-res', type=float, default=1.0,
+                        help='Expected number of random pairwise altloc swaps per residue '
+                             '(Poisson); 0=no scrambling, 1=~1 swap/res, >1=more scrambled '
+                             '(default: 1.0)')
     parser.add_argument('--debug',      action='store_true',
                         help='Copy entire tmpdir to sample_dir/debug/ for inspection')
     parser.add_argument('--seed',       type=int, default=None,
@@ -1804,7 +1807,8 @@ def main():
             missing_fraction=args.missing_fraction,
             never_collected_fraction=args.never_collected_fraction,
             extra_b=args.extra_b,
-            label_scramble_prob=args.label_scramble_prob,
+            altloc_swaps_per_res=args.altloc_swaps_per_res,
+            weight_matrix=args.weight_matrix,
             seed=args.seed,
             debug=args.debug,
         )
@@ -1818,7 +1822,8 @@ def main():
             args.nresidues, args.nwaters, args.n_flood, args.flood_avoid_fullocc,
             args.shift_scale, args.n_altlocs, args.missing_fraction,
             args.never_collected_fraction,
-            extra_b=args.extra_b, label_scramble_prob=args.label_scramble_prob,
+            extra_b=args.extra_b, altloc_swaps_per_res=args.altloc_swaps_per_res,
+            weight_matrix=args.weight_matrix,
             vary_flood=args.vary_flood, max_array=args.max_array,
             seed=args.seed, flood_occ=args.flood_occ,
             cell=CELL, dmin=DMIN, spacegroup=SPACEGROUP,
@@ -1840,7 +1845,7 @@ def main():
                                            args.n_altlocs, args.missing_fraction,
                                            args.never_collected_fraction,
                                            extra_b=args.extra_b,
-                                           label_scramble_prob=args.label_scramble_prob,
+                                           altloc_swaps_per_res=args.altloc_swaps_per_res,
                                            vary_flood=args.vary_flood,
                                            seed=args.seed, debug=args.debug)
             done += 1
@@ -1855,7 +1860,7 @@ def main():
                             args.flood_avoid_fullocc, args.flood_occ,
                             args.shift_scale, args.n_altlocs, args.missing_fraction,
                             args.never_collected_fraction, args.extra_b,
-                            args.label_scramble_prob, args.vary_flood,
+                            args.altloc_swaps_per_res, args.vary_flood,
                             args.seed, args.debug): sid
                 for sid in sample_ids
             }
