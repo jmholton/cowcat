@@ -1846,18 +1846,21 @@ def main():
     sample_ids = list(range(args.nsamples))
     done = ok_count = err_count = 0
 
+    _kw = dict(
+        n_residues=args.nresidues, n_waters=args.nwaters,
+        n_flood=args.n_flood, flood_avoid_fullocc=args.flood_avoid_fullocc,
+        flood_occ=args.flood_occ, vary_flood=args.vary_flood,
+        shift_scale=args.shift_scale, n_altlocs=args.n_altlocs,
+        missing_fraction=args.missing_fraction,
+        never_collected_fraction=args.never_collected_fraction,
+        extra_b=args.extra_b, altloc_swaps_per_res=args.altloc_swaps_per_res,
+        weight_matrix=args.weight_matrix,
+        seed=args.seed, debug=args.debug,
+    )
+
     if args.workers <= 1:
         for sid in sample_ids:
-            idx, ok, msg = generate_sample(sid, outdir,
-                                           args.nresidues, args.nwaters,
-                                           args.n_flood, args.flood_avoid_fullocc,
-                                           args.flood_occ, args.shift_scale,
-                                           args.n_altlocs, args.missing_fraction,
-                                           args.never_collected_fraction,
-                                           extra_b=args.extra_b,
-                                           altloc_swaps_per_res=args.altloc_swaps_per_res,
-                                           vary_flood=args.vary_flood,
-                                           seed=args.seed, debug=args.debug)
+            idx, ok, msg = generate_sample(sid, outdir, **_kw)
             done += 1
             status = 'OK' if ok else 'ERR'
             ok_count += ok; err_count += (not ok)
@@ -1865,13 +1868,7 @@ def main():
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = {
-                pool.submit(generate_sample, sid, str(outdir),
-                            args.nresidues, args.nwaters, args.n_flood,
-                            args.flood_avoid_fullocc, args.flood_occ,
-                            args.shift_scale, args.n_altlocs, args.missing_fraction,
-                            args.never_collected_fraction, args.extra_b,
-                            args.altloc_swaps_per_res, args.vary_flood,
-                            args.seed, args.debug): sid
+                pool.submit(generate_sample, sid, str(outdir), **_kw): sid
                 for sid in sample_ids
             }
             for fut in as_completed(futures):
