@@ -124,9 +124,10 @@ def main():
 
     done = errors = 0
     s_buf = np.zeros(n, dtype=np.float32)
+    cached = {0: (x0, y0, s0)}  # reuse sample 0 already computed for shape
     for i, d in enumerate(sample_dirs):
         try:
-            x, y, s = process_sample(d)
+            x, y, s = cached.pop(i) if i in cached else process_sample(d)
             fx.write(x.tobytes()); fy.write(y.tobytes()); s_buf[i] = s
             done += 1
         except Exception as e:
