@@ -134,6 +134,7 @@ def main():
                 print(f'  ERROR {sample_dirs[i].name}: {e}')
             if (done + errors) % 100 == 0 or (done + errors) == n:
                 print(f'  {done + errors}/{n}', flush=True)
+                X.flush(); Y.flush(); S.flush()  # release dirty pages to disk
 
     del X, Y, S
     print(f'Done. ok={done}  errors={errors}')
