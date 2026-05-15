@@ -101,7 +101,9 @@ class UNet3D(nn.Module):
             e1], dim=1))
 
         out = self.head(d1)
-        return out[:, :1], out[:, 1:], log_scale  # mean_map, log_var_map, log_scale
+        log_var = torch.clamp(out[:, 1:], min=-10.0, max=10.0)
+        log_scale = torch.clamp(log_scale, min=-10.0, max=10.0)
+        return out[:, :1], log_var, log_scale  # mean_map, log_var_map, log_scale
 
 
 class TwoStageUNet3D(nn.Module):

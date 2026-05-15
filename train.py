@@ -35,8 +35,11 @@ from model import UNet3D, count_parameters
 
 def heteroscedastic_nll(mean, log_var, target):
     """Heteroscedastic Gaussian NLL: ½·exp(-s)·(μ-y)² + ½·s  where s=log_var.
-    Jointly optimises prediction accuracy and calibrated per-voxel uncertainty."""
-    return 0.5 * (torch.exp(-log_var) * (mean - target) ** 2 + log_var).mean()
+    Jointly optimises prediction accuracy and calibrated per-voxel uncertainty.
+    log_var is clamped to [-10, 10] to prevent exp(-log_var) overflow when the
+    model is overconfident on out-of-distribution samples."""
+    s = torch.clamp(log_var, min=-10.0, max=10.0)
+    return 0.5 * (torch.exp(-s) * (mean - target) ** 2 + s).mean()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -60,6 +63,7 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0):
             if training:
                 optimizer.zero_grad()
                 loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             total_loss += loss.item() * x.size(0)
