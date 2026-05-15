@@ -1113,7 +1113,7 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
             for name in all_names:
                 _add_collapsed_atom(res_out, by_name[name])
         else:
-            by_name, present = _reduce_conformers(by_name, all_names, max_confs=min(n_conf, 3))
+            by_name, present = _reduce_conformers(by_name, all_names, max_confs=n_conf)
 
             shuffled = list(present)
             n_swaps = int(rng.poisson(altloc_swaps_per_res))
