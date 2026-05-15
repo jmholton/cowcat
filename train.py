@@ -35,7 +35,10 @@ from model import UNet3D, count_parameters
 
 def heteroscedastic_nll(mean, log_var, target):
     """Heteroscedastic Gaussian NLL: ½·exp(-s)·(μ-y)² + ½·s  where s=log_var.
-    Jointly optimises prediction accuracy and calibrated per-voxel uncertainty."""
+    Jointly optimises prediction accuracy and calibrated per-voxel uncertainty.
+    log_var is clamped to [-3, 3] to prevent memorisation (exp(3)≈20 still
+    allows reasonable uncertainty scaling but blocks extreme collapse)."""
+    log_var = torch.clamp(log_var, -3.0, 3.0)
     return 0.5 * (torch.exp(-log_var) * (mean - target) ** 2 + log_var).mean()
 
 
@@ -43,14 +46,20 @@ def heteroscedastic_nll(mean, log_var, target):
 # Training / validation loops
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0):
-    """Single train or eval pass. Pass optimizer=None for eval."""
+def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_steps=1):
+    """Single train or eval pass. Pass optimizer=None for eval.
+
+    accum_steps: accumulate gradients over this many batches before stepping,
+    simulating a larger effective batch size without extra GPU memory.
+    """
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
 
     with torch.set_grad_enabled(training):
-        for x, y, s in loader:
+        if training:
+            optimizer.zero_grad()
+        for step, (x, y, s) in enumerate(loader):
             x, y, s = x.to(device), y.to(device), s.to(device)
             pred_map, pred_log_var, pred_log_scale = model(x)
             loss_map   = heteroscedastic_nll(pred_map, pred_log_var, y)
@@ -58,9 +67,10 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0):
             loss = loss_map + scale_weight * loss_scale
 
             if training:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                (loss / accum_steps).backward()
+                if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+                    optimizer.step()
+                    optimizer.zero_grad()
 
             total_loss += loss.item() * x.size(0)
 
@@ -97,6 +107,13 @@ def main():
                              '(optimizer/scheduler reset — for curriculum transfer)')
     parser.add_argument('--scale-weight', type=float, default=1.0,
                         help='Weight on scale-prediction MSE loss (default: 1.0)')
+    parser.add_argument('--drop-fc', action='store_true',
+                        help='Train with 3 input channels (drop Fc/ch2). When used '
+                             'with --pretrain, surgically removes the Fc slice from '
+                             'enc1.net.0.weight so the rest of the network transfers.')
+    parser.add_argument('--accum-steps', type=int, default=1,
+                        help='Gradient accumulation steps (default: 1). Effective '
+                             'batch size = batch-size * accum-steps.')
     args = parser.parse_args()
 
     # ── Log file (train_<suffix>.log beside the script) ───────────────────────
@@ -120,7 +137,8 @@ def main():
     print(f'Device: {device}  GPUs: {n_gpus}')
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_ds, val_ds = make_splits_multi(args.data, val_fraction=args.val_frac)
+    train_ds, val_ds = make_splits_multi(args.data, val_fraction=args.val_frac,
+                                         drop_fc=args.drop_fc)
     print(f'Train: {len(train_ds)}  Val: {len(val_ds)}')
 
     # pin_memory causes deadlock with DataParallel + forked workers
@@ -133,13 +151,16 @@ def main():
                               pin_memory=pin)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = UNet3D(in_channels=4, out_channels=1,
+    in_channels = 3 if args.drop_fc else 4
+    model = UNet3D(in_channels=in_channels, out_channels=1,
                    base_features=args.base_features).to(device)
     raw_model = model
     if n_gpus > 1:
         model = nn.DataParallel(model)
         args.batch_size *= n_gpus
-    print(f'Parameters: {count_parameters(raw_model):,}  batch_size: {args.batch_size}')
+    print(f'Parameters: {count_parameters(raw_model):,}  batch_size: {args.batch_size}  '
+          f'accum_steps: {args.accum_steps}  eff_batch: {args.batch_size * args.accum_steps}  '
+          f'in_channels: {in_channels}')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-4)
@@ -164,9 +185,15 @@ def main():
     # ── Pretrain (weights only, optimizer/scheduler reset) ────────────────────
     elif args.pretrain and os.path.exists(args.pretrain):
         ckpt = torch.load(args.pretrain, map_location=device)
-        raw_model.load_state_dict(ckpt['model'])
+        sd   = ckpt['model']
+        if args.drop_fc:
+            # Surgically drop the Fc input slice (ch2) from the first conv weight.
+            # Shape goes from (f, 4, k, k, k) → (f, 3, k, k, k); all other layers unchanged.
+            key = 'enc1.net.0.weight'
+            sd[key] = sd[key][:, [0, 1, 3], ...]
+        raw_model.load_state_dict(sd)
         print(f'Loaded pretrained weights (best_val={ckpt.get("best_val", float("inf")):.5f}), '
-              f'optimizer reset')
+              f'optimizer reset{" (Fc channel dropped from enc1)" if args.drop_fc else ""}')
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -175,7 +202,7 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        train_loss = run_epoch(model, train_loader, device, optimizer,      args.scale_weight)
+        train_loss = run_epoch(model, train_loader, device, optimizer,      args.scale_weight, args.accum_steps)
         val_loss   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
         scheduler.step()
 
