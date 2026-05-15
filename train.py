@@ -108,10 +108,6 @@ def main():
                              '(optimizer/scheduler reset — for curriculum transfer)')
     parser.add_argument('--scale-weight', type=float, default=1.0,
                         help='Weight on scale-prediction MSE loss (default: 1.0)')
-    parser.add_argument('--drop-fc', action='store_true',
-                        help='Train with 3 input channels (drop Fc/ch2). When used '
-                             'with --pretrain, surgically removes the Fc slice from '
-                             'enc1.net.0.weight so the rest of the network transfers.')
     parser.add_argument('--accum-steps', type=int, default=1,
                         help='Gradient accumulation steps (default: 1). Effective '
                              'batch size = batch-size * accum-steps.')
@@ -138,8 +134,7 @@ def main():
     print(f'Device: {device}  GPUs: {n_gpus}')
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_ds, val_ds = make_splits_multi(args.data, val_fraction=args.val_frac,
-                                         drop_fc=args.drop_fc)
+    train_ds, val_ds = make_splits_multi(args.data, val_fraction=args.val_frac)
     print(f'Train: {len(train_ds)}  Val: {len(val_ds)}')
 
     # pin_memory causes deadlock with DataParallel + forked workers
@@ -152,7 +147,7 @@ def main():
                               pin_memory=pin)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    in_channels = 3 if args.drop_fc else 4
+    in_channels = 4
     model = UNet3D(in_channels=in_channels, out_channels=1,
                    base_features=args.base_features).to(device)
     raw_model = model
@@ -187,14 +182,9 @@ def main():
     elif args.pretrain and os.path.exists(args.pretrain):
         ckpt = torch.load(args.pretrain, map_location=device)
         sd   = ckpt['model']
-        if args.drop_fc:
-            # Surgically drop the Fc input slice (ch2) from the first conv weight.
-            # Shape goes from (f, 4, k, k, k) → (f, 3, k, k, k); all other layers unchanged.
-            key = 'enc1.net.0.weight'
-            sd[key] = sd[key][:, [0, 1, 3], ...]
         raw_model.load_state_dict(sd)
         print(f'Loaded pretrained weights (best_val={ckpt.get("best_val", float("inf")):.5f}), '
-              f'optimizer reset{" (Fc channel dropped from enc1)" if args.drop_fc else ""}')
+              f'optimizer reset')
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
