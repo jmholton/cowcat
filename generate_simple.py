@@ -255,7 +255,8 @@ def submit(outdir, nsamples, seed, partition, account, qos):
             f'cd {SCRIPT_DIR}',
             f'ccp4-python {script} --task $(( {start} + $SLURM_ARRAY_TASK_ID ))'
             f' --outdir {outdir} --seed {seed}'
-            f' --n-atoms {N_ATOMS} --spacegroup "{SPACEGROUP}"',
+            f' --n-atoms {N_ATOMS} --spacegroup "{SPACEGROUP}"'
+            f' --cell {CELL[0]} {CELL[1]} {CELL[2]} --dmin {DMIN}',
         ]
         sh.write_text('\n'.join(lines) + '\n')
         r = subprocess.run(['sbatch', str(sh)], capture_output=True, text=True)
@@ -265,7 +266,7 @@ def submit(outdir, nsamples, seed, partition, account, qos):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    global N_ATOMS, SPACEGROUP
+    global N_ATOMS, SPACEGROUP, CELL, DMIN
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--nsamples',   type=int, default=100)
@@ -278,15 +279,24 @@ def main():
     ap.add_argument('--account',    default='pc_als831')
     ap.add_argument('--qos',        default='lr_normal')
     ap.add_argument('--n-atoms',    type=int, default=None,
-                    help=f'Number of O atoms (default: {N_ATOMS})')
+                    help='Number of O atoms (default: 20)')
     ap.add_argument('--spacegroup', default=None,
-                    help=f'Space group HM symbol (default: {SPACEGROUP})')
+                    help='Space group HM symbol (default: P 21 21 21)')
+    ap.add_argument('--cell',       nargs=3, type=float, default=None,
+                    metavar=('A', 'B', 'C'),
+                    help='Unit cell a b c in Å (default: 45.9 40.7 30.1)')
+    ap.add_argument('--dmin',       type=float, default=None,
+                    help='Resolution cutoff in Å (default: 0.965)')
     args = ap.parse_args()
 
     if args.n_atoms is not None:
         N_ATOMS = args.n_atoms
     if args.spacegroup is not None:
         SPACEGROUP = args.spacegroup
+    if args.cell is not None:
+        CELL = tuple(args.cell) + (90.0, 90.0, 90.0)
+    if args.dmin is not None:
+        DMIN = args.dmin
 
     if args.submit:
         submit(args.outdir, args.nsamples, args.seed,

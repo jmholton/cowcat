@@ -1347,6 +1347,14 @@ def step9_refmac(tmpdir, n_rounds=3, ncyc_per_round=20, weight_matrix=None):
     return full_log
 
 
+def _read_grid_shape(map_path):
+    """Read (NS, NR, NC) grid dimensions from CCP4 map header."""
+    import struct
+    with open(map_path, 'rb') as f:
+        nc, nr, ns = struct.unpack('3i', f.read(12))
+    return [int(ns), int(nr), int(nc)]
+
+
 def step10_convert_maps(tmpdir, outdir):
     """Compute CCP4 .map files.
 
@@ -1610,7 +1618,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             cell=list(CELL),
             spacegroup=SPACEGROUP,
             dmin=DMIN,
-            grid_shape=[round(CELL[i] * SAMPLE_RATE / DMIN) for i in range(3)],
+            grid_shape=list(_read_grid_shape(sample_dir / 'truth.map')),
             step_timings=timings,
         )
         (sample_dir / 'metadata.json').write_text(json.dumps(meta, indent=2))
