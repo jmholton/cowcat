@@ -29,7 +29,9 @@ import numpy as np
 import gemmi
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REFMAC5    = 'refmac5'
+import shutil as _shutil
+REFMAC5    = _shutil.which('refmac5') or '/programs/ccp4-8.0/bin/refmac5'
+del _shutil
 DMIN       = 0.965
 
 MAINCHAIN_ATOMS = frozenset({'N', 'CA', 'C', 'O', 'OXT', 'H', 'HA', 'HA2', 'HA3'})
@@ -949,6 +951,9 @@ def build_varconf_pdb(chain_names, conf_data, st_orig, out_pdb, workdir, max_k=N
     for slot_i, slot_cn in enumerate(slot_names):
         for reskey, ref_rd in ref_chain_data.items():
             if slot_i >= res_k[reskey]:
+                continue
+            if slot_i >= len(per_res_sel[reskey]):
+                # residue exists in fewer chains than desired k
                 continue
             src_cn = per_res_sel[reskey][slot_i]
             rd_this = conf_data[src_cn]

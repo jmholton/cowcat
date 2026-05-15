@@ -1054,7 +1054,7 @@ def main():
                     help='Comma-separated list of move types: sc,pep,o,ss')
     ap.add_argument('--ncyc',        type=int,   default=50)
     ap.add_argument('--weight',      type=float, default=0.5)
-    ap.add_argument('--partition',   default='lr6')
+    ap.add_argument('--partition',   default='refmac')
     ap.add_argument('--account',     default=None)
     ap.add_argument('--qos',         default=None)
     ap.add_argument('--spr',         type=float, default=1.0,
