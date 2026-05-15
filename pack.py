@@ -59,11 +59,8 @@ def process_sample(base):
     ch2 = _znorm(fc_raw)
 
     crossp_path = os.path.join(base, 'crossp.npy')
-    if os.path.exists(crossp_path):
-        _cp = np.load(crossp_path)
-        ch3 = _znorm(_cp if _cp.shape == ch0.shape else _cross_patterson(fofc_raw, fc_raw))
-    else:
-        ch3 = _znorm(_cross_patterson(fofc_raw, fc_raw))
+    ch3 = _znorm(np.load(crossp_path) if os.path.exists(crossp_path)
+                 else _cross_patterson(fofc_raw, fc_raw))
 
     truth_raw = _load_map(os.path.join(base, 'truth.map'))
     diff_raw  = truth_raw - fc_raw
