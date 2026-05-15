@@ -689,6 +689,9 @@ def generate_sample(sample_idx, outdir, seed=None,
             rwork, rfree, out_mtz = run_refmac(starthere_pdb, fobs_mtz, tmpdir, verbose=verbose)
             if out_mtz is None:
                 return sample_idx, False, 'refmac produced no output MTZ'
+            refmac_log = tmpdir / 'refmac.log'
+            if refmac_log.exists():
+                shutil.copy2(refmac_log, sample_dir / 'refmac.log')
 
             mtz_to_ccp4(truth_sf_mtz, 'FC',     'PHIC',    sample_dir / 'truth.map')
             mtz_to_ccp4(out_mtz,      'FWT',    'PHWT',    sample_dir / '2fofc.map')
