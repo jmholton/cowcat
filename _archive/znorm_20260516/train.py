@@ -38,7 +38,7 @@ def heteroscedastic_nll(mean, log_var, target):
     Jointly optimises prediction accuracy and calibrated per-voxel uncertainty.
     log_var is clamped to [-3, 3] to prevent memorisation (exp(3)≈20 still
     allows reasonable uncertainty scaling but blocks extreme collapse)."""
-    log_var = torch.clamp(log_var, -10.0, 10.0)
+    log_var = torch.clamp(log_var, -3.0, 3.0)
     return 0.5 * (torch.exp(-log_var) * (mean - target) ** 2 + log_var).mean()
 
 
@@ -63,7 +63,7 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
             x, y, s = x.to(device), y.to(device), s.to(device)
             pred_map, pred_log_var, pred_log_scale = model(x)
             loss_map   = heteroscedastic_nll(pred_map, pred_log_var, y)
-            loss_scale = F.mse_loss(pred_log_scale, torch.log(s.clamp(min=1e-8)))
+            loss_scale = F.mse_loss(pred_log_scale, s)
             loss = loss_map + scale_weight * loss_scale
 
             if training:

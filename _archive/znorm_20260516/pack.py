@@ -3,11 +3,10 @@
 pack.py  –  Pack sample directories into memory-mappable numpy arrays.
 
 Reads all sample_NNNNN/ directories, computes/loads cross-Patterson,
-and writes:
-    X.npy  –  float32 (N, 4, D, H, W)  – input channels in e/Å³ (ch0-2 raw;
-                                           ch3 cross-Patterson z-normed)
-    Y.npy  –  float32 (N, 1, D, H, W)  – (truth - Fc) difference map in e/Å³
-    S.npy  –  float32 (N,)             – std(truth - Fc) in e/Å³
+z-normalises each channel, and writes:
+    X.npy  –  float32 (N, 4, D, H, W)  – input channels (znorm'd)
+    Y.npy  –  float32 (N, 1, D, H, W)  – znorm'd (truth - Fc) difference map
+    S.npy  –  float32 (N,)             – log(std(truth - Fc)) scale factor
 
 After packing, training opens 3 files instead of 5×N files per epoch.
 
@@ -50,18 +49,13 @@ def _znorm(arr):
 
 
 def process_sample(base):
-    """Return (x, y, s) for one sample directory.
-
-    x: (4,D,H,W) float32 — ch0-2 in raw e/Å³; ch3 cross-Patterson z-normed
-    y: (1,D,H,W) float32 — truth−Fc difference map in e/Å³
-    s: float32            — std(truth−Fc) in e/Å³
-    """
+    """Return (x, y, s) for one sample directory."""
     base = str(base)
-    ch0      = _load_map(os.path.join(base, '2fofc.map'))
+    ch0      = _znorm(_load_map(os.path.join(base, '2fofc.map')))
     fofc_raw = _load_map(os.path.join(base, 'fofc.map'))
     fc_raw   = _load_map(os.path.join(base, 'fc.map'))
-    ch1 = fofc_raw
-    ch2 = fc_raw
+    ch1 = _znorm(fofc_raw)
+    ch2 = _znorm(fc_raw)
 
     crossp_path = os.path.join(base, 'crossp.npy')
     if os.path.exists(crossp_path):
@@ -72,12 +66,12 @@ def process_sample(base):
 
     truth_raw = _load_map(os.path.join(base, 'truth.map'))
     diff_raw  = truth_raw - fc_raw
-    scale     = np.float32(diff_raw.std())
-    tgt       = diff_raw
+    log_scale = np.float32(np.log(diff_raw.std() + 1e-8))
+    tgt       = _znorm(diff_raw)
 
     x = np.stack([ch0, ch1, ch2, ch3], axis=0).astype(np.float32)  # (4,D,H,W)
     y = tgt[np.newaxis].astype(np.float32)                           # (1,D,H,W)
-    return x, y, scale
+    return x, y, log_scale
 
 
 def main():

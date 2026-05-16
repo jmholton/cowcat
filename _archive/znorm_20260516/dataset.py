@@ -3,13 +3,13 @@ dataset.py  –  PyTorch Dataset for electron density map pairs.
 
 Each sample directory contains:
     truth.map   – ground-truth Fc density (from truth_full.pdb)
-    2fofc.map   – 2Fo-Fc from refmac       (input channel 0, raw e/Å³)
-    fofc.map    – Fo-Fc difference map     (input channel 1, raw e/Å³)
-    fc.map      – FC_ALL_LS from refmac    (input channel 2, raw e/Å³)
+    2fofc.map   – 2Fo-Fc from refmac       (input channel 0)
+    fofc.map    – Fo-Fc difference map     (input channel 1)
+    fc.map      – FC_ALL_LS from refmac    (input channel 2)
 
-Target: truth.map − fc.map in e/Å³ (ideal Fo-Fc with perfect phases).
-Channel 3 (cross-Patterson) is z-normed since its units differ from e/Å³.
-S = std(truth − fc) in e/Å³ — absolute error scale, no log transform.
+Target: truth.map − fc.map  (ideal Fo-Fc: truth density minus partial-model Fc).
+Positive peaks mark missing density; negative peaks mark spurious centroid density.
+Maps are z-score normalised per-channel per-sample before returning.
 """
 
 import os
@@ -79,11 +79,11 @@ class ElectronDensityDataset(Dataset):
     def __getitem__(self, idx):
         base = os.path.join(self.data_dir, self.sample_ids[idx])
 
-        ch0      = _load_map(os.path.join(base, '2fofc.map'))
+        ch0      = _znorm(_load_map(os.path.join(base, '2fofc.map')))
         fofc_raw = _load_map(os.path.join(base, 'fofc.map'))
         fc_raw   = _load_map(os.path.join(base, 'fc.map'))
-        ch1 = fofc_raw
-        ch2 = fc_raw
+        ch1 = _znorm(fofc_raw)
+        ch2 = _znorm(fc_raw)
 
         crossp_path = os.path.join(base, 'crossp.npy')
         if os.path.exists(crossp_path):
@@ -93,8 +93,9 @@ class ElectronDensityDataset(Dataset):
 
         truth_raw = _load_map(os.path.join(base, 'truth.map'))
         diff_raw  = truth_raw - fc_raw
-        scale     = float(diff_raw.std())   # e/Å³, no log
-        tgt       = diff_raw
+        diff_std  = float(diff_raw.std())
+        log_scale = np.log(diff_std + 1e-8)
+        tgt = _znorm(diff_raw)
 
         x = np.stack([ch0, ch1, ch2, ch3], axis=0)  # (4, D, H, W)
 
@@ -106,8 +107,8 @@ class ElectronDensityDataset(Dataset):
                 tgt = np.flip(tgt, axis=spatial_axis)       # tgt is (D,H,W)
 
         x   = torch.from_numpy(x.copy())
-        y   = torch.from_numpy(tgt[np.newaxis].copy())   # (1, D, H, W)
-        s   = torch.tensor(scale, dtype=torch.float32)   # std in e/Å³
+        y   = torch.from_numpy(tgt[np.newaxis].copy())      # (1, D, H, W)
+        s   = torch.tensor(log_scale, dtype=torch.float32)  # scalar
 
         # Random periodic translation — exact for P1 maps (wrap-around is correct BC).
         # ch3 (cross-Patterson) is translation-invariant: P(M(·-d), N(·-d)) = P(M,N).
