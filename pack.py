@@ -48,12 +48,14 @@ def _signed_sqrt(arr):
     return np.sign(arr) * np.sqrt(np.abs(arr))
 
 
-def process_sample(base):
+def process_sample(base, crossp_transform='signed_sqrt'):
     """Return (x, y, s) for one sample directory.
 
-    x: (4,D,H,W) float32 — ch0-2 in raw e/Å³; ch3 cross-Patterson signed-sqrt
+    x: (4,D,H,W) float32 — ch0-2 in raw e/Å³; ch3 cross-Patterson (see crossp_transform)
     y: (1,D,H,W) float32 — truth−Fc difference map in e/Å³
     s: float32            — std(truth−Fc) in e/Å³
+
+    crossp_transform: 'signed_sqrt' (default) or 'raw'
     """
     base = str(base)
     ch0      = _load_map(os.path.join(base, '2fofc.map'))
@@ -65,9 +67,10 @@ def process_sample(base):
     crossp_path = os.path.join(base, 'crossp.npy')
     if os.path.exists(crossp_path):
         _cp = np.load(crossp_path)
-        ch3 = _signed_sqrt(_cp if _cp.shape == ch0.shape else _cross_patterson(fofc_raw, fc_raw))
+        cp_raw = _cp if _cp.shape == ch0.shape else _cross_patterson(fofc_raw, fc_raw)
     else:
-        ch3 = _signed_sqrt(_cross_patterson(fofc_raw, fc_raw))
+        cp_raw = _cross_patterson(fofc_raw, fc_raw)
+    ch3 = _signed_sqrt(cp_raw) if crossp_transform == 'signed_sqrt' else cp_raw.astype(np.float32)
 
     truth_raw = _load_map(os.path.join(base, 'truth.map'))
     diff_raw  = truth_raw - fc_raw
@@ -87,9 +90,16 @@ def main():
                         help='(ignored — packing is now sequential to bound memory)')
     parser.add_argument('--force',   action='store_true',
                         help='Overwrite existing packs')
+    parser.add_argument('--crossp-raw', action='store_true',
+                        help='Store raw cross-Patterson in ch3 (default: signed-sqrt)')
+    parser.add_argument('--outdir', default=None,
+                        help='Output directory (default: same as --data)')
     args = parser.parse_args()
 
+    crossp_transform = 'raw' if args.crossp_raw else 'signed_sqrt'
     data = Path(args.data)
+    out  = Path(args.outdir) if args.outdir else data
+    out.mkdir(parents=True, exist_ok=True)
     sample_dirs = sorted(
         d for d in data.iterdir()
         if d.is_dir() and d.name.startswith('sample_')
@@ -99,14 +109,14 @@ def main():
     if n == 0:
         print('No valid samples found.')
         return
-    print(f'Packing {n} samples from {data} ...')
+    print(f'Packing {n} samples from {data}  crossp={crossp_transform}  →  {out}')
 
-    x_path = data / 'X.npy'
+    x_path = out / 'X.npy'
     if x_path.exists() and not args.force:
         print(f'Pack already exists. Use --force to overwrite.')
         return
 
-    x0, y0, s0 = process_sample(sample_dirs[0])
+    x0, y0, s0 = process_sample(sample_dirs[0], crossp_transform)
     x_shape = (n,) + x0.shape   # (N, 4, D, H, W)
     y_shape = (n,) + y0.shape   # (N, 1, D, H, W)
     nbytes = (np.prod(x_shape) + np.prod(y_shape) + n) * 4
@@ -122,16 +132,16 @@ def main():
             np.empty(shape, dtype=dtype)))
         return f
 
-    fx = _open_npy(data / 'X.npy', np.float32, tuple(x_shape))
-    fy = _open_npy(data / 'Y.npy', np.float32, tuple(y_shape))
-    fs = _open_npy(data / 'S.npy', np.float32, (n,))
+    fx = _open_npy(out / 'X.npy', np.float32, tuple(x_shape))
+    fy = _open_npy(out / 'Y.npy', np.float32, tuple(y_shape))
+    fs = _open_npy(out / 'S.npy', np.float32, (n,))
 
     done = errors = 0
     s_buf = np.zeros(n, dtype=np.float32)
     cached = {0: (x0, y0, s0)}  # reuse sample 0 already computed for shape
     for i, d in enumerate(sample_dirs):
         try:
-            x, y, s = cached.pop(i) if i in cached else process_sample(d)
+            x, y, s = cached.pop(i) if i in cached else process_sample(d, crossp_transform)
             fx.write(x.tobytes()); fy.write(y.tobytes()); s_buf[i] = s
             done += 1
         except Exception as e:
@@ -145,7 +155,7 @@ def main():
     fs.write(s_buf.tobytes())
     fx.close(); fy.close(); fs.close()
 
-    for label, path in [('X', data / 'X.npy'), ('Y', data / 'Y.npy'), ('S', data / 'S.npy')]:
+    for label, path in [('X', out / 'X.npy'), ('Y', out / 'Y.npy'), ('S', out / 'S.npy')]:
         size = os.path.getsize(path)
         if size == 0:
             raise RuntimeError(f'{label}.npy is empty after packing: {path}')
