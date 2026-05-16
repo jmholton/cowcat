@@ -134,6 +134,17 @@ def main():
     print(f'Device: {device}  GPUs: {n_gpus}')
 
     # ── Data ──────────────────────────────────────────────────────────────────
+    import time as _time
+    print('Data files:')
+    for d in args.data:
+        for fname in ('X.npy', 'Y.npy', 'S.npy'):
+            p = os.path.join(d, fname)
+            if os.path.exists(p):
+                mtime = _time.strftime('%Y-%m-%d %H:%M:%S', _time.localtime(os.path.getmtime(p)))
+                size  = os.path.getsize(p)
+                print(f'  {p}  {size:>12,d} bytes  mtime={mtime}')
+            else:
+                print(f'  {p}  MISSING')
     train_ds, val_ds = make_splits_multi(args.data, val_fraction=args.val_frac)
     print(f'Train: {len(train_ds)}  Val: {len(val_ds)}')
 
