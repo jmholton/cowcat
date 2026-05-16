@@ -34,11 +34,7 @@ from model import UNet3D, count_parameters
 # ══════════════════════════════════════════════════════════════════════════════
 
 def heteroscedastic_nll(mean, log_var, target):
-    """Heteroscedastic Gaussian NLL: ½·exp(-s)·(μ-y)² + ½·s  where s=log_var.
-    Jointly optimises prediction accuracy and calibrated per-voxel uncertainty.
-    log_var is clamped to [-3, 3] to prevent memorisation (exp(3)≈20 still
-    allows reasonable uncertainty scaling but blocks extreme collapse)."""
-    log_var = torch.clamp(log_var, -10.0, 10.0)
+    """Heteroscedastic Gaussian NLL: ½·exp(-s)·(μ-y)² + ½·s  where s=log_var."""
     return 0.5 * (torch.exp(-log_var) * (mean - target) ** 2 + log_var).mean()
 
 
