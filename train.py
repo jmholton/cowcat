@@ -51,6 +51,7 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
+    total_mse  = 0.0
 
     with torch.set_grad_enabled(training):
         if training:
@@ -69,9 +70,13 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
                     optimizer.step()
                     optimizer.zero_grad()
 
-            total_loss += loss.item() * x.size(0)
+            n = x.size(0)
+            total_loss += loss.item() * n
+            with torch.no_grad():
+                total_mse += F.mse_loss(pred_map, y).item() * n
 
-    return total_loss / len(loader.dataset)
+    n_total = len(loader.dataset)
+    return total_loss / n_total, total_mse / n_total
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -200,8 +205,8 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        train_loss = run_epoch(model, train_loader, device, optimizer,      args.scale_weight, args.accum_steps)
-        val_loss   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
+        train_loss, train_mse = run_epoch(model, train_loader, device, optimizer,      args.scale_weight, args.accum_steps)
+        val_loss,   val_mse   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
         scheduler.step()
 
         elapsed = time.time() - t0
@@ -209,10 +214,11 @@ def main():
 
         print(f'epoch {epoch:04d}  '
               f'train= {train_loss:.5f}  val= {val_loss:.5f}  '
+              f'mse= {val_mse:.5f}  '
               f'lr= {lr_now:.2e}  t= {elapsed:.1f}s')
 
         entry = dict(epoch=epoch, train=round(train_loss, 6),
-                     val=round(val_loss, 6), lr=lr_now)
+                     val=round(val_loss, 6), mse=round(val_mse, 6), lr=lr_now)
         log.append(entry)
 
         # Save latest checkpoint
