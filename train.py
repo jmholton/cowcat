@@ -71,7 +71,8 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
     n_total = len(loader.dataset)
     mse  = total_mse / n_total
     rmsd = (total_yss / n_total) ** 0.5   # RMS of true map (e/Å³)
-    return mse, mse / rmsd if rmsd > 0 else float('nan')
+    Rrms = mse**0.5 / rmsd if rmsd > 0 else float('nan')
+    return mse, Rrms
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -120,7 +121,9 @@ def main():
         def flush(self):
             for s in self.streams: s.flush()
 
-    _lf = open(_logpath, 'a')
+    if _logpath.exists():
+        _logpath.rename(_logpath.with_suffix('.log.bak'))
+    _lf = open(_logpath, 'w')
     sys.stdout = _Tee(sys.__stdout__, _lf)
     sys.stderr = _Tee(sys.__stderr__, _lf)
     print(f'Logging to {_logpath}')
@@ -200,8 +203,8 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        train_mse, train_ratio = run_epoch(model, train_loader, device, optimizer,      args.scale_weight, args.accum_steps)
-        val_mse,   val_ratio   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
+        train_mse, train_Rrms = run_epoch(model, train_loader, device, optimizer,      args.scale_weight, args.accum_steps)
+        val_mse,   val_Rrms   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
         scheduler.step()
 
         elapsed = time.time() - t0
@@ -209,11 +212,11 @@ def main():
 
         print(f'epoch {epoch:04d}  '
               f'train= {train_mse:.5f}  val= {val_mse:.5f}  '
-              f'ratio= {val_ratio:.4f}  '
+              f'Rrms= {val_Rrms:.4f}  '
               f'lr= {lr_now:.2e}  t= {elapsed:.1f}s')
 
         entry = dict(epoch=epoch, train=round(train_mse, 6),
-                     val=round(val_mse, 6), ratio=round(val_ratio, 4), lr=lr_now)
+                     val=round(val_mse, 6), Rrms=round(val_Rrms, 4), lr=lr_now)
         log.append(entry)
 
         # Save latest checkpoint
