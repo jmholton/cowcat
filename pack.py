@@ -44,9 +44,8 @@ def _cross_patterson(fofc_arr, fc_arr):
 
 def _znorm(arr):
     std = arr.std()
-    if std < 1e-8:
-        return arr - arr.mean()
-    return (arr - arr.mean()) / std
+    sigma = max(float(std), 0.01 * float(np.abs(arr).max()), 1e-8)
+    return (arr - arr.mean()) / sigma
 
 
 def process_sample(base):

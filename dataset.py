@@ -49,11 +49,10 @@ def _cross_patterson(fofc_arr, fc_arr):
 
 
 def _znorm(arr):
-    """Z-score normalise; return as-is if std ≈ 0."""
+    """Z-score normalise with sigma >= 1% of max absolute value."""
     std = arr.std()
-    if std < 1e-8:
-        return arr - arr.mean()
-    return (arr - arr.mean()) / std
+    sigma = max(float(std), 0.01 * float(np.abs(arr).max()), 1e-8)
+    return (arr - arr.mean()) / sigma
 
 
 class ElectronDensityDataset(Dataset):
