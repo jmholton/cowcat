@@ -20,9 +20,9 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 | `pack.py` | Packs `sample_NNNNN/` dirs into `X.npy`/`Y.npy`/`S.npy` for fast mmap loading |
 | `jigglepdb.awk` | Displaces atom positions to generate alternate conformers |
 | `explore_1aho_fusion.py` | Conformer scoring, rebuild, refmac utilities for the 1AHO iterative pipeline |
-| `rebuild_iterate.py` | Standalone iterative rebuild loop: score Fo-Fc outliers → rebuild → refmac → repeat |
 | `swapscan_varconf.py` | Chain-letter swap optimisation: random/geo-targeted trials, refmac NCYC=50, wE scoring |
 | `swapscan_to_samples.py` | Convert swapscan `refmacout.mtz` files → `sample_NNNNN/` dirs for UNet3D training |
+| `rebuild_iterate.py` | Standalone iterative rebuild loop: score Fo-Fc outliers → rebuild → refmac → repeat |
 | `run_untangler_1aho.py` | Wrapper to run Untangler ILP on 1AHO varconf structure via SLURM |
 | `condense_bb.py` | Backbone(+SS)-only maximin condensation sweep (gt48 → various k) |
 | `condense_bb_varconf.py` | Per-residue varconf condensation on a multi-chain conformer model |
@@ -436,6 +436,123 @@ sbatch slurm_untangler_1aho.sh --pdb 1aho/conf3norm_fitGT48.pdb \
 
 ---
 
+## Backbone Conformer Condensation
+
+Three scripts implement increasingly sophisticated conformer-count reduction on 1AHO models, all refining a backbone+disulfide-only model against Fc data computed from the same backbone+SS atoms.
+
+| script | input format | conformer selection | starting atoms |
+|--------|--------------|--------------------|----------------|
+| `condense_bb.py` | multi-chain (e.g. gt48.pdb, 48 chains) | global maximin → flat k chains | ~18,700 (gt48 backbone) |
+| `condense_bb_varconf.py` | multi-chain | per-residue maximin via `build_varconf_pdb` (uses chain A as residue/atom template) | as input |
+| `condense_singlechain.py` | single-chain altloc (e.g. deconform output) | per-residue altloc maximin (no template, no duplicates) | as input |
+
+**Pipeline (`condense_singlechain.py`, the current best):**
+
+1. Strip input PDB to backbone + cysteine CB/SG (preserves disulfide network) → `bbss.pdb`
+2. Compute Fobs MTZ as `FP = |Fc(bbss)|`, `Fpart = 0`, `FreeR_flag` from `1aho/refme_minRfree.mtz` (the actual diffraction free-R split)
+3. For each residue: heavy-atom max-deviation across altlocs → look up target k from a threshold table → maximin-pick that many altlocs
+4. `reoccupy.awk` (`~/Develop/`) renormalizes per-residue occupancies to sum=1
+5. 4 rounds of refmac5-newhess weight-snap (NCYC 10 each at wm 0.01→0.1→1→10→0.5)
+6. Rounds ≥3 generate occupancy-group refmac keywords via `~/Develop/refmac_occupancy_setup.com` (instead of the built-in `generate_occ_groups`)
+
+**Threshold sets** are defined in `condense_singlechain.py:THRESHOLD_SETS` (top of the file). To list available names from the CLI: `ccp4-python condense_singlechain.py --help` shows them under `--threshold-set`. Each set maps heavy-atom max-deviation (Å) to per-residue k:
+
+| set | (dev, k) brackets | bottom k |
+|---|---|---|
+| `floor1lean` | (0.5,1) (0.8,2) (1.2,3) (1.8,5) (2.5,7) (99,10) | 1 |
+| `floor1` | (0.4,1) (0.6,2) (0.8,3) (1.2,5) (2.0,8) (99,12) | 1 |
+| `floor2` | (0.6,2) (0.8,3) (1.2,5) (2.0,8) (99,12) | 2 |
+| `default` | (0.6,2) (0.8,4) (1.0,6) (1.5,8) (2.5,12) (99,16) | 2 |
+| `lean` | (0.6,1) (0.8,2) (1.0,4) (1.5,6) (2.5,8) (99,12) | 1 |
+| `midrich` | (0.6,3) (0.8,5) (1.0,7) (1.5,10) (2.5,14) (99,20) | 3 |
+| `rich` | (0.6,4) (0.8,6) (1.0,8) (1.5,12) (2.5,16) (99,24) | 4 |
+
+**Best results from `1aho/deconform_under20_best_0025.pdb` (22-altloc deconform output)** — backbone+SS, 4 weight-snap rounds, `--cys-floor 3`:
+
+| set | atoms | R rd 4 | Rfree rd 4 |
+|---|---|---|---|
+| floor1lean | 945 | 6.69% | 6.82% |
+| floor1 | 1281 | 5.57% | 5.80% |
+| **floor2** | **1381** | **4.40%** | **4.71%** |
+| midrich | 1966 | 3.16% | 3.37% |
+
+`floor2` is the sweet spot: under 5% Rfree budget, ~30% smaller atom count than `midrich`.
+
+### floor2 recipe (Lawrencium)
+
+```bash
+# On Lawrencium (lr6 partition, pc_als831 account, lr_normal QOS).
+# Source code already includes refmac5-newhess override and reoccupy/occ-setup wiring.
+
+cd /path/to/claude_CNN
+source cluster.sh && setup_ccp4
+
+# Verify required external tools are reachable from the compute node
+ls ~/Develop/reoccupy.awk ~/Develop/refmac_occupancy_setup.com
+which refmac5-newhess  # path is hardcoded in condense_singlechain.py:
+                       # /programs/ccp4-8.0/bin/refmac5-newhess — adjust if cluster differs
+
+sbatch --partition=lr6 --account=pc_als831 --qos=lr_normal \
+       --ntasks=1 --cpus-per-task=1 --mem=8G --export=ALL \
+       --job-name=floor2 --output=floor2_%j.log \
+       --wrap="cd \$SLURM_SUBMIT_DIR && \
+               ccp4-python condense_singlechain.py \
+                 --threshold-set floor2 --n-rounds 4 --cys-floor 3 \
+                 --singlechain-pdb 1aho/deconform_under20_best_0025.pdb \
+                 --outdir 1aho/condense_singlechain"
+
+# Single ~10-minute job. Result lands in 1aho/condense_singlechain/floor2/result.json
+ccp4-python -c "import json; d=json.load(open('1aho/condense_singlechain/floor2/result.json')); print(d['rounds'][-1])"
+```
+
+**Notes for the Lawrencium counterpart:**
+- The hardcoded refmac5-newhess path (`/programs/ccp4-8.0/bin/refmac5-newhess`) in `condense_singlechain.py` works on the original cluster only. On Lawrencium, point it at the equivalent newhess binary or revert to plain refmac5 in `ccp4-9` if newhess is unavailable.
+- `~/Develop/reoccupy.awk` and `~/Develop/refmac_occupancy_setup.com` are NFS-mounted from the user's home, so they should be available on Lawrencium compute nodes.
+- The `--cys-floor 3` keeps the disulfide-bonded cysteines at ≥3 conformers, which buys ~0.2–0.7 % Rfree at +60–100 atom cost — worth it for SS-rich structures like 1AHO (4 disulfides).
+- Threshold sets are defined inline in `condense_singlechain.py:THRESHOLD_SETS`; add new ones there.
+
+---
+
+## Untangler (ILP Conformer Label Optimisation)
+
+`untangler/` is a git submodule (branch `2_conformer_challenge_solution` of github.com/Phoelionix/Untangler). It resolves tangled altloc assignments by ILP, scoring via wE (phenix geometry) + Rfree from phenix.refine.
+
+**Run:**
+```bash
+sbatch slurm_untangler_1aho.sh --pdb 1aho/conf3norm_fitGT48.pdb \
+    --altloc-subset-size 3 --max-runs 5
+```
+
+**Input requirements (critical):**
+- Single-chain altloc format: all protein atoms in chain A with altloc letters (A, B, C, ...)
+- **Uniform altloc coverage**: every disordered residue must have ALL altloc letters present — no partial sets (e.g., B+C without A). Fill gaps by copying the available altloc line with the altloc column changed.
+- **Aromatic side chains required**: `relabel_ring` crashes on backbone-only structures. Use full-atom PDB.
+- `altloc_subset_size` must equal the number of conformers, or the highest-letter conformer is left unpaired.
+
+**`1aho/conf3norm_fitGT48.pdb`** (working 3-conformer input):
+- 2865 atoms = 955 atoms × 3 altlocs (A, B, C), fully normalized coverage
+- Derived from `under20_fitGT48.pdb` altlocs A/B/C; missing altlocs filled by copying nearest available
+
+**Submodule patches** (applied directly in `untangler/`, not committable from parent):
+- `LinearOptimizer/ConstraintsHandler.py` lines 641–644: changed duplicate clash-distance `assert` to a warning (f-string bug accessed wrong dict key during assert message formatting)
+- `LinearOptimizer/Solver.py` lines ~1144 and ~1316: changed `if lp_problem.sol_status==LpStatusInfeasible` → `if lp_problem.sol_status != 1` — PuLP returns `sol_status=0` (no solution found) for infeasible next-best problems, not `-1` (infeasible), so the original guard was never triggered
+- `untangle.py` line ~1503: replaced `shutil.rmtree(tmp_refine_subdir)` with `subprocess.run(['rm', '-rf', tmp_refine_subdir], check=False)` — `shutil.rmtree` raises `OSError: ENOTEMPTY` on NFS after unlinking files (NFS directory-cache race); `rm -rf` is more robust
+
+**SLURM routing:** `Untangler.refine_shell_file` is set to `untangler/Refinement/Refine_slurm.sh`, which submits each phenix.refine call to the `refmac` partition via `sbatch --parsable`, polls until the job exits, and cancels the SLURM job via `trap "scancel $SLURM_JOB_ID" EXIT` if the wrapper is killed (e.g. by Python's subprocess timeout). This prevents zombie jobs from piling up in the refmac queue.
+
+**Skip cross-conformer subprocess calls:** set BOTH `NonbondConstraint: 0` AND `ClashConstraint: 0` in `weight_factors`. Setting only one still runs both cross-conformer scripts (see `skip_nonbonds` logic in ConstraintsHandler.py).
+
+**Performance note:** `GenerateHoltonData.sh` → `untangle_score_weighted.csh` → `phenix.molprobity` runs single-threaded on the full model every ILP loop. With 22 conformers (~10,000 atoms) this is hours per call; the 3-conformer model (~955 atoms) is fast.
+
+**For Untangler to make swaps**, the input must be deliberately tangled (conformer labels not yet optimized). A well-refined structure scores 0 high-tension connections each ILP loop and makes no moves (`"moves": {}` in every `xLO-toFlip_*.json`). Score improvements in that case come entirely from the phenix.refine cycles Untangler runs between ILP iterations, not from any relabelling.
+
+**Completed run on `conf3norm_fitGT48.pdb`** (5 loops, `--altloc-subset-size 3`):
+- No altloc swaps in any loop — input was already optimally labelled
+- Rfree improved 18.62 → 18.51% purely from refinement; wE 87.7 → 84.0
+- Final output: `untangler/output/conf3norm_fitGT48_loopEnd4.pdb` (same conformer assignments, slightly better geometry)
+
+---
+
 ## Known Gotchas
 
 - **pack.py target**: Y.npy stores `znorm(truth - fc)` (the difference map), not `znorm(truth)`. S.npy stores `log(std(truth - fc))`. Matches `ElectronDensityDataset` exactly. pack.py never reads `metadata.json`.
@@ -450,13 +567,12 @@ sbatch slurm_untangler_1aho.sh --pdb 1aho/conf3norm_fitGT48.pdb \
 - **Data generation directories**: keep ≤1000 samples per directory to avoid Lustre metadata slowdown.
 - **DataParallel + pin_memory deadlock**: `pin_memory=True` with DataParallel and forked DataLoader workers causes a hang. `train.py` disables pin_memory when `n_gpus > 1`.
 - **Einsteinium module loading**: `module load --force ml/pytorch/2.3.1-py3.11.7-mf` requires `Core` in MODULEPATH and the `--force` flag; CUDA/cuDNN warnings on login nodes are harmless.
-<<<<<<< HEAD
 - **refmac cwd vs relative paths**: always resolve XYZIN and HKLIN to absolute paths; refmac runs with `cwd=tmpdir` so relative paths fail.
 - **cavenv SYMM**: must be integer space group number (e.g. 19 for P 21 21 21), not HM string. Use `gemmi.find_spacegroup_by_name(sg).number`.
-=======
-- **refmac cwd vs relative paths**: `run_refmac_quick` runs refmac with `cwd=tmpdir`; always resolve XYZIN and HKLIN to absolute paths before passing them in, or refmac will fail with "Cannot find input file".
 - **P2₁2₁2₁ map global peak in symmetry copies**: `transform_f_phi_to_map` returns the full unit cell (4 ASU copies). The global maximum is often in a non-ASU region. When searching for density near protein atoms, sample the map at known atom positions rather than finding the global peak and searching nearby.
 - **shutil.rmtree ENOTEMPTY on NFS**: Python's `shutil.rmtree` calls `os.rmdir` after unlinking all files; on NFS the server may still report the directory non-empty due to caching, raising `OSError: [Errno 39]`. Use `subprocess.run(['rm', '-rf', path])` instead for cleanup of refinement tmp dirs.
 - **Flood water occupancy**: `flood_occ = FLOOD_LINE_K / sqrt(n_flood)` is always positive. The `--flood-occ` CLI flag is unchecked — passing a negative value would propagate to gemmi and write negative occupancies. Normal code paths (including `--vary-flood`) can never produce negative occ.
+- **pack.py zero-fills failed samples**: `open_memmap` with `mode='w+'` initialises to zeros. If `process_sample` raises, that row stays zero — no error propagates to the caller. Check that all rows are non-zero after packing: `(np.abs(X).reshape(N,-1).max(1) == 0).sum()` gives the failure count. Failed samples must be regenerated and repacked; the safest fix is to repack with `--force` once all map files are present.
+- **data_protein_v2_s0 corruption**: 962 sample dirs but only 443 have non-zero rows in X.npy (519 zero-filled). Root cause: map files were still being flushed (or pack.py ran before generation completed). The 443 valid samples yield only ~354 train / 89 val — too few to avoid overfitting a 5.84M-param network. Regenerate and repack.
+- **generate_sample() local multi-sample path bug (fixed 2026-05-15)**: the `--nsamples N` code path (without `--submit`/`--sample-id`) passed `shift_scale` in the `vary_flood` positional slot, then also passed `vary_flood` as a keyword → `TypeError: multiple values for argument 'vary_flood'`. The SLURM array path (`--sample-id`) was unaffected. Fixed by using a `_kw` dict for all keyword args.
 - **Space group domain gap for CNN inference on real 1AHO data**: Training uses synthetic P1 40×40×40 Å cells (one molecule, no symmetry). 1AHO is P2₁2₁2₁ with 4 ASU copies per unit cell. Applying the trained CNN to real 1AHO maps means each 60×60×60 patch sees portions of 2–3 symmetry-related molecules simultaneously — a pattern the network was never trained on. The cross-Patterson channel implicitly encodes inter-ASU vectors but the CNN has no way to exploit that. Expect degraded performance if ever applied to non-P1 experimental data.
->>>>>>> origin/master

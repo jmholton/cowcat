@@ -1113,7 +1113,7 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
             for name in all_names:
                 _add_collapsed_atom(res_out, by_name[name])
         else:
-            by_name, present = _reduce_conformers(by_name, all_names, max_confs=n_conf)
+            by_name, present = _reduce_conformers(by_name, all_names, max_confs=min(n_conf, 3))
 
             shuffled = list(present)
             n_swaps = int(rng.poisson(altloc_swaps_per_res))
@@ -1461,9 +1461,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 
     # Remove any stale prot_* dirs left by previously aborted runs on this node
     ccp4_scr = Path(os.environ.get('CCP4_SCR', '/tmp'))
-    for stale in ccp4_scr.glob('prot_*'):
-        if stale.is_dir():
-            shutil.rmtree(stale, ignore_errors=True)
+    os.makedirs(ccp4_scr, exist_ok=True)
 
     rng = np.random.default_rng(seed=sample_idx if seed is None else seed)
 
