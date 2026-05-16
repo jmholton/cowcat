@@ -33,11 +33,6 @@ from model import UNet3D, count_parameters
 # Loss
 # ══════════════════════════════════════════════════════════════════════════════
 
-def heteroscedastic_nll(mean, log_var, target):
-    """Heteroscedastic Gaussian NLL: ½·exp(-s)·(μ-y)² + ½·s  where s=log_var."""
-    return 0.5 * (torch.exp(-log_var) * (mean - target) ** 2 + log_var).mean()
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Training / validation loops
 # ══════════════════════════════════════════════════════════════════════════════
@@ -50,8 +45,8 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
     """
     training = optimizer is not None
     model.train(training)
-    total_loss = 0.0
     total_mse  = 0.0
+    total_yss  = 0.0  # sum of mean(y²) * n, for dataset-level RMSD
 
     with torch.set_grad_enabled(training):
         if training:
@@ -59,9 +54,7 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
         for step, (x, y, s) in enumerate(loader):
             x, y, s = x.to(device), y.to(device), s.to(device)
             pred_map, pred_log_var, pred_log_scale = model(x)
-            loss_map   = heteroscedastic_nll(pred_map, pred_log_var, y)
-            loss_scale = F.mse_loss(pred_log_scale, torch.log(s.clamp(min=1e-8)))
-            loss = loss_map + scale_weight * loss_scale
+            loss = F.mse_loss(pred_map, y)
 
             if training:
                 (loss / accum_steps).backward()
@@ -71,12 +64,14 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
                     optimizer.zero_grad()
 
             n = x.size(0)
-            total_loss += loss.item() * n
+            total_mse += loss.item() * n
             with torch.no_grad():
-                total_mse += F.mse_loss(pred_map, y).item() * n
+                total_yss += (y ** 2).mean().item() * n
 
     n_total = len(loader.dataset)
-    return total_loss / n_total, total_mse / n_total
+    mse  = total_mse / n_total
+    rmsd = (total_yss / n_total) ** 0.5   # RMS of true map (e/Å³)
+    return mse, mse / rmsd if rmsd > 0 else float('nan')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -205,20 +200,20 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        train_loss, train_mse = run_epoch(model, train_loader, device, optimizer,      args.scale_weight, args.accum_steps)
-        val_loss,   val_mse   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
+        train_mse, train_ratio = run_epoch(model, train_loader, device, optimizer,      args.scale_weight, args.accum_steps)
+        val_mse,   val_ratio   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
         scheduler.step()
 
         elapsed = time.time() - t0
         lr_now  = scheduler.get_last_lr()[0]
 
         print(f'epoch {epoch:04d}  '
-              f'train= {train_loss:.5f}  val= {val_loss:.5f}  '
-              f'mse= {val_mse:.5f}  '
+              f'train= {train_mse:.5f}  val= {val_mse:.5f}  '
+              f'ratio= {val_ratio:.4f}  '
               f'lr= {lr_now:.2e}  t= {elapsed:.1f}s')
 
-        entry = dict(epoch=epoch, train=round(train_loss, 6),
-                     val=round(val_loss, 6), mse=round(val_mse, 6), lr=lr_now)
+        entry = dict(epoch=epoch, train=round(train_mse, 6),
+                     val=round(val_mse, 6), ratio=round(val_ratio, 4), lr=lr_now)
         log.append(entry)
 
         # Save latest checkpoint
@@ -229,15 +224,15 @@ def main():
         torch.save(ckpt, outdir / 'latest.pt')
 
         # Save best checkpoint
-        if val_loss < best_val:
-            best_val = val_loss
+        if val_mse < best_val:
+            best_val = val_mse
             torch.save(ckpt, outdir / 'best.pt')
             print(f'  ↳ new best val={best_val:.5f}')
 
         # Write training log as JSON for easy inspection
         (outdir / 'log.json').write_text(json.dumps(log, indent=2))
 
-    print(f'Done. Best val loss: {best_val:.5f}')
+    print(f'Done. Best val MSE: {best_val:.5f}')
     print(f'Best checkpoint: {outdir / "best.pt"}')
 
 
