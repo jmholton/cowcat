@@ -121,6 +121,21 @@ class ElectronDensityDataset(Dataset):
         return x, y, s
 
 
+def _validate_pack(x_path, y_path, s_path):
+    """Raise ValueError if any pack file is missing, empty, or has inconsistent N."""
+    for p in (x_path, y_path, s_path):
+        size = os.path.getsize(p)
+        if size == 0:
+            raise ValueError(f'Pack file is empty (0 bytes): {p}')
+    X = np.load(x_path, mmap_mode='r')
+    Y = np.load(y_path, mmap_mode='r')
+    S = np.load(s_path, mmap_mode='r')
+    if not (len(X) == len(Y) == len(S)):
+        raise ValueError(
+            f'Pack length mismatch: X={len(X)} Y={len(Y)} S={len(S)} in {os.path.dirname(x_path)}')
+    return X, Y, S
+
+
 class PackedDataset(Dataset):
     """Fast dataset backed by pre-packed X.npy / Y.npy / S.npy memory-mapped arrays.
 
@@ -129,9 +144,7 @@ class PackedDataset(Dataset):
     Augmentation (random axis flips, periodic rolls) is still applied on the fly.
     """
     def __init__(self, x_path, y_path, s_path, indices=None):
-        self.X = np.load(x_path, mmap_mode='r')  # (N, 4, D, H, W)
-        self.Y = np.load(y_path, mmap_mode='r')  # (N, 1, D, H, W)
-        self.S = np.load(s_path, mmap_mode='r')  # (N,)
+        self.X, self.Y, self.S = _validate_pack(x_path, y_path, s_path)
         self.indices = indices if indices is not None else np.arange(len(self.X))
 
     def __len__(self):

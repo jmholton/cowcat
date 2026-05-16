@@ -140,6 +140,11 @@ def main():
 
     fs.write(s_buf.tobytes())
     fx.close(); fy.close(); fs.close()
+
+    for label, path in [('X', data / 'X.npy'), ('Y', data / 'Y.npy'), ('S', data / 'S.npy')]:
+        size = os.path.getsize(path)
+        if size == 0:
+            raise RuntimeError(f'{label}.npy is empty after packing: {path}')
     print(f'Done. ok={done}  errors={errors}')
 
 
