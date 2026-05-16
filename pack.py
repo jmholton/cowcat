@@ -5,7 +5,7 @@ pack.py  –  Pack sample directories into memory-mappable numpy arrays.
 Reads all sample_NNNNN/ directories, computes/loads cross-Patterson,
 and writes:
     X.npy  –  float32 (N, 4, D, H, W)  – input channels in e/Å³ (ch0-2 raw;
-                                           ch3 cross-Patterson z-normed)
+                                           ch3 cross-Patterson signed-sqrt)
     Y.npy  –  float32 (N, 1, D, H, W)  – (truth - Fc) difference map in e/Å³
     S.npy  –  float32 (N,)             – std(truth - Fc) in e/Å³
 
@@ -43,16 +43,15 @@ def _cross_patterson(fofc_arr, fc_arr):
     ).real.astype(np.float32)
 
 
-def _znorm(arr):
-    std = arr.std()
-    sigma = max(float(std), 0.01 * float(np.abs(arr).max()), 1e-8)
-    return (arr - arr.mean()) / sigma
+def _signed_sqrt(arr):
+    """sign(x) * sqrt(|x|) — compresses dynamic range while preserving sign."""
+    return np.sign(arr) * np.sqrt(np.abs(arr))
 
 
 def process_sample(base):
     """Return (x, y, s) for one sample directory.
 
-    x: (4,D,H,W) float32 — ch0-2 in raw e/Å³; ch3 cross-Patterson z-normed
+    x: (4,D,H,W) float32 — ch0-2 in raw e/Å³; ch3 cross-Patterson signed-sqrt
     y: (1,D,H,W) float32 — truth−Fc difference map in e/Å³
     s: float32            — std(truth−Fc) in e/Å³
     """
@@ -66,9 +65,9 @@ def process_sample(base):
     crossp_path = os.path.join(base, 'crossp.npy')
     if os.path.exists(crossp_path):
         _cp = np.load(crossp_path)
-        ch3 = _znorm(_cp if _cp.shape == ch0.shape else _cross_patterson(fofc_raw, fc_raw))
+        ch3 = _signed_sqrt(_cp if _cp.shape == ch0.shape else _cross_patterson(fofc_raw, fc_raw))
     else:
-        ch3 = _znorm(_cross_patterson(fofc_raw, fc_raw))
+        ch3 = _signed_sqrt(_cross_patterson(fofc_raw, fc_raw))
 
     truth_raw = _load_map(os.path.join(base, 'truth.map'))
     diff_raw  = truth_raw - fc_raw

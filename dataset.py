@@ -8,7 +8,7 @@ Each sample directory contains:
     fc.map      – FC_ALL_LS from refmac    (input channel 2, raw e/Å³)
 
 Target: truth.map − fc.map in e/Å³ (ideal Fo-Fc with perfect phases).
-Channel 3 (cross-Patterson) is z-normed since its units differ from e/Å³.
+Channel 3 (cross-Patterson) is sign(x)*sqrt(|x|) compressed — different units from e/Å³.
 S = std(truth − fc) in e/Å³ — absolute error scale, no log transform.
 """
 
@@ -48,11 +48,9 @@ def _cross_patterson(fofc_arr, fc_arr):
     ).real.astype(np.float32)
 
 
-def _znorm(arr):
-    """Z-score normalise with sigma >= 1% of max absolute value."""
-    std = arr.std()
-    sigma = max(float(std), 0.01 * float(np.abs(arr).max()), 1e-8)
-    return (arr - arr.mean()) / sigma
+def _signed_sqrt(arr):
+    """sign(x) * sqrt(|x|) — compresses dynamic range while preserving sign."""
+    return np.sign(arr) * np.sqrt(np.abs(arr))
 
 
 class ElectronDensityDataset(Dataset):
@@ -87,9 +85,9 @@ class ElectronDensityDataset(Dataset):
 
         crossp_path = os.path.join(base, 'crossp.npy')
         if os.path.exists(crossp_path):
-            ch3 = _znorm(np.load(crossp_path))
+            ch3 = _signed_sqrt(np.load(crossp_path))
         else:
-            ch3 = _znorm(_cross_patterson(fofc_raw, fc_raw))
+            ch3 = _signed_sqrt(_cross_patterson(fofc_raw, fc_raw))
 
         truth_raw = _load_map(os.path.join(base, 'truth.map'))
         diff_raw  = truth_raw - fc_raw
