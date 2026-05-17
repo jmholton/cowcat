@@ -38,16 +38,40 @@ def _extract(ft, H, K, L):
     return np.abs(ft[hi, ki, li]).astype(np.float32)
 
 
-def _scale(Fo, Fc):
-    """Least-squares isotropic scale k minimising Σ(Fo − k·Fc)²."""
-    denom = float(np.dot(Fc.astype(np.float64), Fc.astype(np.float64)))
-    if denom < 1e-12:
-        return 1.0
-    return float(np.dot(Fo.astype(np.float64), Fc.astype(np.float64))) / denom
+def _scale_kb(Fo, Fc, s2, n_cycles=4):
+    """F-space nonlinear LS fit of k and B (SC(1)=1 fixed).
+
+    Model: Fc_scaled = k · exp(-B/4 · s²) · Fc
+    Minimises Σ(Fo − Fc_scaled)² via scipy LM.  Iterated n_cycles times.
+    Returns (k, B).
+    """
+    from scipy.optimize import least_squares as _lsq
+    good = (Fo > 0) & (Fc > 0) & np.isfinite(Fo) & np.isfinite(Fc)
+    if good.sum() < 10:
+        return 1.0, 0.0
+    r, t, ss = Fo[good].astype(np.float64), Fc[good].astype(np.float64), s2[good].astype(np.float64)
+    k0 = float(np.dot(r, t) / np.dot(t, t))
+    params = np.array([np.log(max(k0, 1e-10)), 0.0])
+
+    def _scale_fn(p):
+        return np.exp(p[0]) * np.exp(-p[1] / 4.0 * ss)
+
+    for _ in range(n_cycles):
+        try:
+            res = _lsq(lambda p: r - _scale_fn(p) * t, params, method='lm', max_nfev=200)
+            params = res.x
+        except Exception:
+            break
+
+    return float(np.exp(params[0])), float(params[1])
 
 
-def _rfactor(Fo, Fc, k):
-    num = float(np.sum(np.abs(Fo - k * Fc)))
+def _apply_scale(Fc, k, B, s2):
+    return k * Fc * np.exp(-B / 4 * s2)
+
+
+def _rfactor(Fo, Fc_scaled):
+    num = float(np.sum(np.abs(Fo - Fc_scaled)))
     den = float(np.sum(np.abs(Fo)))
     return num / den if den > 0 else float('nan')
 
@@ -77,6 +101,12 @@ def main():
     L    = np.asarray(mtz.column_with_label('L'),          dtype=np.int32)
     Fo   = np.asarray(mtz.column_with_label('F'),          dtype=np.float32)
     free = np.asarray(mtz.column_with_label('FreeR_flag'), dtype=np.float32)
+
+    # s² = 1/d² for each reflection
+    cell = mtz.cell
+    s2 = np.array([cell.calculate_1_d2([h, k, l])
+                   for h, k, l in zip(H.tolist(), K.tolist(), L.tolist())],
+                  dtype=np.float32)
 
     # CCP4 uniqueify convention: flag==0 → FREE, flag!=0 → WORK
     obs    = np.isfinite(Fo) & (Fo > 0)   # measured reflections
@@ -108,23 +138,24 @@ def main():
         sources['truth'] = _extract(ft_truth, H, K, L)
 
     print()
-    header = f'{"":14s}  {"R_work":>8s}  {"R_free":>8s}  {"R_miss":>8s}  scale'
+    header = f'{"":14s}  {"R_work":>8s}  {"R_free":>8s}  {"R_miss":>8s}  {"k":>7s}  {"B":>7s}'
     print(header)
     print('-' * len(header))
 
     for label, Fc in sources.items():
-        k = _scale(Fo[work], Fc[work])
-        r_work = _rfactor(Fo[work],  Fc[work],  k)
-        r_free = _rfactor(Fo[free_m], Fc[free_m], k)
-        # For withheld reflections, we have no Fo — compare Fc_source against Fc_fc as proxy
-        # Instead report Fc amplitude ratio: mean |Fc_pred| / mean |Fc_fc| in missing region
+        k, B = _scale_kb(Fo[work], Fc[work], s2[work])
+        Fc_sw = _apply_scale(Fc[work],   k, B, s2[work])
+        Fc_sf = _apply_scale(Fc[free_m], k, B, s2[free_m])
+        r_work = _rfactor(Fo[work],   Fc_sw)
+        r_free = _rfactor(Fo[free_m], Fc_sf)
         if n_miss > 0 and 'truth' in sources:
             Fo_miss_proxy = sources['truth'][miss]
-            r_miss = _rfactor(Fo_miss_proxy, Fc[miss], k)
+            Fc_sm = _apply_scale(Fc[miss], k, B, s2[miss])
+            r_miss = _rfactor(Fo_miss_proxy, Fc_sm)
         else:
             r_miss = float('nan')
         miss_str = f'{r_miss:.4f}' if np.isfinite(r_miss) else '  n/a '
-        print(f'{label:14s}  {r_work:.4f}    {r_free:.4f}    {miss_str}    {k:.4f}')
+        print(f'{label:14s}  {r_work:.4f}    {r_free:.4f}    {miss_str}    {k:.4f}  {B:+.2f}')
 
 
 if __name__ == '__main__':
