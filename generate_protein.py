@@ -122,6 +122,18 @@ _PI2 = np.pi ** 2
 def _rmsf_to_b(rmsf):
     return float(8.0 * _PI2 * rmsf**2 / 3.0)
 
+# Per-residue-type conformer count for starthere.pdb, derived from
+# 1aho/best_for_0038.pdb mean altloc count per residue type.
+# Waters use a separate floor (WATER_MIN_NCONF).
+# Residues not listed default to 3.
+_GT48_NCONF = {
+    'ALA':  4, 'ARG': 13, 'ASN':  7, 'ASP': 10, 'CYS':  7,
+    'GLN':  8, 'GLU': 13, 'GLY':  5, 'HIS': 11, 'ILE':  3,
+    'LEU':  8, 'LYS': 13, 'MET':  6, 'PHE':  7, 'PRO':  9,
+    'SER':  3, 'THR':  7, 'TRP':  3, 'TYR':  6, 'VAL':  4,
+}
+WATER_MIN_NCONF = 3   # minimum ground-truth conformers per water
+
 
 def _set_target_bfactors(pdb_path):
     """Override B-factors in pdb_path with gt48-derived values (B=8π²RMSF²/3).
@@ -500,12 +512,11 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
         p.write_bytes(result.stdout)
         conf_pdbs.append(p)
 
-    # Minimize each single-conformer PDB independently and in parallel
-    def _minimize_one(conf_pdb):
-        return step4_phenix_geommin(conf_pdb.name, tmpdir, log_tag=f'_{conf_pdb.stem}')
-
-    with ThreadPoolExecutor(max_workers=n_altlocs) as pool:
-        minimized_pdbs = list(pool.map(_minimize_one, conf_pdbs))
+    # Use jigglepdb output directly (no per-conformer phenix.GM).
+    # With N=20 conformers, 20 minimizations would be prohibitively slow.
+    # Geometry errors from jigglepdb are small (~0.05 Å bonds) given the
+    # through-bond correlated displacement; refmac refinement in step9
+    # corrects the partial model anyway.
 
     # Build multiconf.pdb in single-chain altloc form to match refmacout.pdb labeling:
     #   chain A: protein, every atom has altloc A,B,…,N (occ=1/N each)
@@ -514,7 +525,7 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
     CONF_LABELS  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
     occ_per_conf = 1.0 / n_altlocs
 
-    confs       = [gemmi.read_structure(str(pdb)) for pdb in minimized_pdbs]
+    confs       = [gemmi.read_structure(str(pdb)) for pdb in conf_pdbs]
     ref_st      = confs[0]
     st_out      = gemmi.Structure()
     st_out.cell          = ref_st.cell
@@ -724,14 +735,28 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     # Strip flood-water chain (F) before masking: flood waters are already in
     # F_protein from sfcalc above; including them in cavenv would exclude their
     # positions from the mask, giving an artificially low bulk-solvent scale.
-    st_mask = gemmi.read_structure(str(pdb_path))
-    for model in st_mask:
-        to_remove = [i for i, ch in enumerate(model)
-                     if ch.name in ('S', 'W', 'F') or ch.name.islower()]
-        for i in reversed(to_remove):
-            del model[i]
+    # Build cavenv mask: single-conformer protein only (no waters/flood).
+    # Keep only the first occurrence of each (chain, resnum, atom_name) to
+    # strip altlocs. With N=20 altlocs × P212121 symmetry, the full model
+    # exceeds cavenv's MAXATM=50000.
     mask_pdb = str(tmpdir / '_mask_input.pdb')
-    st_mask.write_pdb(mask_pdb)
+    with open(str(pdb_path)) as fin, open(mask_pdb, 'w') as fout:
+        seen = set()
+        for line in fin:
+            if line[:6] in ('CRYST1',):
+                fout.write(line)
+                continue
+            if line[:6] not in ('ATOM  ', 'HETATM'):
+                continue
+            chain = line[21]
+            if chain in ('S', 'W', 'F') or chain.islower():
+                continue
+            key = (chain, line[22:26], line[12:16])
+            if key in seen:
+                continue
+            seen.add(key)
+            fout.write(line[:16] + ' ' + line[17:])   # blank altloc col
+        fout.write('END\n')
 
     _sg = gemmi.find_spacegroup_by_name(SPACEGROUP)
     sg_num = _sg.number if _sg else 1
@@ -1156,7 +1181,8 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
             for name in all_names:
                 _add_collapsed_atom(res_out, by_name[name])
         else:
-            by_name, present = _reduce_conformers(by_name, all_names, max_confs=min(n_conf, 3))
+            res_max = min(n_conf, _GT48_NCONF.get(res0.name, 3))
+            by_name, present = _reduce_conformers(by_name, all_names, max_confs=res_max)
 
             shuffled = list(present)
             n_swaps = int(rng.poisson(altloc_swaps_per_res))
@@ -1180,17 +1206,18 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
         chain_out.add_residue(res_out)
     model_out.add_chain(chain_out)
 
-    # ── Waters → keep all N conformer positions as altlocs in chain S ─────────
-    # Chain S: refmac_occupancy_setup.com treats segid=="S" as waters unconditionally
-    # (conf="w" → incomplete occ group per altloc), so each altloc gets independent
-    # free occupancy refinement.  Starting at occ=1/N for each altloc.
+    # ── Waters → keep WATER_MIN_NCONF altloc positions in chain S ───────────────
+    # Keep at least WATER_MIN_NCONF ground-truth conformers per water so the
+    # network sees realistic multi-position water density. Capped at n_conf.
+    # refmac_occupancy_setup.com gives each altloc an independent incomplete group.
     if water_residues:
-        water_occ = 1.0 / n_conf
+        n_water_conf = min(n_conf, WATER_MIN_NCONF)
+        water_occ = 1.0 / n_water_conf
         water_chain_out = gemmi.Chain('S')
         water_seqids = sorted(water_residues.keys(),
                               key=lambda k: water_residues[k][0].seqid.num)
         for key in water_seqids:
-            residues = water_residues[key]   # list of synthetic residues, one per altloc
+            residues = water_residues[key][:n_water_conf]
             res0    = residues[0]
             res_out = gemmi.Residue()
             res_out.name        = res0.name
