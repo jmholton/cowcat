@@ -93,6 +93,49 @@ BFAC_SC_SIGMA = 0.7
 BFAC_SC_MIN   = 5.0
 BFAC_SC_MAX   = 120.0
 
+# Per-atom RMSF (Å) derived from 1AHO/gt48.pdb (49 conformers).
+# Used by _set_target_bfactors() to override B = 8π²·RMSF²/3 before jigglepdb.
+# Atoms not listed fall back to the self-refined B factor.
+_GT48_RMSF = {
+    ('ALA','N'):0.355,('ALA','CA'):0.380,('ALA','C'):0.333,('ALA','O'):0.412,('ALA','CB'):0.498,
+    ('ARG','N'):0.407,('ARG','CA'):0.412,('ARG','C'):0.363,('ARG','O'):0.455,('ARG','CB'):0.545,('ARG','CG'):0.757,('ARG','CD'):0.995,('ARG','NE'):1.332,('ARG','CZ'):1.643,('ARG','NH1'):1.878,('ARG','NH2'):2.277,
+    ('ASN','N'):0.336,('ASN','CA'):0.327,('ASN','C'):0.320,('ASN','O'):0.395,('ASN','CB'):0.385,('ASN','CG'):0.392,('ASN','OD1'):0.467,('ASN','ND2'):0.514,
+    ('ASP','N'):0.400,('ASP','CA'):0.428,('ASP','C'):0.418,('ASP','O'):0.548,('ASP','CB'):0.539,('ASP','CG'):0.823,('ASP','OD1'):1.060,('ASP','OD2'):1.069,
+    ('CYS','N'):0.288,('CYS','CA'):0.277,('CYS','C'):0.270,('CYS','O'):0.360,('CYS','CB'):0.310,('CYS','SG'):0.423,
+    ('GLN','N'):0.229,('GLN','CA'):0.262,('GLN','C'):0.258,('GLN','O'):0.336,('GLN','CB'):0.318,('GLN','CG'):0.397,('GLN','CD'):0.437,('GLN','OE1'):0.518,('GLN','NE2'):0.549,
+    ('GLU','N'):0.334,('GLU','CA'):0.368,('GLU','C'):0.341,('GLU','O'):0.426,('GLU','CB'):0.450,('GLU','CG'):0.837,('GLU','CD'):1.014,('GLU','OE1'):1.413,('GLU','OE2'):1.717,
+    ('GLY','N'):0.342,('GLY','CA'):0.389,('GLY','C'):0.347,('GLY','O'):0.540,
+    ('HIS','N'):0.358,('HIS','CA'):0.380,('HIS','C'):0.374,('HIS','O'):0.533,('HIS','CB'):0.433,('HIS','CG'):0.503,('HIS','ND1'):1.010,('HIS','CD2'):0.813,('HIS','CE1'):0.994,('HIS','NE2'):0.744,
+    ('ILE','N'):0.269,('ILE','CA'):0.284,('ILE','C'):0.276,('ILE','O'):0.302,('ILE','CB'):0.304,('ILE','CG1'):0.324,('ILE','CG2'):0.389,('ILE','CD1'):0.411,
+    ('LEU','N'):0.352,('LEU','CA'):0.348,('LEU','C'):0.354,('LEU','O'):0.435,('LEU','CB'):0.385,('LEU','CG'):0.422,('LEU','CD1'):0.572,('LEU','CD2'):0.596,
+    ('LYS','N'):0.345,('LYS','CA'):0.371,('LYS','C'):0.357,('LYS','O'):0.471,('LYS','CB'):0.468,('LYS','CG'):0.598,('LYS','CD'):0.762,('LYS','CE'):0.860,('LYS','NZ'):1.209,
+    ('MET','N'):0.340,('MET','CA'):0.360,('MET','C'):0.340,('MET','O'):0.440,('MET','CB'):0.440,('MET','CG'):0.600,('MET','SD'):0.900,('MET','CE'):1.100,
+    ('PHE','N'):0.302,('PHE','CA'):0.308,('PHE','C'):0.281,('PHE','O'):0.401,('PHE','CB'):0.416,('PHE','CG'):0.470,('PHE','CD1'):0.559,('PHE','CD2'):0.560,('PHE','CE1'):0.677,('PHE','CE2'):0.675,('PHE','CZ'):0.732,
+    ('PRO','N'):0.310,('PRO','CA'):0.353,('PRO','C'):0.325,('PRO','O'):0.406,('PRO','CB'):0.470,('PRO','CG'):0.526,('PRO','CD'):0.404,
+    ('SER','N'):0.352,('SER','CA'):0.325,('SER','C'):0.306,('SER','O'):0.358,('SER','CB'):0.342,('SER','OG'):0.367,
+    ('THR','N'):0.298,('THR','CA'):0.303,('THR','C'):0.298,('THR','O'):0.373,('THR','CB'):0.373,('THR','OG1'):0.497,('THR','CG2'):0.603,
+    ('TRP','N'):0.354,('TRP','CA'):0.382,('TRP','C'):0.376,('TRP','O'):0.418,('TRP','CB'):0.469,('TRP','CG'):0.470,('TRP','CD1'):0.535,('TRP','CD2'):0.482,('TRP','NE1'):0.548,('TRP','CE2'):0.517,('TRP','CE3'):0.541,('TRP','CZ2'):0.574,('TRP','CZ3'):0.605,('TRP','CH2'):0.614,
+    ('TYR','N'):0.277,('TYR','CA'):0.277,('TYR','C'):0.263,('TYR','O'):0.350,('TYR','CB'):0.341,('TYR','CG'):0.329,('TYR','CD1'):0.387,('TYR','CD2'):0.399,('TYR','CE1'):0.447,('TYR','CE2'):0.461,('TYR','CZ'):0.454,('TYR','OH'):0.585,
+    ('VAL','N'):0.403,('VAL','CA'):0.380,('VAL','C'):0.375,('VAL','O'):0.486,('VAL','CB'):0.458,('VAL','CG1'):0.556,('VAL','CG2'):0.582,
+}
+_PI2 = np.pi ** 2
+def _rmsf_to_b(rmsf):
+    return float(8.0 * _PI2 * rmsf**2 / 3.0)
+
+
+def _set_target_bfactors(pdb_path):
+    """Override B-factors in pdb_path with gt48-derived values (B=8π²RMSF²/3).
+    Atoms not in the lookup table keep their existing B-factor.
+    Writes the modified structure back in place."""
+    st = gemmi.read_structure(str(pdb_path))
+    for chain in st[0]:
+        for res in chain:
+            for atom in res:
+                key = (res.name, atom.name)
+                if key in _GT48_RMSF:
+                    atom.b_iso = _rmsf_to_b(_GT48_RMSF[key])
+    st.write_pdb(str(pdb_path))
+
 # Altloc displacement threshold (Å): side chains further than this
 # from their centroid stay as separate altloc atoms in the partial model
 ALTLOC_DIST_THRESHOLD = 0.0
@@ -1509,11 +1552,15 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         t = _t('geo_clash_check', t)
 
         # 4b: Self-refine B factors (20 refmac cycles against own SFs)
-        #     Gives chemically correlated B factors before jigglepdb
+        #     Gives chemically correlated coordinates before jigglepdb
         selfref_pdb = step4b_selfref_b_factors(minimized_pdb, tmpdir)
         t = _t('selfref_bfac', t)
 
-        # 5: jigglepdb using refined B factors → N full chains in multiconf.pdb
+        # 4c: Override B factors with per-atom gt48-derived target values so
+        #     jigglepdb displacements match real 1AHO conformer fluctuations.
+        _set_target_bfactors(selfref_pdb)
+
+        # 5: jigglepdb using target B factors → N full chains in multiconf.pdb
         step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng,
                                   shift_scale=shift_scale, n_altlocs=n_altlocs)
         t = _t('jiggle_and_merge', t)
