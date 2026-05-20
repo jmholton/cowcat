@@ -23,7 +23,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from dataset import make_splits, make_splits_multi
 from model import UNet3D, count_parameters
@@ -37,16 +40,19 @@ from model import UNet3D, count_parameters
 # Training / validation loops
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_steps=1):
+def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_steps=1,
+              world_size=1):
     """Single train or eval pass. Pass optimizer=None for eval.
 
     accum_steps: accumulate gradients over this many batches before stepping,
     simulating a larger effective batch size without extra GPU memory.
+    world_size: number of DDP ranks; results are all-reduced across ranks.
     """
     training = optimizer is not None
     model.train(training)
     total_mse  = 0.0
     total_yss  = 0.0  # sum of mean(y²) * n, for dataset-level RMSD
+    total_n    = 0    # local sample count (DistributedSampler shards the dataset)
 
     with torch.set_grad_enabled(training):
         if training:
@@ -64,13 +70,19 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
                     optimizer.zero_grad()
 
             n = x.size(0)
+            total_n   += n
             total_mse += loss.item() * n
             with torch.no_grad():
-                total_yss += (y ** 2).mean().item() * n
+                truth = y + x[:, 2:3]   # fc is input channel 2
+                total_yss += (truth ** 2).mean().item() * n
 
-    n_total = len(loader.dataset)
-    mse  = total_mse / n_total
-    rmsd = (total_yss / n_total) ** 0.5   # RMS of true map (e/Å³)
+    if world_size > 1:
+        t = torch.tensor([total_mse, total_yss, float(total_n)], device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        total_mse, total_yss, total_n = t[0].item(), t[1].item(), int(t[2].item())
+
+    mse  = total_mse / total_n
+    rmsd = (total_yss / total_n) ** 0.5   # RMS of truth map (e/Å³)
     Rrms = mse**0.5 / rmsd if rmsd > 0 else float('nan')
     return mse, Rrms
 
@@ -110,63 +122,90 @@ def main():
                              'batch size = batch-size * accum-steps.')
     args = parser.parse_args()
 
-    # ── Log file (train_<suffix>.log beside the script) ───────────────────────
-    _suffix  = Path(args.outdir).name.replace('checkpoints_', '', 1)
-    _logpath = Path(__file__).parent / f'train_{_suffix}.log'
+    # ── DDP setup (torchrun sets LOCAL_RANK / WORLD_SIZE) ─────────────────────
+    local_rank = int(os.environ.get('LOCAL_RANK', -1))
+    is_ddp     = local_rank >= 0
+    if is_ddp:
+        dist.init_process_group('nccl')
+        rank       = dist.get_rank()
+        world_size = dist.get_world_size()
+        device     = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
+    else:
+        rank       = 0
+        world_size = 1
+        device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    is_rank0 = (rank == 0)
+    n_gpus   = torch.cuda.device_count() if device.type == 'cuda' else 0
 
-    class _Tee:
-        def __init__(self, *streams): self.streams = streams
-        def write(self, data):
-            for s in self.streams: s.write(data)
-        def flush(self):
-            for s in self.streams: s.flush()
+    # ── Log file (train_<suffix>.log beside the script) — rank 0 only ─────────
+    if is_rank0:
+        _suffix  = Path(args.outdir).name.replace('checkpoints_', '', 1)
+        _logpath = Path(__file__).parent / f'train_{_suffix}.log'
 
-    if _logpath.exists():
-        _logpath.rename(_logpath.with_suffix('.log.bak'))
-    _lf = open(_logpath, 'w')
-    sys.stdout = _Tee(sys.__stdout__, _lf)
-    sys.stderr = _Tee(sys.__stderr__, _lf)
-    print(f'Logging to {_logpath}')
+        class _Tee:
+            def __init__(self, *streams): self.streams = streams
+            def write(self, data):
+                for s in self.streams: s.write(data)
+            def flush(self):
+                for s in self.streams: s.flush()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    n_gpus = torch.cuda.device_count() if device.type == 'cuda' else 0
-    print(f'Device: {device}  GPUs: {n_gpus}')
+        if _logpath.exists():
+            _logpath.rename(_logpath.with_suffix('.log.bak'))
+        _lf = open(_logpath, 'w')
+        sys.stdout = _Tee(sys.__stdout__, _lf)
+        sys.stderr = _Tee(sys.__stderr__, _lf)
+        print(f'Logging to {_logpath}')
+        print(f'Device: {device}  GPUs: {n_gpus}  DDP: {is_ddp}  world_size: {world_size}')
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    import time as _time
-    print('Data files:')
-    for d in args.data:
-        for fname in ('X.npy', 'Y.npy', 'S.npy'):
-            p = os.path.join(d, fname)
-            if os.path.exists(p):
-                mtime = _time.strftime('%Y-%m-%d %H:%M:%S', _time.localtime(os.path.getmtime(p)))
-                size  = os.path.getsize(p)
-                print(f'  {p}  {size:>12,d} bytes  mtime={mtime}')
-            else:
-                print(f'  {p}  MISSING')
+    if is_rank0:
+        import time as _time
+        print('Data files:')
+        for d in args.data:
+            for fname in ('X.npy', 'Y.npy', 'S.npy'):
+                p = os.path.join(d, fname)
+                if os.path.exists(p):
+                    mtime = _time.strftime('%Y-%m-%d %H:%M:%S', _time.localtime(os.path.getmtime(p)))
+                    size  = os.path.getsize(p)
+                    print(f'  {p}  {size:>12,d} bytes  mtime={mtime}')
+                else:
+                    print(f'  {p}  MISSING')
     train_ds, val_ds = make_splits_multi(args.data, val_fraction=args.val_frac)
-    print(f'Train: {len(train_ds)}  Val: {len(val_ds)}')
+    if is_rank0:
+        print(f'Train: {len(train_ds)}  Val: {len(val_ds)}')
 
-    # pin_memory causes deadlock with DataParallel + forked workers
-    pin = (device.type == 'cuda') and n_gpus <= 1
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True,  num_workers=args.workers,
-                              pin_memory=pin)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
-                              shuffle=False, num_workers=args.workers,
-                              pin_memory=pin)
+    if is_ddp:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
+        train_loader  = DataLoader(train_ds, batch_size=args.batch_size,
+                                   sampler=train_sampler, num_workers=args.workers, pin_memory=True)
+        val_loader    = DataLoader(val_ds,   batch_size=args.batch_size,
+                                   sampler=val_sampler,   num_workers=args.workers, pin_memory=True)
+    else:
+        # pin_memory causes deadlock with DataParallel + forked workers
+        pin          = (device.type == 'cuda') and n_gpus <= 1
+        train_sampler = None
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                  shuffle=True,  num_workers=args.workers, pin_memory=pin)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+                                  shuffle=False, num_workers=args.workers, pin_memory=pin)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     in_channels = 4
     model = UNet3D(in_channels=in_channels, out_channels=1,
                    base_features=args.base_features).to(device)
     raw_model = model
-    if n_gpus > 1:
+    if is_ddp:
+        # find_unused_parameters=True: pred_log_var/pred_log_scale heads have no gradient under MSE loss
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    elif n_gpus > 1:
         model = nn.DataParallel(model)
         args.batch_size *= n_gpus
-    print(f'Parameters: {count_parameters(raw_model):,}  batch_size: {args.batch_size}  '
-          f'accum_steps: {args.accum_steps}  eff_batch: {args.batch_size * args.accum_steps}  '
-          f'in_channels: {in_channels}')
+    if is_rank0:
+        print(f'Parameters: {count_parameters(raw_model):,}  batch_size: {args.batch_size}  '
+              f'accum_steps: {args.accum_steps}  eff_batch: {args.batch_size * args.accum_steps * world_size}  '
+              f'in_channels: {in_channels}')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-4)
@@ -186,57 +225,67 @@ def main():
         start_epoch = ckpt['epoch'] + 1
         best_val    = ckpt.get('best_val', float('inf'))
         log         = ckpt.get('log', [])
-        print(f'Resumed from epoch {ckpt["epoch"]}  best_val={best_val:.5f}')
+        if is_rank0:
+            print(f'Resumed from epoch {ckpt["epoch"]}  best_val={best_val:.5f}')
 
     # ── Pretrain (weights only, optimizer/scheduler reset) ────────────────────
     elif args.pretrain and os.path.exists(args.pretrain):
         ckpt = torch.load(args.pretrain, map_location=device)
         sd   = ckpt['model']
         raw_model.load_state_dict(sd)
-        print(f'Loaded pretrained weights (best_val={ckpt.get("best_val", float("inf")):.5f}), '
-              f'optimizer reset')
+        if is_rank0:
+            print(f'Loaded pretrained weights (best_val={ckpt.get("best_val", float("inf")):.5f}), '
+                  f'optimizer reset')
 
     outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    if is_rank0:
+        outdir.mkdir(parents=True, exist_ok=True)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
+        if is_ddp:
+            train_sampler.set_epoch(epoch)
+
         t0 = time.time()
 
-        train_mse, train_Rrms = run_epoch(model, train_loader, device, optimizer,      args.scale_weight, args.accum_steps)
-        val_mse,   val_Rrms   = run_epoch(model, val_loader,   device, optimizer=None, scale_weight=args.scale_weight)
+        train_mse, train_Rrms = run_epoch(model, train_loader, device, optimizer,
+                                          args.scale_weight, args.accum_steps, world_size)
+        val_mse,   val_Rrms   = run_epoch(model, val_loader,   device, optimizer=None,
+                                          scale_weight=args.scale_weight, world_size=world_size)
         scheduler.step()
 
-        elapsed = time.time() - t0
-        lr_now  = scheduler.get_last_lr()[0]
+        if is_rank0:
+            elapsed = time.time() - t0
+            lr_now  = scheduler.get_last_lr()[0]
 
-        print(f'epoch {epoch:04d}  '
-              f'train= {train_mse:.5f}  val= {val_mse:.5f}  '
-              f'Rrms= {val_Rrms:.4f}  '
-              f'lr= {lr_now:.2e}  t= {elapsed:.1f}s')
+            print(f'epoch {epoch:04d}  '
+                  f'train= {train_mse:.5f}  val= {val_mse:.5f}  '
+                  f'Rrms= {val_Rrms:.4f}  '
+                  f'lr= {lr_now:.2e}  t= {elapsed:.1f}s')
 
-        entry = dict(epoch=epoch, train=round(train_mse, 6),
-                     val=round(val_mse, 6), Rrms=round(val_Rrms, 4), lr=lr_now)
-        log.append(entry)
+            entry = dict(epoch=epoch, train=round(train_mse, 6),
+                         val=round(val_mse, 6), Rrms=round(val_Rrms, 4), lr=lr_now)
+            log.append(entry)
 
-        # Save latest checkpoint
-        ckpt = dict(epoch=epoch, model=raw_model.state_dict(),
-                    optimizer=optimizer.state_dict(),
-                    scheduler=scheduler.state_dict(),
-                    best_val=best_val, log=log)
-        torch.save(ckpt, outdir / 'latest.pt')
+            ckpt = dict(epoch=epoch, model=raw_model.state_dict(),
+                        optimizer=optimizer.state_dict(),
+                        scheduler=scheduler.state_dict(),
+                        best_val=best_val, log=log)
+            torch.save(ckpt, outdir / 'latest.pt')
 
-        # Save best checkpoint
-        if val_mse < best_val:
-            best_val = val_mse
-            torch.save(ckpt, outdir / 'best.pt')
-            print(f'  ↳ new best val={best_val:.5f}')
+            if val_mse < best_val:
+                best_val = val_mse
+                torch.save(ckpt, outdir / 'best.pt')
+                print(f'  ↳ new best val={best_val:.5f}')
 
-        # Write training log as JSON for easy inspection
-        (outdir / 'log.json').write_text(json.dumps(log, indent=2))
+            (outdir / 'log.json').write_text(json.dumps(log, indent=2))
 
-    print(f'Done. Best val MSE: {best_val:.5f}')
-    print(f'Best checkpoint: {outdir / "best.pt"}')
+    if is_rank0:
+        print(f'Done. Best val MSE: {best_val:.5f}')
+        print(f'Best checkpoint: {outdir / "best.pt"}')
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
