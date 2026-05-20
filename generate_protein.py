@@ -419,13 +419,20 @@ def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None):
     return out
 
 
-def step4b_selfref_b_factors(minimized_pdb, tmpdir):
+def step4b_selfref_b_factors(minimized_pdb, tmpdir, target_wilson_b=None,
+                              b_floor=2.0):
     """Refine single-conf model against its own SFs to get realistic B factors.
 
     Runs refmac for 20 cycles with the model as both PDB and (synthetic) data
     source, allowing B-factor restraints to smooth out uncorrelated random B
     values into physically sensible, bonding-correlated ones.  The refined
     coordinate file is returned; its B factors are used by jigglepdb byB.
+
+    target_wilson_b: if given, measure Wilson B of refined FC and subtract a
+    constant offset from every atom's B-factor so the model's overall Wilson B
+    matches target.  Preserves all per-atom B-factor correlations (only the
+    overall level shifts).  Useful for matching real-data resolution falloff.
+    b_floor: minimum B-factor after offset subtraction (default 2.0 Å²).
     """
     # Calculate SFs for the minimised model (no bulk solvent needed for selfref)
     step6_sfcalc(minimized_pdb, tmpdir / 'selfref.mtz', tmpdir, bulk_solvent=False)
@@ -462,6 +469,28 @@ def step4b_selfref_b_factors(minimized_pdb, tmpdir):
     out = tmpdir / 'selfref_out.pdb'
     if not out.exists():
         raise RuntimeError('selfref_out.pdb not found after self-refinement')
+
+    # Optional: shift overall B-factor level to match a target Wilson B
+    if target_wilson_b is not None:
+        mtz = gemmi.read_mtz_file(str(tmpdir / 'selfref_out.mtz'))
+        h = np.asarray(mtz.column_with_label('H'),  dtype=np.int32)
+        k = np.asarray(mtz.column_with_label('K'),  dtype=np.int32)
+        l = np.asarray(mtz.column_with_label('L'),  dtype=np.int32)
+        F = np.asarray(mtz.column_with_label('FC'), dtype=np.float32)
+        cell = mtz.cell
+        s2 = np.array([cell.calculate_1_d2([int(h_), int(k_), int(l_)])
+                       for h_, k_, l_ in zip(h, k, l)], dtype=np.float64)
+        gen_B   = _wilson_b(F, s2)
+        delta_B = gen_B - target_wilson_b   # subtract this from every atom's B
+        st = gemmi.read_structure(str(out))
+        for chain in st[0]:
+            for res in chain:
+                for atom in res:
+                    atom.b_iso = max(b_floor, atom.b_iso - delta_B)
+        st.write_pdb(str(out))
+        print(f'    selfref Wilson B: {gen_B:.2f} → target {target_wilson_b:.2f}, '
+              f'B-factor shift = {-delta_B:+.2f} Å²')
+
     return out
 
 
@@ -483,13 +512,22 @@ def _apply_flood_signs(pdb_path, rng):
     st.write_pdb(str(pdb_path))
 
 
-def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlocs=2):
-    """Run jigglepdb n_altlocs times, minimize each conformer independently in
+def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlocs=2,
+                              per_conf_geommin=False, bfac_source_pdb=None,
+                              add_h_per_conf=True):
+    """Run jigglepdb n_altlocs times, optionally minimize each conformer in
     parallel, then combine → multiconf.pdb with N protein chains (A, B, … occ=1/N)
     and N water chains (a, b, … occ=1/N).
 
-    Each jigglepdb output is a single-conformer PDB, so phenix.geometry_minimization
-    runs without altloc complexity and all n_altlocs jobs run concurrently.
+    per_conf_geommin: if True, run phenix.geometry_minimization on each conformer
+    (slow with large N — ~13s × n_altlocs). If False, use raw jigglepdb output.
+    bfac_source_pdb: if given, replace B-factors in merged output with values
+    looked up by (chain, resnum, atom_name) from this PDB. Used to restore
+    selfref B-factors after jigglepdb has used gt48 target B-factors for
+    displacement amplitude.
+    add_h_per_conf: if True, run phenix.reduce on each conformer PDB in parallel
+    after geommin so the merged multiconf.pdb already contains hydrogens (saves
+    a slow ~5-minute reduce call on the full 20-altloc model downstream).
     """
     labels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[:n_altlocs]
     seeds  = [int(rng.integers(1000, 99999)) for _ in range(n_altlocs)]
@@ -512,11 +550,34 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
         p.write_bytes(result.stdout)
         conf_pdbs.append(p)
 
-    # Use jigglepdb output directly (no per-conformer phenix.GM).
-    # With N=20 conformers, 20 minimizations would be prohibitively slow.
+    if per_conf_geommin:
+        # Minimize each single-conformer PDB independently and in parallel.
+        def _minimize_one(conf_pdb):
+            return step4_phenix_geommin(conf_pdb.name, tmpdir, log_tag=f'_{conf_pdb.stem}')
+        with ThreadPoolExecutor(max_workers=n_altlocs) as pool:
+            conf_pdbs = list(pool.map(_minimize_one, conf_pdbs))
+    # else: use jigglepdb output directly (no per-conformer phenix.GM).
     # Geometry errors from jigglepdb are small (~0.05 Å bonds) given the
     # through-bond correlated displacement; refmac refinement in step9
     # corrects the partial model anyway.
+
+    if add_h_per_conf:
+        # phenix.reduce on each single-conformer PDB in parallel. Each call is
+        # cheap (~1000 atoms), and 20-way concurrency keeps wall time ≈ 1 reduce
+        # call. Replaces the slow single-call reduce on the merged 21K-atom model.
+        def _reduce_one(conf_pdb):
+            res = subprocess.run(
+                [str(PHENIX_GM.parent / 'phenix.reduce'), str(conf_pdb)],
+                cwd=str(tmpdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            if res.returncode not in (0, 1):
+                raise RuntimeError(f'phenix.reduce failed on {conf_pdb.name}:\n'
+                                   f'{res.stderr.decode(errors="replace")[-1000:]}')
+            out = tmpdir / f'{conf_pdb.stem}_H.pdb'
+            out.write_bytes(res.stdout)
+            return out
+        with ThreadPoolExecutor(max_workers=n_altlocs) as pool:
+            conf_pdbs = list(pool.map(_reduce_one, conf_pdbs))
 
     # Build multiconf.pdb in single-chain altloc form to match refmacout.pdb labeling:
     #   chain A: protein, every atom has altloc A,B,…,N (occ=1/N each)
@@ -524,6 +585,15 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
     # sfcalc sums altloc atoms with their occupancies. Flood waters added later as chain F.
     CONF_LABELS  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
     occ_per_conf = 1.0 / n_altlocs
+
+    # Optional B-factor lookup: (chain, seqid_num, atom_name) → b_iso from source PDB
+    bfac_lookup = {}
+    if bfac_source_pdb is not None:
+        src_st = gemmi.read_structure(str(bfac_source_pdb))
+        for chain in src_st[0]:
+            for res in chain:
+                for atom in res:
+                    bfac_lookup[(chain.name, res.seqid.num, atom.name)] = atom.b_iso
 
     confs       = [gemmi.read_structure(str(pdb)) for pdb in conf_pdbs]
     ref_st      = confs[0]
@@ -555,7 +625,9 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
                     a_new.name    = atom.name
                     a_new.element = atom.element
                     a_new.pos     = atom.pos
-                    a_new.b_iso   = atom.b_iso
+                    a_new.b_iso   = bfac_lookup.get(
+                        (in_chain_name, ref_res.seqid.num, atom.name),
+                        atom.b_iso)
                     a_new.occ     = occ_per_conf
                     a_new.altloc  = CONF_LABELS[ci]
                     res_out.add_atom(a_new)
@@ -700,12 +772,190 @@ def _merge_altconfs(conf_pdbs, out_pdb, rng=None, flood_occ=None):
     st_out.write_pdb(str(out_pdb))
 
 
+# ── Wilson B reference (cached) ─────────────────────────────────────────────
+REF_WILSON_MTZ = SCRIPT_DIR / '1aho' / '1aho.mtz'
+_REF_WILSON_B  = None  # cached after first call
+
+
+def _wilson_b(F, s2, n_bins=20, min_per_bin=10):
+    """Wilson B from |F| and s²=1/d² arrays.
+
+    Linear fit of log(<F²>) vs s² in resolution bins.
+    Slope = -B/2  →  B = -2·slope.  Returns 0.0 if too few valid bins.
+    """
+    valid = (F > 0) & np.isfinite(F) & np.isfinite(s2)
+    F  = F[valid].astype(np.float64)
+    s2 = s2[valid].astype(np.float64)
+    if s2.size < min_per_bin * 3:
+        return 0.0
+    edges = np.linspace(s2.min(), s2.max(), n_bins + 1)
+    xs, ys = [], []
+    for i in range(n_bins):
+        m = (s2 >= edges[i]) & (s2 < edges[i + 1])
+        if m.sum() < min_per_bin:
+            continue
+        xs.append(float(s2[m].mean()))
+        ys.append(float(np.log((F[m] ** 2).mean())))
+    if len(xs) < 3:
+        return 0.0
+    slope, _ = np.polyfit(xs, ys, 1)
+    return -2.0 * float(slope)
+
+
+def _reference_wilson_b():
+    """Compute Wilson B of REF_WILSON_MTZ (1aho FP) once; cache result."""
+    global _REF_WILSON_B
+    if _REF_WILSON_B is None and REF_WILSON_MTZ.exists():
+        mtz = gemmi.read_mtz_file(str(REF_WILSON_MTZ))
+        h = np.asarray(mtz.column_with_label('H'),   dtype=np.int32)
+        k = np.asarray(mtz.column_with_label('K'),   dtype=np.int32)
+        l = np.asarray(mtz.column_with_label('L'),   dtype=np.int32)
+        F = np.asarray(mtz.column_with_label('FP'),  dtype=np.float32)
+        cell = mtz.cell
+        s2 = np.array([cell.calculate_1_d2([int(h_), int(k_), int(l_)])
+                       for h_, k_, l_ in zip(h, k, l)], dtype=np.float64)
+        _REF_WILSON_B = _wilson_b(F, s2)
+    return _REF_WILSON_B
+
+
+def _split_pdb_by_b_n_ways(pdb_path, n_chunks, out_paths):
+    """Sort atoms by B-factor then split into n_chunks contiguous bins.
+
+    Chunk 0 has the n/N lowest-B atoms; chunk N-1 has the n/N highest.
+    Returns a list of (b_min, b_max) per chunk.
+
+    Header lines copied into every sub-PDB are restricted to CRYST1/SCALE/
+    SSBOND/LINK only.  TER/END/MODEL/ENDMDL/USER MOD records would terminate
+    gemmi's model parser before the atoms are read, so they are dropped here
+    and a single END is written after the atom block.
+    """
+    HEADER_RECS = ('CRYST1', 'SCALE1', 'SCALE2', 'SCALE3', 'SSBOND', 'LINK  ')
+    headers = []
+    atoms   = []
+    with open(str(pdb_path)) as fin:
+        for line in fin:
+            rec6 = line[:6]
+            if rec6 in ('ATOM  ', 'HETATM'):
+                try:
+                    b = float(line[60:66])
+                except ValueError:
+                    b = 0.0
+                atoms.append((b, line))
+            elif rec6 in HEADER_RECS:
+                headers.append(line)
+    atoms.sort(key=lambda x: x[0])
+    n = len(atoms)
+    b_ranges = []
+    for i, path in enumerate(out_paths):
+        start = i * n // n_chunks
+        end   = (i + 1) * n // n_chunks
+        slab  = atoms[start:end]
+        with open(str(path), 'w') as fout:
+            for h in headers:
+                fout.write(h)
+            for _, a in slab:
+                fout.write(a)
+            fout.write('END\n')
+        if slab:
+            b_ranges.append((slab[0][0], slab[-1][0]))
+        else:
+            b_ranges.append((0.0, 0.0))
+    return b_ranges
+
+
+def _rate_for_bmin(b_min, safety=1.37):
+    """Coarsest gemmi --rate that keeps σ_min ≥ pixel/safety (no aliasing).
+
+    σ_min = sqrt(b_min / 8π²);  pixel = dmin / (2·rate)
+    Require pixel ≤ safety·σ_min  →  rate ≥ dmin / (2·safety·σ_min)
+    """
+    if b_min <= 0:
+        return 1.5
+    sigma = (b_min / (8.0 * np.pi ** 2)) ** 0.5
+    return max(0.5, DMIN / (2.0 * safety * sigma))
+
+
+def _sfcalc_parallel(pdb_path, mtz_out, tmpdir, n_workers=20):
+    """N-way parallel gemmi sfcalc: sort atoms by B, split into bins, run
+    concurrent sfcalc with per-bin grid rate, sum complex F values.
+
+    Lowest-B bins need fine grid (rate~1.5); highest-B bins can use coarse
+    grid (rate~0.5–1.0).  Wall time is bounded by the slowest (lowest-B) bin.
+    """
+    sub_pdbs = [tmpdir / f'_sub_{i:02d}.pdb' for i in range(n_workers)]
+    sub_mtzs = [tmpdir / f'_sub_{i:02d}.mtz' for i in range(n_workers)]
+    b_ranges = _split_pdb_by_b_n_ways(pdb_path, n_workers, sub_pdbs)
+    # Use same fine rate everywhere so all chunks produce identical HKL sets;
+    # we get the parallel speedup (if any) without the high-res merge headache.
+    rates    = [1.5 for _ in b_ranges]
+    import time as _time
+    _t_par_start = _time.time()
+
+    def _one(i):
+        run(['gemmi', 'sfcalc', f'--dmin={DMIN}', f'--rate={rates[i]}',
+             f'--to-mtz={sub_mtzs[i].name}', str(sub_pdbs[i])], cwd=tmpdir)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(_one, range(n_workers)))
+    print(f'    sfcalc {n_workers}x parallel wall time: {_time.time() - _t_par_start:.1f}s')
+
+    def _hkl_key(h, k, l):
+        return (h.astype(np.int64) << 42) | \
+               ((k.astype(np.int64) & 0x1FFFFF) << 21) | \
+               (l.astype(np.int64) & 0x1FFFFF)
+
+    # Pick chunk with the most HKLs (finest grid) as reference HKL set.
+    # Coarse-grid chunks may have fewer HKLs (no high-res); they contribute
+    # only at HKLs they share with the reference (zero elsewhere).
+    chunk_mtzs = [gemmi.read_mtz_file(str(p)) for p in sub_mtzs]
+    sizes      = [len(np.asarray(m.column_with_label('H'))) for m in chunk_mtzs]
+    ref_idx    = int(np.argmax(sizes))
+    m0         = chunk_mtzs[ref_idx]
+    h0 = np.asarray(m0.column_with_label('H'), dtype=np.int32)
+    k0 = np.asarray(m0.column_with_label('K'), dtype=np.int32)
+    l0 = np.asarray(m0.column_with_label('L'), dtype=np.int32)
+    key0   = _hkl_key(h0, k0, l0)
+    order0 = np.argsort(key0)
+    h_p, k_p, l_p = h0[order0], k0[order0], l0[order0]
+    ref_key = key0[order0]
+    F_total = np.zeros(len(h_p), dtype=np.complex128)
+
+    for m in chunk_mtzs:
+        h = np.asarray(m.column_with_label('H'),    dtype=np.int32)
+        k = np.asarray(m.column_with_label('K'),    dtype=np.int32)
+        l = np.asarray(m.column_with_label('L'),    dtype=np.int32)
+        F = np.asarray(m.column_with_label('FC'),   dtype=np.float64)
+        P = np.asarray(m.column_with_label('PHIC'), dtype=np.float64)
+        chunk_key = _hkl_key(h, k, l)
+        idx       = np.searchsorted(ref_key, chunk_key)
+        in_range  = idx < len(ref_key)
+        match     = in_range & (ref_key[np.where(in_range, idx, 0)] == chunk_key)
+        F_complex = F[match] * np.exp(1j * np.radians(P[match]))
+        np.add.at(F_total, idx[match], F_complex)
+
+    fc_p  = np.abs(F_total).astype(np.float64)
+    phi_p = np.degrees(np.angle(F_total)).astype(np.float64)
+
+    out = gemmi.Mtz()
+    out.cell, out.spacegroup = m0.cell, m0.spacegroup
+    out.add_dataset('HKL_base')
+    for lbl in ('H', 'K', 'L'):
+        out.add_column(lbl, 'H')
+    out.add_dataset('data')
+    out.add_column('FC',   'F')
+    out.add_column('PHIC', 'P')
+    out.set_data(np.column_stack([h_p, k_p, l_p, fc_p, phi_p]).astype(np.float32))
+    out.write_to_file(str(tmpdir / mtz_out))
+    return h_p, k_p, l_p, fc_p, phi_p
+
+
 def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
-                           solvent_radius=1.41, solvent_scale=0.334, solvent_B=50.0):
+                           solvent_radius=1.41, solvent_scale=0.334, solvent_B=50.0,
+                           sfcalc_workers=20):
     """Compute structure factors including a bulk solvent contribution.
 
     Mirrors the model in ano_sfall.com (James Holton):
-      1. Protein SFs from gemmi sfcalc.
+      1. Protein SFs from gemmi sfcalc (N-way parallel atom split).
       2. Solvent mask via cavenv, scaled to solvent_scale e⁻/Å³
          (default 0.334 = bulk water at 1 g/cm³).
       3. Mask → SFs via gemmi FFT (transform_to_f_phi).
@@ -720,16 +970,10 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     nc = round(CELL[2] * SAMPLE_RATE / DMIN)
     grid_kw = f'{na} {nb} {nc}'
 
-    # ── 1. Protein SFs ─────────────────────────────────────────────────────────
-    run(['gemmi', 'sfcalc', f'--dmin={DMIN}',
-         '--to-mtz=_protein_only.mtz', str(pdb_path)],
-        cwd=tmpdir)
+    # ── 1. Protein SFs (N-way parallel atom split, complex F summed) ──────────
+    h_p, k_p, l_p, fc_p, phi_p = _sfcalc_parallel(
+        pdb_path, '_protein_only.mtz', tmpdir, n_workers=sfcalc_workers)
     prot = gemmi.read_mtz_file(str(tmpdir / '_protein_only.mtz'))
-    h_p   = np.array(prot.column_with_label('H'),    dtype=np.int32)
-    k_p   = np.array(prot.column_with_label('K'),    dtype=np.int32)
-    l_p   = np.array(prot.column_with_label('L'),    dtype=np.int32)
-    fc_p  = np.array(prot.column_with_label('FC'),   dtype=np.float64)
-    phi_p = np.array(prot.column_with_label('PHIC'), dtype=np.float64)
 
     # ── 2. Solvent mask via cavenv ──────────────────────────────────────────────
     # Strip flood-water chain (F) before masking: flood waters are already in
@@ -814,6 +1058,17 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     fc_out  = np.abs(F_tot).astype(np.float32)
     phi_out = np.degrees(np.angle(F_tot)).astype(np.float32)
 
+    # ── 7. Wilson B correction: match overall B of real 1aho data ─────────────
+    #     Applies exp(-ΔB · s²/4) where ΔB = B_ref - B_gen.  Brings simulated
+    #     <F²> vs s² spectrum into line with the experimental reference so the
+    #     CNN sees realistic resolution-dependent intensity falloff.
+    ref_B = _reference_wilson_b()
+    if ref_B is not None:
+        gen_B   = _wilson_b(fc_out, s_sq)
+        delta_B = ref_B - gen_B
+        fc_out  = (fc_out * np.exp(-delta_B * s_sq / 4.0)).astype(np.float32)
+        print(f'    Wilson B: ref={ref_B:.2f} gen={gen_B:.2f} ΔB={delta_B:+.2f} Å² applied')
+
     out = gemmi.Mtz()
     out.cell       = prot.cell
     out.spacegroup = prot.spacegroup
@@ -827,8 +1082,18 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     out.write_to_file(str(mtz_out))
 
 
+def _pdb_has_hydrogens(pdb_path):
+    """Quick scan: True if any ATOM record has element 'H' (cols 77-78)."""
+    with open(str(pdb_path)) as f:
+        for line in f:
+            if line[:6] in ('ATOM  ', 'HETATM') and len(line) >= 78 \
+               and line[76:78].strip() == 'H':
+                return True
+    return False
+
+
 def step6_sfcalc(pdb_path, mtz_out, tmpdir, bulk_solvent=True):
-    """Add hydrogens to pdb_path in-place, then compute structure factors.
+    """Add hydrogens to pdb_path (if not already present), then compute SFs.
 
     If bulk_solvent=True (default), includes a mask-based bulk solvent
     contribution (cavenv + sfall, matching ano_sfall.com parameters:
@@ -837,19 +1102,19 @@ def step6_sfcalc(pdb_path, mtz_out, tmpdir, bulk_solvent=True):
     Set bulk_solvent=False for internal steps (e.g. self-refinement B factors)
     where speed matters and absolute realism is not required.
 
-    pdb_path is overwritten with the H-containing model so that truth_full.pdb
-    saved to the sample directory includes H.
+    pdb_path is overwritten with the H-containing model when reduce is run, so
+    truth_full.pdb saved to the sample directory includes H either way.
     """
-    pdb_with_h = tmpdir / '_sfcalc_withH.pdb'
-    result = subprocess.run(
-        [str(PHENIX_GM.parent / 'phenix.reduce'), str(pdb_path)],
-        cwd=str(tmpdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if result.returncode not in (0, 1):  # reduce exits 1 on warnings, which is normal
-        raise RuntimeError(f'phenix.reduce failed:\n{result.stderr.decode(errors="replace")[-1000:]}')
-    pdb_with_h.write_bytes(result.stdout)
-    # Replace truth_full.pdb with the H-containing version
-    pdb_with_h.replace(pdb_path)
+    if not _pdb_has_hydrogens(pdb_path):
+        pdb_with_h = tmpdir / '_sfcalc_withH.pdb'
+        result = subprocess.run(
+            [str(PHENIX_GM.parent / 'phenix.reduce'), str(pdb_path)],
+            cwd=str(tmpdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode not in (0, 1):  # reduce exits 1 on warnings, normal
+            raise RuntimeError(f'phenix.reduce failed:\n{result.stderr.decode(errors="replace")[-1000:]}')
+        pdb_with_h.write_bytes(result.stdout)
+        pdb_with_h.replace(pdb_path)
 
     if bulk_solvent:
         _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir)
@@ -1346,16 +1611,25 @@ def step9_probe(tmpdir):
     return _parse_unused_links(probe_log)
 
 
-def step9_refmac(tmpdir, n_rounds=3, ncyc_per_round=20, weight_matrix=None):
-    """Run refmac in n_rounds sequential rounds of ncyc_per_round cycles each.
+def step9_refmac(tmpdir, ncyc_per_round=(20, 40), refine_occ=(False, True),
+                 weight_matrix=None):
+    """Run refmac in sequential rounds with per-round NCYC and occupancy control.
 
-    Round 1: starthere.pdb → refmacout.pdb / refmacout.mtz
-    Round k: previous refmacout.pdb → refmacout.pdb / refmacout.mtz
-    Occupancy setup is regenerated each round from the current input PDB.
-    All round logs are concatenated into refmac.log.
+    ncyc_per_round: list of ints, one per round
+    refine_occ:     list of bools (same length as ncyc_per_round); True enables
+                    OCCUpancy GROUP keywords from refmac_occupancy_setup.com
+    weight_matrix:  optional WEIGHT MATRIX override (default: refmac auto)
+
+    Splitting occupancy refinement off the first round avoids a refmac
+    intermediate-state bond-stretching bug: when occ is refined in round 1,
+    the round-2 input has perturbed occupancies that confuse the geometry
+    minimiser and stretch bonds (e.g. CB-CA → 1.73 Å on high-occ altlocs).
 
     Returns the concatenated log text.
     """
+    n_rounds = len(ncyc_per_round)
+    assert len(refine_occ) == n_rounds, "ncyc_per_round and refine_occ must have same length"
+
     def _build_occ_bytes(xyzin):
         run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), xyzin],
             cwd=tmpdir)
@@ -1380,10 +1654,11 @@ def step9_refmac(tmpdir, n_rounds=3, ncyc_per_round=20, weight_matrix=None):
 
     for rnd in range(n_rounds):
         xyzout = 'refmacout.pdb'
+        occ_bytes = _build_occ_bytes(xyzin) if refine_occ[rnd] else b''
         keywords = (
-            _build_occ_bytes(xyzin) +
+            occ_bytes +
             b'MAKE HYDR A NEWLIGAND NOEXIT\n' +
-            f'NCYC {ncyc_per_round}\n'.encode() +
+            f'NCYC {ncyc_per_round[rnd]}\n'.encode() +
             (f'WEIGHT MATRIX {weight_matrix}\n'.encode() if weight_matrix is not None else b'') +
             b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
             b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT '
@@ -1463,17 +1738,28 @@ def step10_convert_maps(tmpdir, outdir):
     diff_ccp4.write_ccp4_map(str(outdir / 'truediff.map'))
 
 
-def _generate_flood_waters(truth_full_pdb, rng, n_flood, flood_occ):
+def _generate_flood_waters(truth_full_pdb, rng, n_flood, flood_occ,
+                            collision_pdb=None):
     """Append chain F flood waters to truth_full.pdb, avoiding full-occ atoms.
 
-    Reads existing atom positions from truth_full.pdb (protein + ordered waters)
-    to avoid placing flood waters on top of real atoms (min separation 2.8 Å).
+    Collision check uses heavy atoms from collision_pdb (single-conformer model
+    such as the self-refined PDB) if given, otherwise from truth_full_pdb.
+    Checking against one model is ~20× cheaper than against the 20-altloc
+    truth model, and the result is essentially identical because all 20 altlocs
+    are within ~1 Å of the single-conformer positions.
+
     Returns the number of flood waters actually placed.
     """
     _occ = float(flood_occ) if flood_occ is not None else 0.1
     st = gemmi.read_structure(str(truth_full_pdb))
-    existing = [(a.pos.x, a.pos.y, a.pos.z)
-                for chain in st[0] for res in chain for a in res]
+    coll_src = gemmi.read_structure(str(collision_pdb)) if collision_pdb else st
+    # Skip H atoms — they sit inside heavy-atom exclusion radii anyway.
+    existing_xyz = np.array(
+        [(a.pos.x, a.pos.y, a.pos.z)
+         for chain in coll_src[0] for res in chain for a in res
+         if a.element.name != 'H'],
+        dtype=np.float64,
+    )
     margin = 2.0
     flood_chain = gemmi.Chain('F')
     added = 0
@@ -1483,8 +1769,10 @@ def _generate_flood_waters(truth_full_pdb, rng, n_flood, flood_occ):
         x = float(rng.uniform(margin, CELL[0] - margin))
         y = float(rng.uniform(margin, CELL[1] - margin))
         z = float(rng.uniform(margin, CELL[2] - margin))
-        if any((x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 < 7.84
-               for px, py, pz in existing):
+        dx = existing_xyz[:, 0] - x
+        dy = existing_xyz[:, 1] - y
+        dz = existing_xyz[:, 2] - z
+        if np.any(dx * dx + dy * dy + dz * dz < 7.84):
             continue
         b = float(np.clip(rng.lognormal(BFAC_SC_MU, BFAC_SC_SIGMA + 0.3),
                           BFAC_SC_MIN, 120.0))
@@ -1499,7 +1787,7 @@ def _generate_flood_waters(truth_full_pdb, rng, n_flood, flood_occ):
         atom.b_iso   = b
         res.add_atom(atom)
         flood_chain.add_residue(res)
-        existing.append((x, y, z))
+        existing_xyz = np.vstack([existing_xyz, [x, y, z]])
         added += 1
     if added > 0:
         st[0].add_chain(flood_chain)
@@ -1516,6 +1804,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                     shift_scale=0.5, n_altlocs=2, missing_fraction=0.05,
                     never_collected_fraction=0.05, extra_b=0.0,
                     altloc_swaps_per_res=1.0, weight_matrix=None,
+                    per_conf_geommin=False,
                     seed=None, debug=False):
     """Run the full pipeline for one sample. Returns (sample_idx, ok, info).
 
@@ -1579,17 +1868,26 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         t = _t('geo_clash_check', t)
 
         # 4b: Self-refine B factors (20 refmac cycles against own SFs)
-        #     Gives chemically correlated coordinates before jigglepdb
-        selfref_pdb = step4b_selfref_b_factors(minimized_pdb, tmpdir)
+        #     Gives chemically correlated coordinates before jigglepdb.
+        #     Shifts overall B level so model Wilson B matches 1aho reference.
+        selfref_pdb = step4b_selfref_b_factors(
+            minimized_pdb, tmpdir, target_wilson_b=_reference_wilson_b())
         t = _t('selfref_bfac', t)
 
-        # 4c: Override B factors with per-atom gt48-derived target values so
-        #     jigglepdb displacements match real 1AHO conformer fluctuations.
+        # 4c: Save the selfref B-factors as the *truth* B-factors before
+        #     overriding selfref_pdb with gt48 target values for jigglepdb.
+        #     Truth-model B-factors come from selfref; gt48 B-factors only
+        #     drive jigglepdb displacement amplitude.
+        selfref_bfac_pdb = tmpdir / 'selfref_bfac_truth.pdb'
+        shutil.copy2(selfref_pdb, selfref_bfac_pdb)
         _set_target_bfactors(selfref_pdb)
 
-        # 5: jigglepdb using target B factors → N full chains in multiconf.pdb
+        # 5: jigglepdb using target B factors → N full chains in multiconf.pdb;
+        #    truth B-factors restored from selfref in the merged output.
         step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng,
-                                  shift_scale=shift_scale, n_altlocs=n_altlocs)
+                                  shift_scale=shift_scale, n_altlocs=n_altlocs,
+                                  per_conf_geommin=per_conf_geommin,
+                                  bfac_source_pdb=selfref_bfac_pdb)
         t = _t('jiggle_and_merge', t)
 
         # 6: Each conformer was already minimized independently inside
@@ -1601,7 +1899,8 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         n_flood_added = 0
         if n_flood > 0:
             n_flood_added = _generate_flood_waters(
-                tmpdir / 'truth_full.pdb', rng, n_flood, flood_occ)
+                tmpdir / 'truth_full.pdb', rng, n_flood, flood_occ,
+                collision_pdb=selfref_pdb)
             _apply_flood_signs(tmpdir / 'truth_full.pdb', rng)
 
         # 6b: Apply extra_b to all truth atoms — broadens the target density,
@@ -1633,8 +1932,10 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                                  altloc_swaps_per_res=altloc_swaps_per_res)
         t = _t('build_mixed_model', t)
 
-        # 10: Full NCYC 20 refinement
-        refmac_log = step9_refmac(tmpdir, n_rounds=2, weight_matrix=weight_matrix)
+        # 10: Refmac NCYC=20 × 2 rounds with occupancy refinement on both
+        refmac_log = step9_refmac(tmpdir,
+                                  ncyc_per_round=(20, 20), refine_occ=(True, True),
+                                  weight_matrix=weight_matrix)
         t = _t('refmac_2x20', t)
 
         # Parse final Rwork from refmac log
@@ -1854,6 +2155,9 @@ def main():
                              '(default: 1.0)')
     parser.add_argument('--debug',      action='store_true',
                         help='Copy entire tmpdir to sample_dir/debug/ for inspection')
+    parser.add_argument('--per-conf-geommin', action='store_true',
+                        help='Run phenix.geometry_minimization on each conformer '
+                             '(parallel via ThreadPoolExecutor; ~13s × n_altlocs)')
     parser.add_argument('--seed',       type=int, default=None,
                         help='Fixed RNG seed (overrides sample-id as seed); '
                              'use to hold the protein structure constant while varying other params')
@@ -1891,6 +2195,7 @@ def main():
             extra_b=args.extra_b,
             altloc_swaps_per_res=args.altloc_swaps_per_res,
             weight_matrix=args.weight_matrix,
+            per_conf_geommin=args.per_conf_geommin,
             seed=args.seed,
             debug=args.debug,
         )
