@@ -89,18 +89,20 @@ def _report(label, Fc_dict, k_dict, masks, names):
 
 def main():
     ap = argparse.ArgumentParser(description='R factors from maps vs refmac MTZ.')
-    ap.add_argument('--mtz',   required=True)
-    ap.add_argument('--fc',    required=True)
-    ap.add_argument('--pred',  required=True)
-    ap.add_argument('--truth', default=None)
+    ap.add_argument('--mtz',        required=True)
+    ap.add_argument('--fc',         required=True)
+    ap.add_argument('--pred',       required=True)
+    ap.add_argument('--truth',      default=None)
+    ap.add_argument('--fo-label',   default='F',          help='MTZ column for Fo (default: F)')
+    ap.add_argument('--free-label', default='FreeR_flag', help='MTZ column for free flag (default: FreeR_flag)')
     args = ap.parse_args()
 
     mtz  = gemmi.read_mtz_file(args.mtz)
-    H    = np.asarray(mtz.column_with_label('H'),          dtype=np.int32)
-    K    = np.asarray(mtz.column_with_label('K'),          dtype=np.int32)
-    L    = np.asarray(mtz.column_with_label('L'),          dtype=np.int32)
-    Fo   = np.asarray(mtz.column_with_label('F'),          dtype=np.float32)
-    free = np.asarray(mtz.column_with_label('FreeR_flag'), dtype=np.float32)
+    H    = np.asarray(mtz.column_with_label('H'),               dtype=np.int32)
+    K    = np.asarray(mtz.column_with_label('K'),               dtype=np.int32)
+    L    = np.asarray(mtz.column_with_label('L'),               dtype=np.int32)
+    Fo   = np.asarray(mtz.column_with_label(args.fo_label),     dtype=np.float32)
+    free = np.asarray(mtz.column_with_label(args.free_label),   dtype=np.float32)
 
     # s² = 1/d² for each reflection
     cell = mtz.cell
