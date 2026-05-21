@@ -2028,7 +2028,8 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        max_array=300, seed=None, flood_occ=None, cell=None,
                        dmin=2.0, spacegroup='P 1', partition='debug',
                        account=None, qos=None, time='00:10:00',
-                       weight_matrix=None):
+                       weight_matrix=None, per_conf_geommin=False,
+                       exclude_nodes=None):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     python  = sys.executable
@@ -2050,11 +2051,13 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     dmin_line      = f'    --dmin {dmin} \\\n'
     account_line   = f'#SBATCH --account={account}\n'    if account              else ''
     qos_line       = f'#SBATCH --qos={qos}\n'            if qos                  else ''
+    exclude_line   = f'#SBATCH --exclude={exclude_nodes}\n' if exclude_nodes     else ''
+    pcg_line       = f'    --per-conf-geommin \\\n'      if per_conf_geommin     else ''
     script_text = f"""\
 #!/bin/bash
 #SBATCH --job-name=prot_data
 #SBATCH --partition={partition}
-{account_line}{qos_line}#SBATCH --array=0-{nsamples-1}%{max_array}
+{account_line}{qos_line}{exclude_line}#SBATCH --array=0-{nsamples-1}%{max_array}
 #SBATCH --output={outdir}/logs/%A_%a.log
 #SBATCH --error={outdir}/logs/%A_%a.log
 #SBATCH --time={time}
@@ -2073,7 +2076,7 @@ mkdir -p "${{CCP4_SCR:-/tmp}}"
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
     --never-collected-fraction {never_collected_fraction} \\
-{cell_line}{dmin_line}{sg_line}{flood_occ_line}{varflood_line}{extra_b_line}{scramble_line}{weight_line}{seed_line}"""
+{cell_line}{dmin_line}{sg_line}{flood_occ_line}{varflood_line}{extra_b_line}{scramble_line}{weight_line}{pcg_line}{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
@@ -2158,6 +2161,9 @@ def main():
     parser.add_argument('--per-conf-geommin', action='store_true',
                         help='Run phenix.geometry_minimization on each conformer '
                              '(parallel via ThreadPoolExecutor; ~13s × n_altlocs)')
+    parser.add_argument('--exclude-nodes',  default=None,
+                        help='SLURM --exclude= node list (e.g. "voltron,graphics2" '
+                             'to keep CPU jobs off GPU nodes)')
     parser.add_argument('--seed',       type=int, default=None,
                         help='Fixed RNG seed (overrides sample-id as seed); '
                              'use to hold the protein structure constant while varying other params')
@@ -2216,6 +2222,8 @@ def main():
             cell=CELL, dmin=DMIN, spacegroup=SPACEGROUP,
             partition=args.partition, account=args.account, qos=args.qos,
             time=args.time,
+            per_conf_geommin=args.per_conf_geommin,
+            exclude_nodes=args.exclude_nodes,
         )
         sys.exit(0 if ok else 1)
 
