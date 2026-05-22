@@ -54,9 +54,10 @@ _ALTLOC_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 # ── Atom placement ────────────────────────────────────────────────────────────
 
-def place_atoms(n, rng, min_dist=2.5):
+def place_atoms(n, rng, min_dist=2.5, b_range=(10.0, 30.0)):
     """Return list of (x, y, z, b_iso) for n O atoms in the unit cell."""
     a, b, c = CELL[:3]
+    b_lo, b_hi = b_range
     positions = []
     for _ in range(n * 300):
         if len(positions) >= n:
@@ -67,7 +68,8 @@ def place_atoms(n, rng, min_dist=2.5):
                      for px, py, pz, _ in positions]
             if min(dists) < min_dist:
                 continue
-        positions.append((x, y, z, float(rng.uniform(10.0, 30.0))))
+        b_iso = b_lo if b_hi == b_lo else float(rng.uniform(b_lo, b_hi))
+        positions.append((x, y, z, b_iso))
     return positions[:n]
 
 
@@ -555,6 +557,7 @@ def generate_sample(sample_idx, outdir, seed=None,
                     bfac_shift=None, bfac_natoms=None,
                     n_altconfs=1, altconf_rms=0.5,
                     n_clusters=1, all_clusters=False,
+                    b_range=(10.0, 30.0),
                     no_refmac=False, verbose=False):
     outdir     = Path(outdir).resolve()
     sample_dir = outdir / f'sample_{sample_idx:05d}'
@@ -588,7 +591,7 @@ def generate_sample(sample_idx, outdir, seed=None,
 
     try:
         # ── Place atoms ──────────────────────────────────────────────────────
-        positions = place_atoms(n_atoms_eff, rng)
+        positions = place_atoms(n_atoms_eff, rng, b_range=b_range)
         if len(positions) < n_atoms_eff:
             return sample_idx, False, f'only placed {len(positions)}/{n_atoms_eff} atoms'
 
@@ -779,6 +782,8 @@ def _cli_flags_for_task(args):
         flags += [f'--n-clusters {args.n_clusters}']
     if args.all_clusters:
         flags += ['--all-clusters']
+    if args.b_range != [10.0, 30.0]:
+        flags += [f'--b-range {args.b_range[0]} {args.b_range[1]}']
     if args.no_refmac:
         flags += ['--no-refmac']
     if args.verbose:
@@ -887,6 +892,10 @@ def main():
                     help='Split every atom into an alt-conf cluster (overrides --n-clusters)')
 
     # ── Pipeline control ──────────────────────────────────────────────────────
+    ap.add_argument('--b-range',         type=float, nargs=2, default=[10.0, 30.0],
+                    metavar=('MIN', 'MAX'),
+                    help='B-factor range for placed atoms; MIN==MAX → fixed B '
+                         '(default: 10 30)')
     ap.add_argument('--no-refmac',       action='store_true',
                     help='Skip refmac; use sfcalc+scaleit map coefficients instead')
     ap.add_argument('--verbose',         action='store_true')
@@ -936,6 +945,7 @@ def main():
             bfac_shift=args.bfac_shift, bfac_natoms=args.bfac_natoms,
             n_altconfs=args.n_altconfs, altconf_rms=args.altconf_rms,
             n_clusters=args.n_clusters, all_clusters=args.all_clusters,
+            b_range=tuple(args.b_range),
             no_refmac=args.no_refmac, verbose=args.verbose,
         )
         print(f'sample {idx}: {"ok" if ok else "FAILED"}  {msg}')
@@ -956,6 +966,7 @@ def main():
             bfac_shift=args.bfac_shift, bfac_natoms=args.bfac_natoms,
             n_altconfs=args.n_altconfs, altconf_rms=args.altconf_rms,
             n_clusters=args.n_clusters, all_clusters=args.all_clusters,
+            b_range=tuple(args.b_range),
             no_refmac=args.no_refmac, verbose=args.verbose,
         )
         if success:
