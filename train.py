@@ -40,17 +40,21 @@ from model import UNet3D, count_parameters
 # Training / validation loops
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_steps=1,
+def run_epoch(model, loader, device, optimizer=None, alpha=0.5, accum_steps=1,
               world_size=1):
     """Single train or eval pass. Pass optimizer=None for eval.
 
+    alpha: peak-weight coefficient. Loss is mean((1 + alpha·|y|)·(ŷ-y)²) —
+    errors at real density peaks (large |y|) are upweighted so the model does
+    not smear amplitude away from sparse high-magnitude features. The reported
+    metric is still plain MSE, so it stays comparable across alpha values.
     accum_steps: accumulate gradients over this many batches before stepping,
     simulating a larger effective batch size without extra GPU memory.
     world_size: number of DDP ranks; results are all-reduced across ranks.
     """
     training = optimizer is not None
     model.train(training)
-    total_mse  = 0.0
+    total_mse  = 0.0  # plain MSE, for the reported metric
     total_yss  = 0.0  # sum of mean(y²) * n, for dataset-level RMSD
     total_n    = 0    # local sample count (DistributedSampler shards the dataset)
 
@@ -60,7 +64,10 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
         for step, (x, y, s) in enumerate(loader):
             x, y, s = x.to(device), y.to(device), s.to(device)
             pred_map, pred_log_var, pred_log_scale = model(x)
-            loss = F.mse_loss(pred_map, y)
+            # Peak-weighted MSE drives backprop; plain MSE is logged as the metric.
+            sq   = (pred_map - y) ** 2
+            loss = ((1.0 + alpha * y.abs()) * sq).mean()
+            mse  = sq.mean()
 
             if training:
                 (loss / accum_steps).backward()
@@ -71,7 +78,7 @@ def run_epoch(model, loader, device, optimizer=None, scale_weight=1.0, accum_ste
 
             n = x.size(0)
             total_n   += n
-            total_mse += loss.item() * n
+            total_mse += mse.item() * n
             with torch.no_grad():
                 truth = y + x[:, 2:3]   # fc is input channel 2
                 total_yss += (truth ** 2).mean().item() * n
@@ -107,7 +114,8 @@ def main():
     parser.add_argument('--base-features', type=int, default=32,
                         help='U-Net base channel count (default: 32)')
     parser.add_argument('--alpha',       type=float, default=0.5,
-                        help='Peak-weight coefficient in loss (default: 0.5)')
+                        help='Peak-weight coefficient in loss: '
+                             'mean((1+alpha*|y|)*(pred-y)^2) (default: 0.5)')
     parser.add_argument('--workers',     type=int, default=2,
                         help='DataLoader worker processes (default: 2)')
     parser.add_argument('--resume',      default=None,
@@ -115,8 +123,6 @@ def main():
     parser.add_argument('--pretrain',    default=None,
                         help='Path to checkpoint to load model weights only '
                              '(optimizer/scheduler reset — for curriculum transfer)')
-    parser.add_argument('--scale-weight', type=float, default=1.0,
-                        help='Weight on scale-prediction MSE loss (default: 1.0)')
     parser.add_argument('--accum-steps', type=int, default=1,
                         help='Gradient accumulation steps (default: 1). Effective '
                              'batch size = batch-size * accum-steps.')
@@ -249,9 +255,9 @@ def main():
         t0 = time.time()
 
         train_mse, train_Rrms = run_epoch(model, train_loader, device, optimizer,
-                                          args.scale_weight, args.accum_steps, world_size)
+                                          args.alpha, args.accum_steps, world_size)
         val_mse,   val_Rrms   = run_epoch(model, val_loader,   device, optimizer=None,
-                                          scale_weight=args.scale_weight, world_size=world_size)
+                                          alpha=args.alpha, world_size=world_size)
         scheduler.step()
 
         if is_rank0:

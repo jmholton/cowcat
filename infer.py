@@ -146,6 +146,8 @@ def main():
                         help='Overlap between adjacent patches (default: 30)')
     parser.add_argument('--cpu', action='store_true',
                         help='Force CPU even if CUDA is available')
+    parser.add_argument('--no-scale', action='store_true',
+                        help='Skip the LSQ amplitude rescale against fofc')
     args = parser.parse_args()
 
     device = torch.device('cpu' if args.cpu or not torch.cuda.is_available() else 'cuda')
@@ -180,6 +182,23 @@ def main():
 
     print(f'pred range:  [{mean_map.min():.4f}, {mean_map.max():.4f}]  mean={mean_map.mean():.4f}  std={mean_map.std():.4f}  (e/Å³)')
 
+    # ── Amplitude rescale ─────────────────────────────────────────────────────
+    # MSE training shrinks the predicted amplitude and leaves a DC offset.
+    # Difference maps are physically zero-mean, so: (1) subtract the mean,
+    # (2) RMS-match to the fofc difference map — the one amplitude reference
+    # available even on real data (no truth needed). RMS matching is scale-
+    # preserving; an LSQ fit would instead shrink by the correlation factor.
+    if not args.no_scale:
+        dc = float(mean_map.mean())
+        mean_map = mean_map - dc
+        std_pred = float(mean_map.std())
+        k_scale  = float(fofc.std()) / std_pred if std_pred > 0 else 1.0
+        mean_map = mean_map * k_scale
+        print(f'Amplitude rescale: DC offset {dc:+.4f} removed, '
+              f'k (RMS match to fofc) = {k_scale:.4f}')
+        print(f'pred range (scaled): [{mean_map.min():.4f}, {mean_map.max():.4f}]  '
+              f'std={mean_map.std():.4f}  (e/Å³)')
+
     # ── Write output maps ─────────────────────────────────────────────────────
     _write_map(args.output, mean_map, args.fofc2)
     pred_total = mean_map + fc
@@ -201,6 +220,12 @@ def main():
         print(f'RMSE(pred, true_diff) = {rmse:.4f} e/Å³  ({rmse/rmsd_true:.4f} × rmsd_true)')
         print(f'CC(pred,   true_diff) = {cc:.4f}')
         print(f'CC(fofc,   true_diff) = {cc_fofc:.4f}')
+        # Ideal scalar vs truth — should be ≈1.0 if the fofc-based rescale was
+        # right; the residual is the fofc-fit error.
+        pp_t = float(np.sum(mean_map * mean_map))
+        k_true = float(np.sum(mean_map * true_diff)) / pp_t if pp_t > 0 else 1.0
+        print(f'ideal scale k vs true_diff = {k_true:.4f}  '
+              f'(residual RMSE {np.sqrt(np.mean((k_true*mean_map - true_diff)**2))/rmsd_true:.4f} × rmsd_true)')
         # R factor in map space: Σ|pred - true| / Σ|true|
         _write_map(str(out_dir / 'true_diff.map'), true_diff, args.fofc2)
 
