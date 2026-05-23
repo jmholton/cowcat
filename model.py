@@ -29,15 +29,20 @@ import torch.nn.functional as F
 
 
 class _ConvBlock(nn.Module):
-    """Conv3d → BN → ReLU, repeated twice."""
+    """Conv3d → ReLU, repeated twice (no normalization).
+
+    BatchNorm removed: with batch=1 per rank and no SyncBN, BN's per-rank
+    running stats are noisy and lock in wrong values for eval mode, adding
+    avoidable val variance epoch-to-epoch. Normalization is also at odds
+    with the task — predicting absolute-scale electron density (e/Å³) —
+    where activation amplitudes should pass through unmolested.
+    """
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, padding_mode='circular', bias=False),
-            nn.BatchNorm3d(out_ch),
+            nn.Conv3d(in_ch,  out_ch, kernel_size=3, padding=1, padding_mode='circular'),
             nn.ReLU(inplace=True),
-            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, padding_mode='circular', bias=False),
-            nn.BatchNorm3d(out_ch),
+            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, padding_mode='circular'),
             nn.ReLU(inplace=True),
         )
 

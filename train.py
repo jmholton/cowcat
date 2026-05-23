@@ -91,7 +91,7 @@ def run_epoch(model, loader, device, optimizer=None, alpha=0.5, accum_steps=1,
     mse  = total_mse / total_n
     rmsd = (total_yss / total_n) ** 0.5   # RMS of truth map (e/Å³)
     Rrms = mse**0.5 / rmsd if rmsd > 0 else float('nan')
-    return mse, Rrms
+    return mse, Rrms, rmsd
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -126,6 +126,13 @@ def main():
     parser.add_argument('--accum-steps', type=int, default=1,
                         help='Gradient accumulation steps (default: 1). Effective '
                              'batch size = batch-size * accum-steps.')
+    parser.add_argument('--eval-1aho-dir', default=None,
+                        help='Directory with 1aho_test maps + refmac MTZ; if set, '
+                             'reports Rfree against this real-data sample each '
+                             'epoch as a generalisation check')
+    parser.add_argument('--eval-1aho-fo-label',   default='FP')
+    parser.add_argument('--eval-1aho-free-label', default='FreeR_flag')
+    parser.add_argument('--eval-1aho-mtz-name',   default='refmacout_minRfree.mtz')
     args = parser.parse_args()
 
     # ── DDP setup (torchrun sets LOCAL_RANK / WORLD_SIZE) ─────────────────────
@@ -247,6 +254,17 @@ def main():
     if is_rank0:
         outdir.mkdir(parents=True, exist_ok=True)
 
+    # ── Optional Rfree-on-real-1aho diagnostic ────────────────────────────────
+    eval_ctx = None
+    if is_rank0 and args.eval_1aho_dir:
+        from eval_1aho import setup_1aho_eval, eval_rfree
+        eval_ctx = setup_1aho_eval(
+            args.eval_1aho_dir,
+            fo_label=args.eval_1aho_fo_label,
+            free_label=args.eval_1aho_free_label,
+            mtz_name=args.eval_1aho_mtz_name,
+        )
+
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
         if is_ddp:
@@ -254,23 +272,40 @@ def main():
 
         t0 = time.time()
 
-        train_mse, train_Rrms = run_epoch(model, train_loader, device, optimizer,
-                                          args.alpha, args.accum_steps, world_size)
-        val_mse,   val_Rrms   = run_epoch(model, val_loader,   device, optimizer=None,
-                                          alpha=args.alpha, world_size=world_size)
+        train_mse, train_Rrms, _        = run_epoch(model, train_loader, device, optimizer,
+                                                    args.alpha, args.accum_steps, world_size)
+        val_mse,   val_Rrms,   val_rmsd = run_epoch(model, val_loader,   device, optimizer=None,
+                                                    alpha=args.alpha, world_size=world_size)
         scheduler.step()
+
+        # Rfree-on-real-1aho diagnostic (rank 0 only, after val)
+        rfree_1aho = None
+        if eval_ctx is not None:
+            try:
+                rfree_1aho = eval_rfree(raw_model, eval_ctx, device)
+            except Exception as e:
+                print(f'  eval_1aho.eval_rfree failed: {e}; disabling', flush=True)
+                eval_ctx = None
 
         if is_rank0:
             elapsed = time.time() - t0
             lr_now  = scheduler.get_last_lr()[0]
 
+            # Print val rmsd_truth once (it's a fixed dataset property, not per-epoch info).
+            if epoch == start_epoch:
+                print(f'  val rmsd_truth = {val_rmsd:.4f} e/Å³ (RMS of truth map; fixed)')
+
+            rfree_str = f'Rfree_1aho= {rfree_1aho:.4f}  ' if rfree_1aho is not None else ''
             print(f'epoch {epoch:04d}  '
                   f'train= {train_mse:.5f}  val= {val_mse:.5f}  '
                   f'Rrms= {val_Rrms:.4f}  '
+                  f'{rfree_str}'
                   f'lr= {lr_now:.2e}  t= {elapsed:.1f}s')
 
             entry = dict(epoch=epoch, train=round(train_mse, 6),
                          val=round(val_mse, 6), Rrms=round(val_Rrms, 4), lr=lr_now)
+            if rfree_1aho is not None:
+                entry['Rfree_1aho'] = round(rfree_1aho, 4)
             log.append(entry)
 
             ckpt = dict(epoch=epoch, model=raw_model.state_dict(),

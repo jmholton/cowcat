@@ -132,6 +132,53 @@ def _validate_pack(x_path, y_path, s_path):
     return X, Y, S
 
 
+class PackedDatasetWithP(Dataset):
+    """Like PackedDataset but also returns net1's precomputed predicted_diff (P).
+
+    Used to train a second (σ-predicting) net on (input, net1.pred, truth)
+    triples. Augmentation (flip, periodic roll) is applied to (X, P, Y) in
+    lockstep — both nets are flip-equivariant, so flipping net1's prediction
+    in lockstep with the input is valid and avoids re-running inference.
+
+    Channel 3 of X (cross-Patterson) is invariant under joint translation, so
+    it is NOT rolled — matches the convention in PackedDataset.
+    """
+    def __init__(self, x_path, y_path, s_path, p_path, indices=None):
+        self.X, self.Y, self.S = _validate_pack(x_path, y_path, s_path)
+        self.P = np.load(p_path, mmap_mode='r')
+        if len(self.P) != len(self.X):
+            raise ValueError(
+                f'P.npy length {len(self.P)} != X.npy length {len(self.X)}')
+        self.indices = indices if indices is not None else np.arange(len(self.X))
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        i = self.indices[idx]
+        x = np.array(self.X[i])
+        p = np.array(self.P[i])
+        y = np.array(self.Y[i])
+        s = float(self.S[i])
+
+        for ax in (0, 1, 2):
+            if np.random.rand() < 0.5:
+                x = np.flip(x, axis=ax + 1)
+                p = np.flip(p, axis=ax + 1)
+                y = np.flip(y, axis=ax + 1)
+
+        x = torch.from_numpy(x.copy())
+        p = torch.from_numpy(p.copy())
+        y = torch.from_numpy(y.copy())
+
+        shifts = [int(np.random.randint(0, d)) for d in x.shape[1:]]
+        x = torch.cat([torch.roll(x[:3], shifts, dims=[1, 2, 3]), x[3:]], dim=0)
+        p = torch.roll(p, shifts, dims=[1, 2, 3])
+        y = torch.roll(y, shifts, dims=[1, 2, 3])
+
+        return x, p, y, torch.tensor(s, dtype=torch.float32)
+
+
 class PackedDataset(Dataset):
     """Fast dataset backed by pre-packed X.npy / Y.npy / S.npy memory-mapped arrays.
 

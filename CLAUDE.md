@@ -14,10 +14,14 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 | `generate_simple.py` | Simple O-atom pipeline — N random O atoms in configurable cell/SG, 1 missing, refmac |
 | `generate_1aho.py` | 1AHO-specific pipeline — jiggle real protein, flood waters, sfcalc, refmac, CCP4 maps |
 | `generate_data.py` | Oldest pipeline — random O atoms, atom deletion, no refmac (kept for reference) |
-| `model.py` | UNet3D: 4 input channels, 1 output, base_features=32, circular padding, 5.84M params |
-| `train.py` | Training loop: heteroscedastic NLL loss, AdamW, CosineAnnealingLR, DataParallel, --accum-steps |
-| `dataset.py` | `ElectronDensityDataset`, `PackedDataset`, `make_splits` / `make_splits_multi` |
-| `pack.py` | Packs `sample_NNNNN/` dirs into `X.npy`/`Y.npy`/`S.npy` for fast mmap loading |
+| `model.py` | UNet3D: 4 input channels, 1 output, base_features=32, circular padding; **U-Net + parallel FNO branch** (factorized full-band F-FNO), no BN, 6.50M params |
+| `train.py` | Training loop: peak-weighted MSE / heteroscedastic NLL, AdamW, CosineAnnealingLR, DDP via torchrun, --accum-steps, --eval-1aho-dir per-epoch real-data Rfree diagnostic |
+| `eval_1aho.py` | In-training Rfree diagnostic on a held-out real-1aho sample; loaded by train.py at startup (axis convention: `ft[L,K,H]` for CCP4 (NS,NR,NC) maps) |
+| `infer.py` | Inference on CCP4 map triples; writes `<output>` (predicted **diff**) and `predicted.map` (predicted **total** = pred+fc); --no-scale skips the demean+RMS-match-to-fofc rescale; auto-runs inline rfactor if `refmacout.mtz` present |
+| `rfactor.py` | F-space LM k+B scaling + R/Rfree against MTZ; **`--pred` expects the total map (pred+fc), not the diff** |
+| `dataset.py` | `ElectronDensityDataset`, `PackedDataset`, `PackedDatasetWithP` (for net2), `make_splits` / `make_splits_multi` |
+| `pack.py` | Packs `sample_NNNNN/` dirs into `X.npy`/`Y.npy`/`S.npy` for fast mmap loading; `--crossp-raw` skips signed-sqrt compression of channel 3 |
+| `generate.csh` / `pack.csh` / `train.csh` / `train1.csh` / `infer.csh` | tcsh wrappers with sane v4 defaults |
 | `jigglepdb.awk` | Displaces atom positions to generate alternate conformers |
 | `explore_1aho_fusion.py` | Conformer scoring, rebuild, refmac utilities for the 1AHO iterative pipeline |
 | `swapscan_varconf.py` | Chain-letter swap optimisation: random/geo-targeted trials, refmac NCYC=50, wE scoring |
@@ -32,10 +36,12 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 
 ## Architecture
 
-- **Map channels (input)**: 2Fo-Fc (FWT/PHWT), Fo-Fc (DELFWT/PHDELWT), Fc (FC_ALL_LS/PHIC_ALL_LS), cross-Patterson
-- **Target (Y)**: `znorm(truth.map − fc.map)` — true phased difference map (what Fo-Fc would be with perfect phases)
-- **Scale (S)**: `log(std(truth − fc))` — predicted by a scalar head; used in heteroscedastic NLL loss
-- **Model**: UNet3D, base_features=32, circular padding, 5.84M params; fully convolutional (handles any grid size)
+- **Map channels (input)**: 2Fo-Fc (FWT/PHWT), Fo-Fc (DELFWT/PHDELWT), Fc (FC_ALL_LS/PHIC_ALL_LS), cross-Patterson (raw, no signed-sqrt compression — `pack.py --crossp-raw`)
+- **Target (Y)**: `znorm(truth.map − fc.map)` for older runs; plain `truth − fc` for current MSE-based runs
+- **Scale (S)**: `log(std(truth − fc))` — predicted by a scalar head; used in heteroscedastic NLL loss (legacy)
+- **Model**: UNet3D + parallel FNO branch, base_features=32, circular padding; **no BN** in `_ConvBlock` (Conv → ReLU only); fully convolutional (handles any grid size); 6,503,716 params
+- **FNO branch**: factorized full-band 3D spectral conv (F-FNO style) running parallel to the U-Net; rfftn → per-axis per-frequency channel mixing → irfftn; covers the entire spectrum at O(C²·m) per axis (no low-mode truncation). Sum into the head with the U-Net mean prediction
+- **Loss**: peak-weighted MSE `mean((1 + α|y|)·(pred-y)²)` with α=0.5 — current default; plain MSE returned as metric for Rrms comparability
 - **Grid**: 60×60×60 for 40×40×40 Å / dmin=2.0; 144×128×96 for 45.9×40.7×30.1 Å / dmin=0.965 (sample_rate=3.0)
 - **Note**: CCP4 maps cover the full P1 unit cell regardless of space group (4 ASU copies for P 21 21 21)
 
@@ -163,38 +169,61 @@ UNIQUEIFY  = 'uniqueify'   # on PATH via CCP4 environment
 
 ---
 
-## Current Training Status (as of 2026-05-14)
+## Current Training Status (as of 2026-05-23)
 
-Loss is heteroscedastic NLL — negative values are normal and not comparable to earlier MSE-based runs.
+Current loss is **peak-weighted MSE** (α=0.5). Plain MSE returned as metric so `Rrms = sqrt(val_MSE) / sqrt(mean(truth²))` stays comparable across runs.
 
-| Checkpoint | Dataset | Best val | Notes |
-|-----------|---------|----------|-------|
-| `checkpoints_n10_N1altconf2_5/` | protein n1000 | 0.00182 (ep 81) | MSE loss; warm-start source |
-| `checkpoints_1aho_n1000v3/` | 1AHO n=1000 | **-0.7376** (ep 18) | NLL loss; best to date; 2-GPU, 100 ep |
+### Real-1aho R_free leaderboard (vs `1aho_test/refmacout_minRfree.mtz`, fc baseline = 0.1097)
 
-**Datasets available (packed):**
+| checkpoint | R_work | R_free | best_val | ep | arch |
+|---|---|---|---|---|---|
+| **`fno_lr3e4_4gpu_rc/best.pt`** | **0.0687** | **0.1083** | 0.0133 | 27 | FNO+BN, lr=3e-4 — **only model to beat fc** |
+| `fno_4gpu_rc/best.pt` | 0.1010 | 0.1138 | 0.0099 | 40 | FNO+BN, lr=1e-3 |
+| `fno_noBN_4gpu_rc/latest.pt` | 0.0909 | 0.1192 | 0.0044 | 50 | FNO no-BN (current run) |
+| `fno_acc4_4gpu_rc/best.pt` | 0.0835 | 0.1247 | 0.0047 | 89 | FNO+BN, accum 4 |
+| fc baseline | 0.0840 | 0.1097 | — | — | — |
+
+**Key finding (2026-05-23):** lower synthetic val loss → higher real-1aho R_free. `fno_lr3e4` with best_val=0.0133 beats fc on real data; the no-BN run with best_val=0.0044 sits ~1% above fc. We're overfitting the synthetic peak distribution and losing real-data generalization. Either BN regularizes usefully, or `fno_lr3e4` simply caught the sweet spot (ep 27) before overfitting.
+
+### eval pipeline validation
+
+The in-training Rfree_1aho column (printed by `eval_1aho.py` in `train.py`) and external `infer.csh` + `rfactor.py` agree to ~0.003–0.004 R_free. Gap is **tiled inference overhead**: `infer.py` blends 60-voxel patches with 30-voxel overlap (slight softening at boundaries); `eval_1aho.py` runs the whole map at once. Use eval_1aho for relative comparison across epochs; use infer.csh for the canonical reportable number.
+
+### Datasets available (packed, channel 3 = raw cross-Patterson)
 
 | Path | N | Grid | Notes |
 |------|---|------|-------|
-| `data/data_1aho_n1000` | 991 | 144×128×96 | Best proven dataset; X.npy=6G |
+| `data/data_protein_v4_s0_rawcrossp` | 1000 | 144×128×96 | protein v4 (Wilson B match to 1aho, parallel reduce+sfcalc, per-conf geommin) |
+| `data/data_simple_b10_rawcrossp` | 1000 | 144×128×96 | 20 O-atoms B=10 (sharp peak baseline) |
+| `data/data_1aho_n1000` | 991 | 144×128×96 | 1AHO n=1000 (older NLL training set) |
 | `data/data_simple_v2_s0` | 1000 | 144×128×96 | 20 O-atoms, P 21 21 21 |
-| `data/data_simple_v2_p1_s0` | 1000 | 144×128×96 | 20 O-atoms, P1; X.npy=17G |
-| `data/data_simple_60_s0` | 1000 | 60×60×60 | 20 O-atoms, P1, 40Å, dmin=2.0 |
-| `data/data_protein_v2_s0` | 962 | 144×128×96 | protein v2; **training unstable — see below** |
 
-**Training instability finding (2026-05-14):**
-- All runs from Apr 11–Apr 19 used MSE loss (positive, train≈val, healthy)
-- NLL loss introduced Apr 20: first runs fine, but some val spikes appeared early
-- 1AHO NLL runs (Apr 23–24) trained well: train and val tracked together
-- **protein v2 runs (May 14) broken**: ep0 train=3815, val=169,262 — extreme values in packed arrays
-- Root cause under investigation: likely extreme cross-Patterson values from P 21 21 21 symmetry with flood waters (spikey Patterson) and/or data pipeline artifacts
-- Simple P1 runs also show train/val divergence (train→-3, val→40+) due to batch_size=1 + heteroscedastic NLL overconfidence collapse
+`data/data_protein_v2_s0` is **corrupted** — 962 dirs but 519 X.npy rows zero-filled (pack.py ran before generation finished); regenerate before reuse. See gotchas.
 
-**Training instability fixes to try:**
-- Use `--accum-steps 8` to simulate larger batch size (added to train.py)
-- Diagnose protein_v2 X.npy for extreme values before retraining
-- Consider dropping cross-Patterson channel for P 21 21 21 data (spikey Patterson)
-- 60×60×60 simple dataset available as clean baseline
+### Architectural changes (2026-05-22 → 2026-05-23)
+
+- **FNO branch added** to `UNet3D` (`SpectralConv3d` + `FNOBlock3d`). Factorized full-band F-FNO: per-axis weights at fixed `ref_len=96` control points, linearly interpolated to runtime axis length. Covers entire spectrum O(C²·m); no low-mode truncation. Stored real, viewed as complex in forward (DDP-safe).
+- **BN removed** from `_ConvBlock`. With batch=1 per rank and no SyncBN, BN's per-rank running stats add noise and lock in wrong eval-mode values. Also at odds with the task (absolute-scale electron density predictions should pass through unmolested). Result: synthetic val drops further, but real-1aho generalization regresses — see leaderboard.
+- **DDP via torchrun** in `train.py` (`LOCAL_RANK`, NCCL, DistributedSampler, `find_unused_parameters=True`). `train.csh` submits 4-GPU jobs; `train1.csh` is the 1-GPU variant.
+- **Amplitude rescale** in `infer.py`: demean + RMS-match-to-fofc (`k = fofc.std() / pred.std()`). Disabled with `--no-scale`.
+- **eval_1aho axis fix**: CCP4 maps load as (NS, NR, NC) = (Z, Y, X); index `ft[L%nz, K%ny, H%nx]` not `ft[H, K, L]`. Without this, in-training R_free was reading 0.67 instead of ~0.12.
+
+### Loading legacy FNO+BN checkpoints
+
+Current `model.py` has BN-less `_ConvBlock` (44 weight keys + FNO). To load checkpoints from before BN was removed (100 keys, `bias=False` Conv3d + BatchNorm3d), temporarily restore BN:
+
+```python
+self.net = nn.Sequential(
+    nn.Conv3d(in_ch, out_ch, 3, padding=1, padding_mode='circular', bias=False),
+    nn.BatchNorm3d(out_ch),
+    nn.ReLU(inplace=True),
+    nn.Conv3d(out_ch, out_ch, 3, padding=1, padding_mode='circular', bias=False),
+    nn.BatchNorm3d(out_ch),
+    nn.ReLU(inplace=True),
+)
+```
+
+Revert before resuming training. Pre-FNO checkpoints (88 keys, no FNO branch) additionally need the FNO branch removed — easier to just re-train from scratch.
 
 ## 1AHO Iterative Rebuild (varconf_sweep)
 
@@ -576,3 +605,10 @@ sbatch slurm_untangler_1aho.sh --pdb 1aho/conf3norm_fitGT48.pdb \
 - **data_protein_v2_s0 corruption**: 962 sample dirs but only 443 have non-zero rows in X.npy (519 zero-filled). Root cause: map files were still being flushed (or pack.py ran before generation completed). The 443 valid samples yield only ~354 train / 89 val — too few to avoid overfitting a 5.84M-param network. Regenerate and repack.
 - **generate_sample() local multi-sample path bug (fixed 2026-05-15)**: the `--nsamples N` code path (without `--submit`/`--sample-id`) passed `shift_scale` in the `vary_flood` positional slot, then also passed `vary_flood` as a keyword → `TypeError: multiple values for argument 'vary_flood'`. The SLURM array path (`--sample-id`) was unaffected. Fixed by using a `_kw` dict for all keyword args.
 - **Space group domain gap for CNN inference on real 1AHO data**: Training uses synthetic P1 40×40×40 Å cells (one molecule, no symmetry). 1AHO is P2₁2₁2₁ with 4 ASU copies per unit cell. Applying the trained CNN to real 1AHO maps means each 60×60×60 patch sees portions of 2–3 symmetry-related molecules simultaneously — a pattern the network was never trained on. The cross-Patterson channel implicitly encodes inter-ASU vectors but the CNN has no way to exploit that. Expect degraded performance if ever applied to non-P1 experimental data.
+- **`rfactor.py --pred` expects the TOTAL map (pred + fc), not the diff**: `infer.py` writes two maps: `<output>` is the predicted *difference*; `predicted.map` (alongside it) is the predicted *total*. Passing the diff to `rfactor.py --pred` gives nonsense (k≈6, R≈0.5) because rfactor.py FFTs `--pred` directly and treats |F| as the total amplitude. Always pass `predicted.map` (or anything that is pred + fc).
+- **Real-1aho MTZ column labels**: `1aho_test/refmacout_minRfree.mtz` and `1aho/refme*.mtz` use Fo column **`FP`**, not the default `F`. Pass `--fo-label FP` to `rfactor.py` (and `fo_label='FP'` to `eval_1aho.setup_1aho_eval`). Forgetting this gives 0 matched reflections and an `IndexError` deep in `_scale_kb`.
+- **eval_1aho.py Miller-index axis convention**: CCP4 maps load with shape (NS, NR, NC) = (Z, Y, X) for the standard MAPC=1/MAPR=2/MAPS=3 axis order. Miller H/K/L correspond to X, Y, Z frequencies. Index `ft[L % nz, K % ny, H % nx]`, **not** `ft[H, K, L]`. The wrong order gives Rfree ≈ 0.67 (uncorrelated noise) instead of ~0.12.
+- **Stale `predicted.map` from a failed inference**: `infer.py` writes `predicted.map` next to `<output>`. If `model.load_state_dict()` raises (architecture mismatch), the prior `predicted.map` from a different checkpoint stays on disk. A subsequent `rfactor.py --pred predicted.map` will silently score that stale map. Either delete `predicted.map` between runs or check infer.py's exit status.
+- **`best.pt` `best_val` field is stale by one update**: in `train.py`, the checkpoint dict is constructed *before* `best_val` is updated when a new best is found, so `best.pt`'s stored `best_val` reflects the *previous* best, not the one being saved. Model weights are correct; the metadata field is off. Trust the printed log line, not the field.
+- **Loading legacy FNO+BN checkpoints (100 keys) into current model.py (44 keys)**: current `_ConvBlock` has no BN. Legacy checkpoints used `Conv3d(..., bias=False) + BatchNorm3d`. Re-adding BN without setting `bias=False` produces the wrong key set (the extra `.bias` keys appear and the BN weights miss). See "Loading legacy FNO+BN checkpoints" under Training Status.
+- **DDP + `find_unused_parameters=True` warning is benign**: torchrun launches print "did not find any unused parameters in the forward pass" for every rank. The flag is needed because the FNO branch's per-axis weights aren't all touched on every step depending on grid dims; the warning costs only one extra autograd graph traversal. Safe to ignore.
