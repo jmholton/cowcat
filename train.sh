@@ -13,4 +13,4 @@
 cd "$SLURM_SUBMIT_DIR"
 source cluster.sh
 setup_pytorch
-python train.py "$@"
+torchrun --nproc_per_node=2 train.py "$@"
