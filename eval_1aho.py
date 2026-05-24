@@ -44,13 +44,19 @@ def _cross_patterson(fofc, fc):
         s=fc.shape).real.astype(np.float32)
 
 
-def _build_input(twofofc, fofc, fc):
-    """4-channel input tensor matching `pack.py --crossp-raw` (no signed_sqrt).
+def _signed_sqrt(arr):
+    return np.sign(arr) * np.sqrt(np.abs(arr))
 
-    Models trained on `*_rawcrossp` datasets saw the raw cross-Patterson at
-    ch3 — match that here.
+
+def _build_input(twofofc, fofc, fc, crossp_raw=False):
+    """4-channel input tensor.
+
+    ch3 cross-Patterson is signed-sqrt compressed by default (matches `pack.py`
+    default = `*_ssqrt` packs). Pass crossp_raw=True for models trained on
+    `pack.py --crossp-raw` (i.e. `*_rawcrossp` packs).
     """
-    ch3 = _cross_patterson(fofc, fc)
+    crossp = _cross_patterson(fofc, fc)
+    ch3 = crossp if crossp_raw else _signed_sqrt(crossp)
     x   = np.stack([twofofc, fofc, fc, ch3], axis=0).astype(np.float32)
     return torch.from_numpy(x[np.newaxis])   # (1, 4, D, H, W)
 
@@ -111,7 +117,7 @@ def _scale_kb(Fo, Fc, s2, n_cycles=4):
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def setup_1aho_eval(eval_dir, fo_label='FP', free_label='FreeR_flag',
-                    mtz_name='refmacout_minRfree.mtz'):
+                    mtz_name='refmacout_minRfree.mtz', crossp_raw=False):
     """Build the context dict consumed by eval_rfree. Returns None on failure.
 
     Loads twofofc/fofc/fc maps + extracts MTZ data. ccp4-python must be on PATH
@@ -127,7 +133,7 @@ def setup_1aho_eval(eval_dir, fo_label='FP', free_label='FreeR_flag',
     twofofc = _load_ccp4_map(d / '2fofc.map')
     fofc    = _load_ccp4_map(d / 'fofc.map')
     fc      = _load_ccp4_map(d / 'fc.map')
-    x       = _build_input(twofofc, fofc, fc)
+    x       = _build_input(twofofc, fofc, fc, crossp_raw=crossp_raw)
 
     mtz = _read_mtz_via_ccp4python(d / mtz_name, fo_label, free_label)
     if mtz is None:

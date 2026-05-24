@@ -36,6 +36,7 @@ set real          = 1aho_test
 set real_fo_label = FP
 set real_mtz      = refmacout_minRfree.mtz
 set skip          = ""
+set crossp_raw    = 0    # 1 → pass --crossp-raw to infer.py (for *_rawcrossp-trained models)
 
 # read command line: key=value pairs
 foreach Arg ( $* )
@@ -69,6 +70,9 @@ endif
 set PYTHON = /programs/pytorch/envs/pt/bin/python
 set SRUN   = "srun --partition=gpu --gres=gpu:1 --ntasks=1 --cpus-per-task=4"
 
+set infer_extra = ""
+if ( "$crossp_raw" == "1" ) set infer_extra = "$infer_extra --crossp-raw"
+
 echo "================================================================"
 echo "inference gamut"
 echo "  checkpoint     = $checkpoint"
@@ -95,7 +99,7 @@ if ( $do_protein ) then
         --2fofc $protein/2fofc.map \
         --fofc  $protein/fofc.map \
         --fc    $protein/fc.map \
-        --output $out_map
+        --output $out_map $infer_extra
     if ( -e "$protein/refmacout.mtz" ) then
         echo ""
         echo "-- rfactor.py vs refmacout.mtz --"
@@ -126,7 +130,7 @@ if ( $do_simple ) then
         --2fofc $simple/2fofc.map \
         --fofc  $simple/fofc.map \
         --fc    $simple/fc.map \
-        --output $out_map
+        --output $out_map $infer_extra
     # simple pipeline has no MTZ; infer.py reports CC vs truth.map if present
 else
     echo "skipped: b10 simple"
@@ -147,7 +151,7 @@ if ( $do_real ) then
         --2fofc $real/2fofc.map \
         --fofc  $real/fofc.map \
         --fc    $real/fc.map \
-        --output $out_map
+        --output $out_map $infer_extra
     if ( -e "$real/$real_mtz" ) then
         echo ""
         echo "-- rfactor.py vs $real_mtz (fo-label=$real_fo_label) --"
