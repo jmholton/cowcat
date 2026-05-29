@@ -133,10 +133,9 @@ def main():
     parser.add_argument('--eval-1aho-fo-label',   default='FP')
     parser.add_argument('--eval-1aho-free-label', default='FreeR_flag')
     parser.add_argument('--eval-1aho-mtz-name',   default='refmacout_minRfree.mtz')
-    parser.add_argument('--eval-1aho-crossp',     default='raw',
-                        choices=['raw', 'signed_sqrt'],
-                        help='Cross-Patterson transform for 1aho eval input '
-                             '(raw=rawcrossp datasets; signed_sqrt=ssqrt datasets)')
+    parser.add_argument('--eval-1aho-crossp-raw', action='store_true',
+                        help='Use raw cross-Patterson for 1aho eval input '
+                             '(default: signed_sqrt, matches *_ssqrt packs)')
     args = parser.parse_args()
 
     # ── DDP setup (torchrun sets LOCAL_RANK / WORLD_SIZE) ─────────────────────
@@ -271,7 +270,7 @@ def main():
             fo_label=args.eval_1aho_fo_label,
             free_label=args.eval_1aho_free_label,
             mtz_name=args.eval_1aho_mtz_name,
-            crossp_transform=args.eval_1aho_crossp,
+            crossp_raw=args.eval_1aho_crossp_raw,
         )
 
     # ── Training loop ─────────────────────────────────────────────────────────

@@ -64,12 +64,17 @@ def _cross_patterson(fofc_arr, fc_arr):
     ).real.astype(np.float32)
 
 
-def _build_input(twofofc, fofc, fc):
+def _build_input(twofofc, fofc, fc, crossp_raw=False):
     """Stack four channels and return a (1, 4, D, H, W) float32 tensor.
 
-    ch0-2: raw e/Å³; ch3: sign(crossp)*sqrt(|crossp|)
+    ch0-2: raw e/Å³
+    ch3: cross-Patterson, signed-sqrt compressed by default (matches
+         `pack.py` default). Pass crossp_raw=True to feed the raw
+         cross-Patterson — required for models trained on `pack.py --crossp-raw`
+         datasets (e.g. `*_rawcrossp`).
     """
-    ch3 = _signed_sqrt(_cross_patterson(fofc, fc))
+    crossp = _cross_patterson(fofc, fc)
+    ch3 = crossp if crossp_raw else _signed_sqrt(crossp)
     x = np.stack([twofofc, fofc, fc, ch3], axis=0)
     return torch.from_numpy(x[np.newaxis].astype(np.float32))  # (1,4,D,H,W)
 
@@ -148,6 +153,10 @@ def main():
                         help='Force CPU even if CUDA is available')
     parser.add_argument('--no-scale', action='store_true',
                         help='Skip the LSQ amplitude rescale against fofc')
+    parser.add_argument('--crossp-raw', action='store_true',
+                        help='Feed RAW cross-Patterson at ch3 instead of the default '
+                             'signed-sqrt. Required for models trained on '
+                             '`pack.py --crossp-raw` datasets (e.g. *_rawcrossp).')
     args = parser.parse_args()
 
     device = torch.device('cpu' if args.cpu or not torch.cuda.is_available() else 'cuda')
@@ -159,7 +168,8 @@ def main():
     fc      = _load_map(args.fc)
     print(f'Grid shape: {twofofc.shape}')
 
-    x = _build_input(twofofc, fofc, fc)
+    x = _build_input(twofofc, fofc, fc, crossp_raw=args.crossp_raw)
+    print(f"cross-Patterson encoding (ch3): {'raw' if args.crossp_raw else 'signed-sqrt'}")
 
     # ── Load model ────────────────────────────────────────────────────────────
     sys.path.insert(0, str(Path(__file__).parent))

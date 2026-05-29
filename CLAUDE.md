@@ -187,14 +187,18 @@ Current loss is **peak-weighted MSE** (α=0.5). Plain MSE returned as metric so 
 
 ### eval pipeline validation
 
-The in-training Rfree_1aho column (printed by `eval_1aho.py` in `train.py`) and external `infer.csh` + `rfactor.py` agree to ~0.003–0.004 R_free. Gap is **tiled inference overhead**: `infer.py` blends 60-voxel patches with 30-voxel overlap (slight softening at boundaries); `eval_1aho.py` runs the whole map at once. Use eval_1aho for relative comparison across epochs; use infer.csh for the canonical reportable number.
+The in-training Rfree_1aho column (printed by `eval_1aho.py` in `train.py`) and external `infer.csh` + `rfactor.py` agree to ~0.003–0.004 R_free. By default `infer.csh` runs whole-map inference (no `--tile`) — same as `eval_1aho.py` — so this isn't a patching artefact. Remaining gap likely comes from differences in how the amplitude rescale interacts with the saved-and-reloaded vs in-memory map values, and from `eval_1aho.py` skipping the demean step. Use eval_1aho for relative comparison across epochs; use infer.csh for the canonical reportable number.
 
-### Datasets available (packed, channel 3 = raw cross-Patterson)
+### Datasets available (packed)
+
+Two cross-Patterson encodings of the same source dirs: `*_rawcrossp` keeps the raw `irfft(rfft(fofc)·conj(rfft(fc)))` at ch3; `*_ssqrt` applies signed-sqrt compression (`sign(x)·sqrt(|x|)`) to tame the spectral peaks of P 21 21 21 cross-Patterson.
 
 | Path | N | Grid | Notes |
 |------|---|------|-------|
 | `data/data_protein_v4_s0_rawcrossp` | 1000 | 144×128×96 | protein v4 (Wilson B match to 1aho, parallel reduce+sfcalc, per-conf geommin) |
 | `data/data_simple_b10_rawcrossp` | 1000 | 144×128×96 | 20 O-atoms B=10 (sharp peak baseline) |
+| `data/data_protein_v4_s0_ssqrt` | 1000 | 144×128×96 | same source as rawcrossp, signed-sqrt ch3 |
+| `data/data_simple_b10_ssqrt` | 1000 | 144×128×96 | same source as rawcrossp, signed-sqrt ch3 |
 | `data/data_1aho_n1000` | 991 | 144×128×96 | 1AHO n=1000 (older NLL training set) |
 | `data/data_simple_v2_s0` | 1000 | 144×128×96 | 20 O-atoms, P 21 21 21 |
 
@@ -224,6 +228,29 @@ self.net = nn.Sequential(
 ```
 
 Revert before resuming training. Pre-FNO checkpoints (88 keys, no FNO branch) additionally need the FNO branch removed — easier to just re-train from scratch.
+
+The Lawrencium `train.py` uses **`strict=False`** when loading `--pretrain`, which silently drops mismatched keys: a 100-key FNO+BN checkpoint loaded into the no-BN model gives `missing keys (random init): 21  unexpected keys (ignored): 77`. The 23 conv weights and the entire FNO branch transfer, but BN's per-channel scale is lost — ep 0 train loss spikes (~120) while the optimizer re-fits the missing pieces. The Voltron `train.py` uses `strict=True` and will error in the same situation. Backport `strict=False` if you want to warm-start across architecture changes here too.
+
+### Ongoing runs (as of 2026-05-23 evening)
+
+| job | host | data | warm-start | ep | best_val | Rfree_1aho |
+|---|---|---|---|---|---|---|
+| `26568133` train_v4_b10_fno_noBN_4gpu_rc | Voltron 4×TITAN V | rawcrossp | none (scratch) | 118 | 0.00384 (ep 116) | 0.1203 |
+| `26569602` train_v4_b10_fno_noBN_ssqrt_2gpu_rc | Voltron 2×TITAN V | ssqrt | `fno_noBN_4gpu_rc/best.pt` | 12 | 0.00378 (ep 12) | 0.1210 |
+| Lawrencium `train_v4_ssqrt_pretrain` | Lawrencium 1×A40 | ssqrt | `fno_lr3e4_4gpu_rc/best.pt` (strict=False) | 2 | 0.00451 (ep 2) | **0.1173** (ep 1) |
+
+Lawrencium's `lr3e4`-warm-start + ssqrt is the most promising of the three so far — Rfree_1aho 0.1173 after just 1 epoch, second-best real-data result behind lr3e4 itself (0.1083). The other two runs are stuck at the ~0.121 plateau characteristic of from-scratch noBN training.
+
+### GPU hardware
+
+| host | GPUs | per-sample wall (training, eff_batch=16) |
+|---|---|---|
+| Voltron | 4× **TITAN V** (Volta GV100, 12 GB, 2017) | ~0.85 s |
+| Lawrencium es1 | 4× **A40** (Ampere, 48 GB, 2020) | ~0.49 s |
+
+A40 is ~1.7× faster per card and has 4× the memory. The earlier `base_features=64` OOM on TITAN V is a 12 GB-VRAM limit, not architectural — bf64 should fit on A40 with room to spare.
+
+Cross-cluster wall-clock comparisons must be normalised by GPU count: Lawrencium 1×A40 at 785 s/ep is *faster per card* than Voltron 4×TITAN V at 341 s/ep — same total compute per epoch, the difference is just how many cards are sharing it.
 
 ## 1AHO Iterative Rebuild (varconf_sweep)
 
@@ -612,3 +639,6 @@ sbatch slurm_untangler_1aho.sh --pdb 1aho/conf3norm_fitGT48.pdb \
 - **`best.pt` `best_val` field is stale by one update**: in `train.py`, the checkpoint dict is constructed *before* `best_val` is updated when a new best is found, so `best.pt`'s stored `best_val` reflects the *previous* best, not the one being saved. Model weights are correct; the metadata field is off. Trust the printed log line, not the field.
 - **Loading legacy FNO+BN checkpoints (100 keys) into current model.py (44 keys)**: current `_ConvBlock` has no BN. Legacy checkpoints used `Conv3d(..., bias=False) + BatchNorm3d`. Re-adding BN without setting `bias=False` produces the wrong key set (the extra `.bias` keys appear and the BN weights miss). See "Loading legacy FNO+BN checkpoints" under Training Status.
 - **DDP + `find_unused_parameters=True` warning is benign**: torchrun launches print "did not find any unused parameters in the forward pass" for every rank. The flag is needed because the FNO branch's per-axis weights aren't all touched on every step depending on grid dims; the warning costs only one extra autograd graph traversal. Safe to ignore.
+- **torchrun port collision when two DDP jobs land on the same node**: torchrun's default rendezvous port is `29500`. If SLURM places a second multi-GPU job on a node already running another torchrun-launched job, both try to bind the same port → `Address already in use` on the second. Pass `--master-port=<unique>` to torchrun (e.g. 29550 / 29551) for any concurrent runs, or use `--master-port=0` to pick freely. `train.csh`/`train1.csh` currently hard-code the default port — fix when running multiple jobs on the same node.
+- **Voltron vs Lawrencium GPU comparisons need GPU-count normalisation**: Voltron = TITAN V (12 GB Volta, 2017), Lawrencium es1 = A40 (48 GB Ampere, 2020). A40 is ~1.7× faster per card. Wall-clock per epoch is therefore misleading across clusters: 1× A40 ≈ 4× TITAN V for the same epoch time. Use s-per-sample-per-GPU = (wall × n_gpus) / 1600 to compare.
+- **train.py strict-load asymmetry across clusters**: Voltron `train.py` does `load_state_dict(sd)` (strict=True), Lawrencium does `load_state_dict(sd, strict=False)`. The latter silently accepts mismatched key sets — useful for warm-starting across architecture changes (e.g. loading a FNO+BN checkpoint into the no-BN model). Backport if you want this on Voltron too.
