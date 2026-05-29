@@ -133,6 +133,10 @@ def main():
     parser.add_argument('--eval-1aho-fo-label',   default='FP')
     parser.add_argument('--eval-1aho-free-label', default='FreeR_flag')
     parser.add_argument('--eval-1aho-mtz-name',   default='refmacout_minRfree.mtz')
+    parser.add_argument('--eval-1aho-crossp',     default='raw',
+                        choices=['raw', 'signed_sqrt'],
+                        help='Cross-Patterson transform for 1aho eval input '
+                             '(raw=rawcrossp datasets; signed_sqrt=ssqrt datasets)')
     args = parser.parse_args()
 
     # ── DDP setup (torchrun sets LOCAL_RANK / WORLD_SIZE) ─────────────────────
@@ -245,10 +249,14 @@ def main():
     elif args.pretrain and os.path.exists(args.pretrain):
         ckpt = torch.load(args.pretrain, map_location=device)
         sd   = ckpt['model']
-        raw_model.load_state_dict(sd)
+        missing, unexpected = raw_model.load_state_dict(sd, strict=False)
         if is_rank0:
             print(f'Loaded pretrained weights (best_val={ckpt.get("best_val", float("inf")):.5f}), '
                   f'optimizer reset')
+            if missing:
+                print(f'  missing keys (random init): {len(missing)}')
+            if unexpected:
+                print(f'  unexpected keys (ignored, e.g. old BN): {len(unexpected)}')
 
     outdir = Path(args.outdir)
     if is_rank0:
@@ -263,6 +271,7 @@ def main():
             fo_label=args.eval_1aho_fo_label,
             free_label=args.eval_1aho_free_label,
             mtz_name=args.eval_1aho_mtz_name,
+            crossp_transform=args.eval_1aho_crossp,
         )
 
     # ── Training loop ─────────────────────────────────────────────────────────
