@@ -135,18 +135,615 @@ _GT48_NCONF = {
 WATER_MIN_NCONF = 3   # minimum ground-truth conformers per water
 
 
-def _set_target_bfactors(pdb_path):
+def _set_target_bfactors(pdb_path, rmsf_by_resnum=None):
     """Override B-factors in pdb_path with gt48-derived values (B=8π²RMSF²/3).
-    Atoms not in the lookup table keep their existing B-factor.
-    Writes the modified structure back in place."""
+
+    Lookup priority:
+      1. rmsf_by_resnum[(resnum, atom_name)]  — set when a reference PDB is
+         given, encodes per-position disorder from that reference's conformer
+         ensemble (overrides the per-restype average).
+      2. _GT48_RMSF[(restype, atom_name)]     — per-restype averages from
+         1AHO/gt48.pdb (the original generator default).
+      3. existing atom B-factor                — used if neither table has an
+         entry for this atom (e.g. unusual atoms).
+
+    Waters (HOH) are intentionally skipped for the *table lookup* — their
+    resnums often collide with protein resnums and the protein-derived RMSFs
+    don't describe water disorder.  But waters that selfref refmac assigned
+    a very large B (because the random placement landed in a no-density
+    region) get their B capped to WATER_B_MAX so jiggle doesn't fly them
+    apart in the subsequent step5 pass.
+
+    Writes the modified structure back in place.
+    """
+    WATER_B_MAX = 30.0   # B² ⇒ RMSF ≤ ~0.6 Å, jiggle max ~0.6 Å per altloc
     st = gemmi.read_structure(str(pdb_path))
     for chain in st[0]:
         for res in chain:
+            if res.name == 'HOH':
+                for atom in res:
+                    if atom.b_iso > WATER_B_MAX:
+                        atom.b_iso = WATER_B_MAX
+                continue
             for atom in res:
+                if rmsf_by_resnum is not None:
+                    rkey = (res.seqid.num, atom.name)
+                    if rkey in rmsf_by_resnum:
+                        atom.b_iso = _rmsf_to_b(rmsf_by_resnum[rkey])
+                        continue
                 key = (res.name, atom.name)
                 if key in _GT48_RMSF:
                     atom.b_iso = _rmsf_to_b(_GT48_RMSF[key])
     st.write_pdb(str(pdb_path))
+def _apply_bfac_table(pdb_path, bfac_table, b_floor=2.0):
+    """Write mean-B values from bfac_table onto pdb_path in place.
+
+    bfac_table: {(resnum, atom_name): mean_b_iso} — protein heavy atoms only.
+    Waters (HOH) are left at their existing B values; non-table atoms unchanged.
+    b_floor: minimum B after assignment (prevents unphysically small values).
+    """
+    st = gemmi.read_structure(str(pdb_path))
+    for chain in st[0]:
+        for res in chain:
+            if res.name == 'HOH':
+                continue
+            rn = res.seqid.num
+            for atom in res:
+                b = bfac_table.get((rn, atom.name))
+                if b is not None:
+                    atom.b_iso = max(b_floor, float(b))
+    st.write_pdb(str(pdb_path))
+
+
+# ── Reference-PDB parser (boiled-from-reference mode) ────────────────────────
+# Extract sequence, per-(resnum, atom) RMSF, and disulfide pairs from a
+# multi-conformer reference PDB (e.g. 1aho/gt48.pdb).  Used by generate_sample
+# when --reference-pdb is given: synthetic samples then have the reference's
+# exact sequence, exact per-atom disorder pattern, and explicit SS bonds.
+
+from functools import lru_cache
+
+SS_DIST_THRESHOLD = 3.0   # Å — chain-A SG-SG distance under which two CYS are
+                          #     considered disulfide-bonded in the reference.
+
+
+@lru_cache(maxsize=4)
+def _parse_reference(pdb_path):
+    """Parse a multi-conformer reference PDB.
+
+    Returns a dict with:
+      sequence:     {resnum: residue_name}  (from chain A)
+      rmsf_table:   {(resnum, atom_name): rmsf_angstroms}  (across all chains)
+      disulfides:   [(resnum_lo, resnum_hi), ...] from chain-A SG-SG < 3 Å
+      unpaired_cys: list of CYS resnums not part of any detected disulfide
+      n_conf:       number of conformer chains found
+      cell:         (a, b, c, α, β, γ)
+      spacegroup_hm: H-M space group symbol
+
+    Cached on pdb_path so re-calls in the same process are free.
+    """
+    st = gemmi.read_structure(str(pdb_path))
+    model = st[0]
+    chains = list(model)
+    if not chains:
+        raise RuntimeError(f'No chains in {pdb_path}')
+
+    # Sequence + disulfide detection from chain A (the reference conformer).
+    a = chains[0]
+    sequence = {r.seqid.num: r.name for r in a}
+    cys_res = [r for r in a if r.name == 'CYS']
+
+    def _sg(res):
+        for atom in res:
+            if atom.name == 'SG':
+                return atom.pos
+        return None
+
+    disulfides = []
+    paired = set()
+    # Pair each CYS with its closest CYS (mutual nearest-neighbour) under SS_DIST_THRESHOLD.
+    sgs = [(r.seqid.num, _sg(r)) for r in cys_res]
+    sgs = [(n, p) for n, p in sgs if p is not None]
+    nearest = {}
+    for i, (ni, pi) in enumerate(sgs):
+        best_d, best_n = None, None
+        for j, (nj, pj) in enumerate(sgs):
+            if i == j:
+                continue
+            d = pi.dist(pj)
+            if d <= SS_DIST_THRESHOLD and (best_d is None or d < best_d):
+                best_d, best_n = d, nj
+        if best_n is not None:
+            nearest[ni] = (best_n, best_d)
+    # Mutual nearest = disulfide
+    for ni, (nj, d) in nearest.items():
+        if nj in nearest and nearest[nj][0] == ni and ni < nj:
+            disulfides.append((ni, nj))
+            paired.add(ni); paired.add(nj)
+    unpaired_cys = sorted(n for n, _ in sgs if n not in paired)
+
+    # Per-(resnum, atom_name) RMSF across all conformer chains.
+    # PROTEIN ONLY — waters (HOH) live in a separate chain in gt48 but share
+    # resnums with protein residues, which would otherwise pollute the table
+    # (e.g. a backbone-O entry at resnum N would mix LYS-O across 48 chains
+    # with the water O at chain z resnum N, giving a huge fake RMSF).
+    coords = {}   # (resnum, atom_name) → list of (x, y, z)
+    for chain in chains:
+        for res in chain:
+            if res.name == 'HOH':
+                continue
+            rn = res.seqid.num
+            for atom in res:
+                if atom.element.name == 'H':
+                    continue
+                coords.setdefault((rn, atom.name), []).append(
+                    (atom.pos.x, atom.pos.y, atom.pos.z))
+
+    # k=2 clustering per atom — flag those whose two clusters are clearly
+    # separated relative to the intra-cluster RMS.  When an atom is bimodal,
+    # `rmsf_table` stores the *intra*-cluster σ (so Gaussian jiggle gives a
+    # tight spread within each parent), and `bimodal_atoms` stores the inter-
+    # cluster distance d (applied as a one-shot ±d/2 split between two parent
+    # models in _apply_bimodal_split before the normal jiggle round).
+    def _kmeans2(pts, max_iter=20):
+        pts = np.asarray(pts, dtype=np.float64)
+        d2 = ((pts[:, None] - pts[None, :]) ** 2).sum(-1)
+        i, j = np.unravel_index(d2.argmax(), d2.shape)
+        c = np.array([pts[i], pts[j]])
+        for _ in range(max_iter):
+            d = ((pts[:, None] - c[None]) ** 2).sum(-1)
+            labels = d.argmin(1)
+            new_c = np.array([pts[labels == k].mean(0) if (labels == k).any() else c[k]
+                              for k in (0, 1)])
+            if np.allclose(new_c, c):
+                break
+            c = new_c
+        return c, labels
+
+    # Mean B-factor per (resnum, atom_name) across conformers.
+    bfac_sums  = {}   # key → [b_iso, ...]
+    for chain in chains:
+        for res in chain:
+            if res.name == 'HOH':
+                continue
+            rn = res.seqid.num
+            for atom in res:
+                if atom.element.name == 'H':
+                    continue
+                bfac_sums.setdefault((rn, atom.name), []).append(atom.b_iso)
+    bfac_table = {k: float(np.mean(v)) for k, v in bfac_sums.items()}
+
+    rmsf_table   = {}
+    bimodal_atoms = {}
+    BIMODAL_MIN_SIGMA = 0.5    # only flag atoms with overall σ > 0.5 Å
+    BIMODAL_MIN_SCORE = 3.0    # d_inter / σ_intra > 3 → clearly bimodal
+    BIMODAL_MAX_DIST  = 5.0    # cap d_inter at physically plausible value
+                               # (anything bigger is almost certainly an artefact
+                               # of mis-aligned conformer chains in the reference)
+    for key, pts in coords.items():
+        if len(pts) < 4:
+            if len(pts) >= 2:
+                arr  = np.asarray(pts, dtype=np.float64)
+                sigma = float(np.sqrt(((arr - arr.mean(0)) ** 2).sum(-1).mean()))
+                rmsf_table[key] = sigma
+            continue
+        arr      = np.asarray(pts, dtype=np.float64)
+        sigma_uni = float(np.sqrt(((arr - arr.mean(0)) ** 2).sum(-1).mean()))
+        cs, labels = _kmeans2(arr)
+        d_inter = float(np.linalg.norm(cs[0] - cs[1]))
+        sigma_intra = float(np.sqrt(np.concatenate([
+            ((arr[labels == 0] - cs[0]) ** 2).sum(-1),
+            ((arr[labels == 1] - cs[1]) ** 2).sum(-1),
+        ]).mean()))
+        score = d_inter / max(sigma_intra, 1e-6)
+        if (sigma_uni > BIMODAL_MIN_SIGMA
+                and score > BIMODAL_MIN_SCORE
+                and d_inter < BIMODAL_MAX_DIST):
+            bimodal_atoms[key] = d_inter
+            rmsf_table[key]    = sigma_intra
+        else:
+            rmsf_table[key]    = sigma_uni
+
+    # Water sites: cluster all HOH-O atoms across conformer chains by spatial
+    # proximity (single-linkage at 1.5 Å). Each cluster represents one
+    # binding site in the reference; cluster_count = how many distinct
+    # ordered-water sites the reference has.  Used by main() to auto-set
+    # --nwaters in boiled mode so the synthetic sample matches the reference's
+    # water density, even though the actual positions are still random.
+    water_positions = []
+    for chain in chains:
+        for res in chain:
+            if res.name != 'HOH':
+                continue
+            for atom in res:
+                if atom.name == 'O':
+                    water_positions.append((atom.pos.x, atom.pos.y, atom.pos.z))
+    n_water_sites = 0
+    if water_positions:
+        wp = np.asarray(water_positions, dtype=np.float64)
+        used = np.zeros(len(wp), dtype=bool)
+        EPS_SQ = 1.5 ** 2
+        for i in range(len(wp)):
+            if used[i]:
+                continue
+            queue = [i]
+            used[i] = True
+            n_water_sites += 1
+            while queue:
+                head = queue.pop()
+                d2 = ((wp - wp[head]) ** 2).sum(-1)
+                for j in np.where((~used) & (d2 < EPS_SQ))[0]:
+                    used[j] = True
+                    queue.append(int(j))
+
+    # High-resolution limit (Å) from REMARK 3 "RESOLUTION RANGE HIGH" if
+    # present.  Set to None if the header doesn't expose it.
+    dmin = None
+    for line in Path(pdb_path).read_text().splitlines():
+        if 'RESOLUTION RANGE HIGH' in line:
+            try:
+                dmin = float(line.split(':')[-1].split()[0])
+            except (ValueError, IndexError):
+                pass
+            break
+
+    return {
+        'sequence':      sequence,
+        'rmsf_table':    rmsf_table,
+        'bfac_table':    bfac_table,
+        'bimodal_atoms': bimodal_atoms,
+        'disulfides':    disulfides,
+        'unpaired_cys':  unpaired_cys,
+        'n_conf':        len(chains),
+        'n_water_sites': n_water_sites,
+        'cell':          (st.cell.a, st.cell.b, st.cell.c,
+                          st.cell.alpha, st.cell.beta, st.cell.gamma),
+        'spacegroup_hm': st.spacegroup_hm,
+        'dmin':          dmin,
+    }
+
+
+def _apply_bimodal_split(in_pdb, bimodal_atoms, parent_A_pdb, parent_B_pdb,
+                         tmpdir, rng, chain='A',
+                         brace_chain='Z', tight_sigma=0.3, brace_sigma=0.5,
+                         brace_exaggerate=2.0,
+                         disulfide_pairs=None, max_reasonable_bond=150.0):
+    """Split selfref into two "parent" PDBs differing only at the bimodal
+    atoms, with bonded geometry kept ideal by phenix.geometry_minimization.
+
+    Mechanism:
+      1. Read selfref; make 2 copies.  For each residue with ≥1 bimodal atom,
+         pick a random unit vector and displace each bimodal atom by ±d/2
+         along it in copy A / copy B.  Non-bimodal atoms stay put.  Bonds
+         to non-bimodal partners are now snapped (e.g. GLY C=O).
+      2. Combine both copies into one PDB: original chain → 'A', second copy
+         → `brace_chain` (default 'Z').
+      3. Build a .eff with extra bond restraints between every atom in chain
+         A and its counterpart in chain Z:
+            - non-bimodal atoms: distance_ideal = 0.001, sigma = tight_sigma
+              (= "very short bonds to hold the rest of the molecule together")
+            - bimodal atoms:     distance_ideal = d_inter, sigma = brace_sigma
+              (= "braces to hold the bimodal atoms apart")
+         Plus the standard SS-bond restraints (in BOTH chains) and
+         excessive_bond_distance_limit so phenix accepts the snapped inputs.
+      4. Run phenix.geometry_minimization on the combined PDB.  Each chain's
+         bonded geometry relaxes toward ideal while the cross-chain braces
+         hold the bimodal split in place.
+      5. Split the minimised output back: chain A → parent_A_pdb,
+         chain Z (renamed to A) → parent_B_pdb.
+
+    Returns the number of bimodal atoms split.
+    """
+    # ── 1. per-residue random direction + per-copy displacement ──────────────
+    bimodal_resnums = sorted({rn for (rn, _) in bimodal_atoms})
+    res_dir = {}
+    for rn in bimodal_resnums:
+        phi   = float(rng.uniform(0, 2 * np.pi))
+        cos_t = float(rng.uniform(-1, 1))
+        sin_t = float(np.sqrt(1 - cos_t * cos_t))
+        res_dir[rn] = (sin_t * np.cos(phi),
+                       sin_t * np.sin(phi),
+                       cos_t)
+
+    st_A = gemmi.read_structure(str(in_pdb))
+    st_B = gemmi.read_structure(str(in_pdb))
+    n_split = 0
+    # Only the protein chain (`chain`, default 'A') gets the bimodal split and
+    # the brace-chain duplication.  Waters/other chains stay singular in the
+    # combined PDB — they aren't in bimodal_atoms anyway, and duplicating them
+    # would collide on resseq with the protein in the brace chain.
+    protein_A = next((ch for ch in st_A[0] if ch.name == chain), None)
+    protein_B = next((ch for ch in st_B[0] if ch.name == chain), None)
+    if protein_A is None or protein_B is None:
+        raise RuntimeError(f'_apply_bimodal_split: chain {chain!r} not found in {in_pdb}')
+    # Initial split: a small fixed displacement (0.3 Å) in each direction —
+    # just enough to break A/Z symmetry so the brace bonds know which way
+    # to pull.  Avoids severing bonds in bimodal_combined.pdb (the input
+    # to phenix); large d_inter atoms like THR27-CG2 at 2.75 Å would shear
+    # off their CB partner if we displaced by full d_inter/2.  The brace
+    # pass then pulls them apart to d_inter * brace_exaggerate while bonded
+    # chemistry holds bond lengths near-ideal.
+    INITIAL_DISP = 0.01
+    for res_A, res_B in zip(protein_A, protein_B):
+        rn = res_A.seqid.num
+        if rn not in res_dir:
+            continue
+        ux, uy, uz = res_dir[rn]
+        for atom_A, atom_B in zip(res_A, res_B):
+            if (rn, atom_A.name) not in bimodal_atoms:
+                continue
+            half = INITIAL_DISP
+            p = atom_A.pos
+            atom_A.pos = gemmi.Position(p.x + half * ux,
+                                        p.y + half * uy,
+                                        p.z + half * uz)
+            atom_B.pos = gemmi.Position(p.x - half * ux,
+                                        p.y - half * uy,
+                                        p.z - half * uz)
+            n_split += 1
+
+    # Capture (resnum, atom_name, pos) tuples NOW — gemmi invalidates chain
+    # iterators after a subsequent add_chain on the same Model.
+    protein_atoms = [(res.seqid.num, atom.name,
+                      np.array([atom.pos.x, atom.pos.y, atom.pos.z]))
+                     for res in protein_A for atom in res]
+    # Atoms within BIMODAL_BRACE_LOOSE_R of any bimodal atom get a LOOSE
+    # brace (larger sigma) instead of the tight one.  Reason: the bimodal
+    # atom moves by ±d/2 between parents; a bonded neighbour (e.g. GLY61-C
+    # bonded to bimodal GLY61-O) braced rigidly at 0.001 Å between parents
+    # cannot satisfy both C-O bond restraints simultaneously without
+    # stretching C-O or the peptide.  A loose brace lets bonded neighbours
+    # drift slightly between parents to track their displaced bimodal
+    # partner.  We can't *remove* the brace — chain A and chain Z atoms
+    # otherwise sit at identical positions and the nonbond repulsion
+    # between them blows the structure apart.
+    BIMODAL_BRACE_LOOSE_R = 2.5  # Å — covers 1-2 bonds out
+    bimodal_xyz = [pos for (rn, name, pos) in protein_atoms
+                   if (rn, name) in bimodal_atoms]
+    if bimodal_xyz:
+        bimodal_xyz = np.stack(bimodal_xyz)
+    loose_keys = set()
+    if len(bimodal_xyz):
+        for (rn, name, pos) in protein_atoms:
+            if (rn, name) in bimodal_atoms:
+                continue
+            if np.min(np.linalg.norm(bimodal_xyz - pos, axis=1)) < BIMODAL_BRACE_LOOSE_R:
+                loose_keys.add((rn, name))
+
+    # ── 2. combine into one PDB: both protein copies in chain A as altloc
+    #     A / B (occ 0.50 each) so phenix treats them as alternate
+    #     conformations and skips nonbond between A↔B.  Waters stay singular.
+    protein_B.name = brace_chain
+    st_A[0].add_chain(protein_B.clone())
+    combined = tmpdir / 'bimodal_combined.pdb'
+    st_A.write_pdb(str(combined))
+
+    # Post-process: rewrite chain Z → chain A with altloc B; chain A → altloc A.
+    # PDB columns (0-indexed): 16=altLoc, 21=chainID, 54:60=occupancy ('%6.2f').
+    new_lines = []
+    for line in combined.read_text().splitlines(keepends=True):
+        if line.startswith(('ATOM  ', 'HETATM')):
+            cid = line[21]
+            if cid == chain:
+                line = line[:16] + 'A' + line[17:54] + '  0.50' + line[60:]
+            elif cid == brace_chain:
+                line = (line[:16] + 'B' + line[17:21] + chain
+                        + line[22:54] + '  0.50' + line[60:])
+        new_lines.append(line)
+    combined.write_text(''.join(new_lines))
+
+    # ── 3. build .eff with cross-altloc bond restraints (protein only).
+    #     altid A ↔ altid B brace bonds replace cross-chain bonds.  Atoms in
+    #     loose_keys (near bimodal) get NO brace — altloc separation already
+    #     turns off nonbond between them, so they're free to find their own
+    #     bonded ideal in each altloc.
+    bond_blocks = []
+    for rn, name, _pos in protein_atoms:
+        if (rn, name) in loose_keys:
+            continue                     # free — nonbond off between altlocs
+        if (rn, name) in bimodal_atoms:
+            d_ideal = float(bimodal_atoms[(rn, name)]) * brace_exaggerate
+            sigma   = brace_sigma
+        else:
+            d_ideal = 0.001
+            sigma   = tight_sigma
+        bond_blocks.append(
+            f'    bond {{\n'
+            f'      action = *add\n'
+            f'      atom_selection_1 = chain {chain} and altid A and resseq {rn} and name {name}\n'
+            f'      atom_selection_2 = chain {chain} and altid B and resseq {rn} and name {name}\n'
+            f'      distance_ideal   = {d_ideal:.4f}\n'
+            f'      sigma            = {sigma:.4f}\n'
+            f'    }}'
+        )
+    # SS restraints inside each altloc so disulfides don't blow apart
+    if disulfide_pairs:
+        for altid in ('A', 'B'):
+            for a, b in disulfide_pairs:
+                bond_blocks.append(
+                    f'    bond {{\n'
+                    f'      action = *add\n'
+                    f'      atom_selection_1 = chain {chain} and altid {altid} and resseq {a} and name SG\n'
+                    f'      atom_selection_2 = chain {chain} and altid {altid} and resseq {b} and name SG\n'
+                    f'      distance_ideal   = 2.05\n'
+                    f'      sigma            = 0.05\n'
+                    f'    }}'
+                )
+    eff_path = tmpdir / 'bimodal_braces.eff'
+    eff_path.write_text(
+        f'pdb_interpretation {{\n'
+        f'  proceed_with_excessive_length_bonds = True\n'
+        f'  max_reasonable_bond_distance        = {max_reasonable_bond}\n'
+        f'}}\n'
+        f'geometry_restraints {{\n'
+        f'  edits {{\n'
+        f'    excessive_bond_distance_limit = {max_reasonable_bond}\n'
+        + '\n'.join(bond_blocks) + '\n'
+        f'  }}\n'
+        f'}}\n'
+    )
+
+    # ── 4. phenix.geometry_minimization on the combined PDB ──────────────────
+    base_cmd = ['cdl=false', 'link_all=False', 'link_none=True',
+                'link_ligands=False', 'correct_hydrogens=False']
+    cmd = [PHENIX_GM, combined.name, eff_path.name] + base_cmd
+    result = run(cmd, cwd=tmpdir, check=False)
+    log_text = result.stdout.decode(errors='replace') + result.stderr.decode(errors='replace')
+    (tmpdir / 'bimodal_braces.phenix.log').write_text(log_text)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'phenix.geometry_minimization (bimodal braces) failed:\n{log_text[-2000:]}')
+    minim = tmpdir / 'bimodal_combined_minimized.pdb'
+    if not minim.exists():
+        raise RuntimeError(f'phenix bimodal-brace output not found: {minim}')
+
+    # ── 4b. intermediate pass: drop the LONG bimodal braces, keep only the
+    #     short cross-chain "local consistency" braces at sigma=0.3.  With
+    #     no long brace pulling them apart, the bimodal atoms relax to
+    #     their bonded chemistry ideal in each chain.  Those ideals differ
+    #     because the loose-near-bimodal atoms drifted in step 4, so the
+    #     gap survives — but the bonded geometry is now clean.
+    inter_bonds = []
+    for rn, name, _pos in protein_atoms:
+        if name != 'CA':
+            continue
+        if (rn, name) in bimodal_atoms:
+            continue
+        inter_bonds.append(
+            f'    bond {{\n'
+            f'      action = *add\n'
+            f'      atom_selection_1 = chain {chain} and altid A and resseq {rn} and name {name}\n'
+            f'      atom_selection_2 = chain {chain} and altid B and resseq {rn} and name {name}\n'
+            f'      distance_ideal   = 0.0010\n'
+            f'      sigma            = 0.3000\n'
+            f'    }}'
+        )
+    if disulfide_pairs:
+        for altid in ('A', 'B'):
+            for a, b in disulfide_pairs:
+                inter_bonds.append(
+                    f'    bond {{\n'
+                    f'      action = *add\n'
+                    f'      atom_selection_1 = chain {chain} and altid {altid} and resseq {a} and name SG\n'
+                    f'      atom_selection_2 = chain {chain} and altid {altid} and resseq {b} and name SG\n'
+                    f'      distance_ideal   = 2.05\n'
+                    f'      sigma            = 0.05\n'
+                    f'    }}'
+                )
+    inter_eff = tmpdir / 'bimodal_intermediate.eff'
+    inter_eff.write_text(
+        f'pdb_interpretation {{\n'
+        f'  proceed_with_excessive_length_bonds = True\n'
+        f'  max_reasonable_bond_distance        = {max_reasonable_bond}\n'
+        f'}}\n'
+        f'geometry_restraints {{\n'
+        f'  edits {{\n'
+        f'    excessive_bond_distance_limit = {max_reasonable_bond}\n'
+        + '\n'.join(inter_bonds) + '\n'
+        f'  }}\n'
+        f'}}\n'
+    )
+    cmd = [PHENIX_GM, minim.name, inter_eff.name] + base_cmd
+    result = run(cmd, cwd=tmpdir, check=False)
+    log_text = result.stdout.decode(errors='replace') + result.stderr.decode(errors='replace')
+    (tmpdir / 'bimodal_intermediate.phenix.log').write_text(log_text)
+    inter_minim = tmpdir / 'bimodal_combined_minimized_minimized.pdb'
+    if result.returncode != 0 or not inter_minim.exists():
+        print(f'    [bimodal intermediate diverged; using brace-pass output instead]',
+              flush=True)
+    else:
+        minim = inter_minim  # use intermediate output for the split
+
+    # ── 5. split back: minimised chain A altloc A → parent_A's chain A,
+    #     minimised chain A altloc B → parent_B's chain A.  Altloc letters
+    #     and occupancies are stripped (singular chain A with occ 1.0).
+    #     Waters / other non-protein chains come unchanged from selfref.
+    #     Done as PDB text rewrite to avoid gemmi altloc-handling quirks.
+    minim_lines = minim.read_text().splitlines(keepends=True)
+
+    # Header: CRYST1/SCALE/SSBOND from minim — drop LINK (brace bonds between
+    # altlocs A/B — meaningless in the singular-altloc parent PDBs).
+    header = []
+    for line in minim_lines:
+        if line.startswith(('ATOM  ', 'HETATM', 'TER', 'END')):
+            break
+        if not line.startswith('LINK'):
+            header.append(line)
+
+    # Nonchain lines (chain W waters) come from selfref unchanged; compute once
+    # since both parents share the same water set.  Writing nonchain_lines AFTER
+    # the protein ATOM block (no TER/END in between) ensures gemmi reads chain W
+    # when it later parses parent_{A,B}.pdb.
+    st_p = gemmi.read_structure(str(in_pdb))
+    st_p[0].remove_chain(chain)
+    nonchain_pdb = tmpdir / '_nonchain_template.pdb'
+    st_p.write_pdb(str(nonchain_pdb))
+    nonchain_lines = [ln for ln in nonchain_pdb.read_text().splitlines(keepends=True)
+                      if ln.startswith(('ATOM  ', 'HETATM'))]
+
+    for parent_path, keep_alt in ((parent_A_pdb, 'A'), (parent_B_pdb, 'B')):
+        kept = []
+        for line in minim_lines:
+            if not line.startswith(('ATOM  ', 'HETATM')):
+                continue
+            if line[21] != chain:
+                continue
+            alt = line[16]
+            if alt not in (' ', keep_alt):
+                continue
+            kept.append(line[:16] + ' ' + line[17:54] + '  1.00' + line[60:])
+        parent_path.write_text(''.join(header) + ''.join(kept)
+                               + ''.join(nonchain_lines) + 'END\n')
+    return n_split
+
+
+def _ssbond_record(idx, resnum_a, resnum_b, dist=2.04, chain='A'):
+    """Format a single SSBOND PDB record (column-precise).
+
+    Columns: 1-6 SSBOND, 8-10 serNum, 12-14 resName, 16 chainID,
+             18-21 resNum, 26-28 resName, 30 chainID, 32-35 resNum,
+             60-65 sym1, 67-72 sym2, 74-78 length.
+    """
+    return (f'SSBOND {idx:3d} CYS {chain}{resnum_a:5d}    '
+            f'CYS {chain}{resnum_b:5d}                          '
+            f'1555   1555 {dist:5.2f}\n')
+
+
+def _link_record(resnum_a, resnum_b, dist=2.04, chain='A'):
+    """Format a PDB LINK record for a CYS-SG to CYS-SG disulfide.
+
+    Column-precise per the PDB v3.3 LINK spec:
+      13-16 name1, 17 altLoc1, 18-20 resName1, 22 chainID1, 23-26 resSeq1,
+      43-46 name2, 47 altLoc2, 48-50 resName2, 52 chainID2, 53-56 resSeq2,
+      60-65 sym1, 67-72 sym2, 74-78 length.
+    """
+    return (f'LINK         SG  CYS {chain}{resnum_a:4d}'
+            f'                 SG  CYS {chain}{resnum_b:4d}'
+            f'     1555   1555  {dist:4.2f}\n')
+
+
+def _inject_ssbonds(pdb_path, disulfide_pairs, chain='A'):
+    """Insert SSBOND + LINK records into a PDB file before the first ATOM line.
+
+    Refmac obeys explicit LINK records over its own coordinate-based
+    auto-detection; emitting both LINK and SSBOND ensures phenix and refmac
+    are on the same page. No-op when disulfide_pairs is empty.  Idempotent if
+    called twice (existing SSBOND/LINK lines are replaced).
+    """
+    if not disulfide_pairs:
+        return
+    p = Path(pdb_path)
+    lines = p.read_text().splitlines(keepends=True)
+    # Drop any existing SSBOND / LINK records for SS pairs.
+    lines = [ln for ln in lines if not ln.startswith(('SSBOND', 'LINK'))]
+    insert_at = next((i for i, ln in enumerate(lines)
+                      if ln.startswith(('ATOM', 'HETATM'))), len(lines))
+    ss_text   = [_ssbond_record(i + 1, a, b, chain=chain)
+                 for i, (a, b) in enumerate(disulfide_pairs)]
+    link_text = [_link_record(a, b, chain=chain)
+                 for (a, b) in disulfide_pairs]
+    lines[insert_at:insert_at] = ss_text + link_text
+    p.write_text(''.join(lines))
 
 # Altloc displacement threshold (Å): side chains further than this
 # from their centroid stay as separate altloc atoms in the partial model
@@ -286,16 +883,9 @@ def step3_setup_structure(tmpdir, rng, n_waters=10):
                                     BFAC_SC_MIN, BFAC_SC_MAX))
         a.occ = 1.0
 
-    # Centre at ASU centre: (a/2, b/2, c/2) for P1; (a/4, b/4, c/2) for others
-    cx = sum(a.pos.x for a in all_atoms) / len(all_atoms)
-    cy = sum(a.pos.y for a in all_atoms) / len(all_atoms)
-    cz = sum(a.pos.z for a in all_atoms) / len(all_atoms)
-    tx = CELL[0]/2 if is_p1 else CELL[0]/4
-    ty = CELL[1]/2 if is_p1 else CELL[1]/4
-    tz = CELL[2]/2
-    dx, dy, dz = tx - cx, ty - cy, tz - cz
-    for a in all_atoms:
-        a.pos = gemmi.Position(a.pos.x + dx, a.pos.y + dy, a.pos.z + dz)
+    # (centering removed — let phenix/refmac handle positioning; for non-P1
+    # boiled runs the random-coil centroid often crosses ASU boundaries when
+    # forced to (a/4, b/4, c/2), triggering symmetry-mate clashes downstream.)
 
     # Set protein chain name to 'A'
     for chain in st[0]:
@@ -343,15 +933,22 @@ def step3_setup_structure(tmpdir, rng, n_waters=10):
     return added
 
 
-def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0):
-    """Return set of (chain, resnum) pairs involved in severe nonbond clashes.
+def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0, bond_delta_threshold=0.3):
+    """Return set of (chain, resnum) pairs involved in severe clashes.
 
-    Parses phenix .geo nonbonded blocks using the Lennard-Jones energy formula
-    from molprobify_runme.com:
-      lj0(r, r0) = 4 * ((r0*2^(-1/6)/r)^12 - (r0*2^(-1/6)/r)^6)
-      lj(r, r0)  = lj0(r, r0) - lj0(6, r0)   [shifted to 0 at r=6 Å]
+    Parses phenix .geo files for two clash signatures:
 
-    Only heavy-atom clashes (obs < ideal) above lj_threshold are flagged.
+    1. Nonbonded: LJ energy > lj_threshold when obs < vdw_ideal.
+       Formula from molprobify_runme.com:
+         lj0(r, r0) = 4 * ((r0*2^(-1/6)/r)^12 - (r0*2^(-1/6)/r)^6)
+         lj(r, r0)  = lj0(r, r0) - lj0(6, r0)   [shifted to 0 at r=6 Å]
+
+    2. Bond lengths: |delta| > bond_delta_threshold (Å).  Severely stretched
+       or compressed covalent bonds arise when atoms are threaded through each
+       other or pushed apart by an irresolvable clash — both indicate clashing
+       geometry that geometry_minimization could not fully relax.
+
+    Only heavy-atom pairs are checked in both cases.
     Atom ID format in .geo: 15-char PDB string; chain at index 9, resnum 10:15.
     """
     def _lj(r, r0):
@@ -362,6 +959,16 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0):
             return 4 * ((s / r) ** 12 - (s / r) ** 6)
         return lj0(r) - lj0(6.0)
 
+    def _add_pair(id1, id2):
+        for id_str in (id1, id2):
+            if len(id_str) >= 15:
+                chain  = id_str[9]
+                try:
+                    resnum = int(id_str[10:15])
+                    bad.add((chain, resnum))
+                except ValueError:
+                    pass
+
     bad = set()
     try:
         lines = Path(geo_file).read_text().splitlines()
@@ -370,12 +977,12 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0):
 
     i = 0
     while i < len(lines):
-        if 'nonbonded pdb=' in lines[i]:
-            m1 = re.search(r'"([^"]*)"', lines[i])
+        line = lines[i]
+        if 'nonbonded pdb=' in line:
+            m1 = re.search(r'"([^"]*)"', line)
             m2 = re.search(r'"([^"]*)"', lines[i + 1]) if i + 1 < len(lines) else None
             if m1 and m2 and i + 3 < len(lines):
                 id1, id2 = m1.group(1), m2.group(1)
-                # Skip hydrogen pairs — H atoms have name starting with H after strip
                 atom1 = id1[0:4].strip() if len(id1) >= 4 else ''
                 atom2 = id2[0:4].strip() if len(id2) >= 4 else ''
                 if not atom1.startswith('H') and not atom2.startswith('H'):
@@ -384,11 +991,24 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0):
                         try:
                             obs, ideal = float(parts[0]), float(parts[1])
                             if obs < ideal and _lj(obs, ideal) > lj_threshold:
-                                for id_str in (id1, id2):
-                                    if len(id_str) >= 15:
-                                        chain  = id_str[9]
-                                        resnum = int(id_str[10:15])
-                                        bad.add((chain, resnum))
+                                _add_pair(id1, id2)
+                        except ValueError:
+                            pass
+            i += 4
+        elif 'bond pdb=' in line:
+            m1 = re.search(r'"([^"]*)"', line)
+            m2 = re.search(r'"([^"]*)"', lines[i + 1]) if i + 1 < len(lines) else None
+            if m1 and m2 and i + 3 < len(lines):
+                id1, id2 = m1.group(1), m2.group(1)
+                atom1 = id1[0:4].strip() if len(id1) >= 4 else ''
+                atom2 = id2[0:4].strip() if len(id2) >= 4 else ''
+                if not atom1.startswith('H') and not atom2.startswith('H'):
+                    parts = lines[i + 3].split()
+                    # bond data line: ideal  model  delta  sigma  weight  residual
+                    if len(parts) >= 3:
+                        try:
+                            if abs(float(parts[2])) > bond_delta_threshold:
+                                _add_pair(id1, id2)
                         except ValueError:
                             pass
             i += 4
@@ -397,15 +1017,94 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0):
     return bad
 
 
-def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None):
+def _swap_cryst1(pdb_path, new_a, new_b, new_c, new_sg='P 1', restore=None):
+    """Replace the CRYST1 line in pdb_path with the given cell, optionally
+    returning the original line so the caller can restore it later.
+
+    If restore is given, it should be the previously returned CRYST1 line
+    (including the trailing newline) and the function will swap it back in
+    place of whatever CRYST1 line currently exists in the file.
+    """
+    p = Path(pdb_path)
+    lines = p.read_text().splitlines(keepends=True)
+    orig = None
+    for i, ln in enumerate(lines):
+        if ln.startswith('CRYST1'):
+            orig = ln
+            break
+    new_line = (f'CRYST1{new_a:9.3f}{new_b:9.3f}{new_c:9.3f}'
+                f'  90.00  90.00  90.00 {new_sg:<11s}\n')
+    if restore is not None:
+        new_line = restore
+    if orig is None:
+        lines.insert(0, new_line)
+    else:
+        lines[i] = new_line
+    p.write_text(''.join(lines))
+    return orig
+
+
+def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None,
+                         disulfide_pairs=None, chain='A',
+                         max_reasonable_bond=150.0):
     """Run phenix.geometry_minimization; return path to *_minimized.pdb.
+
+    When disulfide_pairs is given (list of (resnum_a, resnum_b)), writes a
+    .eff parameter file with explicit `geometry_restraints.edits.bond` entries
+    for each pair (distance_ideal=2.05, sigma=0.05) plus
+    `proceed_with_excessive_length_bonds=True` and a large
+    `max_reasonable_bond_distance` so phenix accepts random-coil starting
+    geometries.  Phenix hard-caps the bond-distance limit at the shortest
+    cell axis, so we also temporarily widen the cell in the input PDB to
+    `max_reasonable_bond` and restore the original CRYST1 in the output.
+    The minimiser's gradient pulls the SG atoms together.
 
     Saves stdout+stderr to {stem}{log_tag}.phenix.log in tmpdir.
     """
-    result = run([PHENIX_GM, pdb_name, 'cdl=false',
-                  'link_all=False', 'link_none=True', 'link_ligands=False',
-                  'correct_hydrogens=False'],
-                 cwd=tmpdir, check=False)
+    cmd = [PHENIX_GM, pdb_name, 'cdl=false',
+           'link_all=False', 'link_none=True', 'link_ligands=False',
+           'correct_hydrogens=False']
+    orig_cryst1 = None
+    if disulfide_pairs:
+        eff_path = Path(tmpdir) / f'{Path(pdb_name).stem}_disulfides.eff'
+        bond_blocks = '\n'.join(f'''    bond {{
+      action = *add
+      atom_selection_1 = chain {chain} and resseq {a} and name SG
+      atom_selection_2 = chain {chain} and resseq {b} and name SG
+      distance_ideal   = 2.05
+      sigma            = 0.05
+    }}''' for a, b in disulfide_pairs)
+        eff_text = f'''pdb_interpretation {{
+  proceed_with_excessive_length_bonds = True
+  max_reasonable_bond_distance        = {max_reasonable_bond}
+}}
+geometry_restraints {{
+  edits {{
+    excessive_bond_distance_limit = {max_reasonable_bond}
+{bond_blocks}
+  }}
+}}
+'''
+        eff_path.write_text(eff_text)
+        cmd.append(eff_path.name)
+        # Only widen the cell to P1 when the SS bonds are *longer* than the
+        # shortest cell axis (phenix's hard upper bound).  After the first
+        # pull pass the SGs are within 2-3 Å, so a second symmetry-aware
+        # pass can keep the target cell+SG (which is what packs the chain).
+        st_in = gemmi.read_structure(str(Path(tmpdir) / pdb_name))
+        cur_ss_max = 0.0
+        chain_a = list(st_in[0])[0]
+        sg_pos = {r.seqid.num: at.pos for r in chain_a if r.name == 'CYS'
+                  for at in r if at.name == 'SG'}
+        for a, b in disulfide_pairs:
+            if a in sg_pos and b in sg_pos:
+                cur_ss_max = max(cur_ss_max, sg_pos[a].dist(sg_pos[b]))
+        shortest_axis = min(st_in.cell.a, st_in.cell.b, st_in.cell.c)
+        if cur_ss_max > shortest_axis * 0.9:
+            orig_cryst1 = _swap_cryst1(Path(tmpdir) / pdb_name,
+                                       max_reasonable_bond, max_reasonable_bond,
+                                       max_reasonable_bond, new_sg='P 1')
+    result = run(cmd, cwd=tmpdir, check=False)
     stem = Path(pdb_name).stem
     log_name = f'{stem}{log_tag or ""}.phenix.log'
     log_text = result.stdout.decode(errors='replace') + result.stderr.decode(errors='replace')
@@ -416,11 +1115,17 @@ def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None):
     out = tmpdir / f'{stem}_minimized.pdb'
     if not out.exists():
         raise RuntimeError(f'phenix output not found: {out}')
+
+    # Restore the original CRYST1 in both the input and the minimised output
+    # so downstream steps see the real cell.
+    if orig_cryst1 is not None:
+        _swap_cryst1(Path(tmpdir) / pdb_name, 0, 0, 0, restore=orig_cryst1)
+        _swap_cryst1(out, 0, 0, 0, restore=orig_cryst1)
     return out
 
 
 def step4b_selfref_b_factors(minimized_pdb, tmpdir, target_wilson_b=None,
-                              b_floor=2.0):
+                              b_floor=5.0, water_b_floor=10.0):
     """Refine single-conf model against its own SFs to get realistic B factors.
 
     Runs refmac for 20 cycles with the model as both PDB and (synthetic) data
@@ -441,7 +1146,7 @@ def step4b_selfref_b_factors(minimized_pdb, tmpdir, target_wilson_b=None,
     step7_build_refme_mtz(tmpdir / 'selfref.mtz', tmpdir / 'selfref_refme.mtz')
 
     keywords = (
-        b'MAKE HYDR NO NEWLIGAND NOEXIT\n'
+        b'MAKE HYDR NO NEWLIGAND NOEXIT LINK NO\n'
         b'NCYC 20\n'
         b'LABIN FP=F SIGFP=SIGF\n'
         b'LABOUT FC=FC PHIC=PHIC\n'
@@ -485,11 +1190,13 @@ def step4b_selfref_b_factors(minimized_pdb, tmpdir, target_wilson_b=None,
         st = gemmi.read_structure(str(out))
         for chain in st[0]:
             for res in chain:
+                floor = water_b_floor if res.name == 'HOH' else b_floor
                 for atom in res:
-                    atom.b_iso = max(b_floor, atom.b_iso - delta_B)
+                    atom.b_iso = max(floor, atom.b_iso - delta_B)
         st.write_pdb(str(out))
         print(f'    selfref Wilson B: {gen_B:.2f} → target {target_wilson_b:.2f}, '
-              f'B-factor shift = {-delta_B:+.2f} Å²')
+              f'B-factor shift = {-delta_B:+.2f} Å²  '
+              f'(b_floor={b_floor:.0f}, water_floor={water_b_floor:.0f})')
 
     return out
 
@@ -506,15 +1213,66 @@ def _apply_flood_signs(pdb_path, rng):
         if chain.name != 'F':
             continue
         for res in chain:
-            sign = float(rng.choice([-1, 1]))
+            sign = float(rng.choice([1, 1]))
             for atom in res:
                 atom.occ = abs(atom.occ) * sign
     st.write_pdb(str(pdb_path))
 
 
+def _align_conformers_by_ca(conf_pdbs, chain_name='A'):
+    """Kabsch-align all conformers' protein-chain atoms to the first
+    conformer using CA positions.
+
+    After per-conformer phenix.geommin, each conformer can be rigid-body
+    drifted from the others.  This rotates+translates every conformer
+    (except the reference, conf_pdbs[0]) so their CA atoms in chain
+    `chain_name` superpose by least squares.  ONLY atoms in `chain_name`
+    are moved — waters and other chains stay where the per-conformer
+    pipeline left them (e.g. ordered waters in chain W keep their
+    independent jiggle positions instead of being dragged by the
+    protein's rigid alignment).  Internal protein geometry is preserved.
+    """
+    if len(conf_pdbs) < 2:
+        return
+    ref = gemmi.read_structure(str(conf_pdbs[0]))
+    ref_ca = np.array([
+        (a.pos.x, a.pos.y, a.pos.z)
+        for ch in ref[0] if ch.name == chain_name
+        for res in ch for a in res if a.name == 'CA'
+    ])
+    if len(ref_ca) == 0:
+        return
+    ref_centroid = ref_ca.mean(axis=0)
+    P = ref_ca - ref_centroid
+    for conf in conf_pdbs[1:]:
+        st = gemmi.read_structure(str(conf))
+        mob_ca = np.array([
+            (a.pos.x, a.pos.y, a.pos.z)
+            for ch in st[0] if ch.name == chain_name
+            for res in ch for a in res if a.name == 'CA'
+        ])
+        if len(mob_ca) != len(ref_ca):
+            continue
+        mob_centroid = mob_ca.mean(axis=0)
+        Q = mob_ca - mob_centroid
+        H = Q.T @ P
+        U, _, Vt = np.linalg.svd(H)
+        d = np.sign(np.linalg.det(Vt.T @ U.T))
+        R = Vt.T @ np.diag([1.0, 1.0, float(d)]) @ U.T
+        for chain in st[0]:
+            if chain.name != chain_name:
+                continue  # waters / other chains stay put
+            for res in chain:
+                for atom in res:
+                    p = np.array([atom.pos.x, atom.pos.y, atom.pos.z])
+                    q = R @ (p - mob_centroid) + ref_centroid
+                    atom.pos = gemmi.Position(float(q[0]), float(q[1]), float(q[2]))
+        st.write_pdb(str(conf))
+
+
 def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlocs=2,
-                              per_conf_geommin=False, bfac_source_pdb=None,
-                              add_h_per_conf=True):
+                              per_conf_geommin=True, bfac_source_pdb=None,
+                              add_h_per_conf=True, jiggle_shift='byB'):
     """Run jigglepdb n_altlocs times, optionally minimize each conformer in
     parallel, then combine → multiconf.pdb with N protein chains (A, B, … occ=1/N)
     and N water chains (a, b, … occ=1/N).
@@ -531,19 +1289,68 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
     """
     labels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[:n_altlocs]
     seeds  = [int(rng.integers(1000, 99999)) for _ in range(n_altlocs)]
+    # 'uniformB' is not a built-in jigglepdb shift_opt; translate it.
+    if jiggle_shift == 'uniformB':
+        jigglepdb_shift = 'byB'
+        extra_jiggle_args = ['-v', 'distribution=uniform']
+    else:
+        jigglepdb_shift = jiggle_shift
+        extra_jiggle_args = []
+    # selfref_pdb may be a single Path/str OR a list of N parent PDBs (one per
+    # altloc).  The list form is used by the bimodal-split branch in
+    # generate_sample to seed half the altlocs from each parent.
+    if isinstance(selfref_pdb, (str, Path)):
+        parent_per_altloc = [selfref_pdb] * n_altlocs
+    else:
+        parent_per_altloc = list(selfref_pdb)
+        if len(parent_per_altloc) != n_altlocs:
+            raise ValueError(
+                f'step5_jigglepdb: got {len(parent_per_altloc)} parent PDBs '
+                f'but n_altlocs={n_altlocs}; lengths must match')
+    # Split each parent into protein-only (chain A) and waters (chain W) before
+    # jigglepdb — waters are added back AFTER per-conf-geommin + CA-align so
+    # they don't get scrambled by the heavy phenix relaxation each altloc gets.
+    waters_pristine = tmpdir / 'waters_pristine.pdb'
+    waters_written  = False
+    protein_parents = []
+    for i, parent in enumerate(parent_per_altloc):
+        st = gemmi.read_structure(str(parent))
+        # Extract waters once (from the first parent — both parents share waters)
+        if not waters_written:
+            st_w = gemmi.Structure()
+            st_w.cell          = st.cell
+            st_w.spacegroup_hm = st.spacegroup_hm
+            mw = gemmi.Model('1')
+            for ch in st[0]:
+                if ch.name != 'A':
+                    mw.add_chain(ch.clone())
+            if len(mw):
+                st_w.add_model(mw)
+                st_w.write_pdb(str(waters_pristine))
+            waters_written = True
+        # Protein-only copy of the parent.  Capture chain names first —
+        # gemmi invalidates chain references after remove_chain().
+        non_a_chains = [ch.name for ch in st[0] if ch.name != 'A']
+        for name in non_a_chains:
+            st[0].remove_chain(name)
+        prot_path = tmpdir / f'parent_protein_{i}.pdb'
+        st.write_pdb(str(prot_path))
+        protein_parents.append(prot_path)
+
     conf_pdbs = []
-    for seed, label in zip(seeds, labels):
+    for parent, seed, label in zip(protein_parents, seeds, labels):
         result = run(
             ['awk', '-f', str(JIGGLEPDB),
              '-v', f'seed={seed}',
-             '-v', 'shift=byB',
+             '-v', f'shift={jigglepdb_shift}',
              '-v', f'shift_scale={shift_scale}',
              '-v', 'dry_shift_scale=1.0',
-             '-v', 'frac_thrubond=0.9',
-             '-v', 'ncyc_thrubond=500',
+             '-v', 'frac_thrubond=0.1',
+             '-v', 'ncyc_thrubond=10',
              '-v', 'frac_magnforce=1.1',
-             '-v', 'ncyc_magnforce=500',
-             str(selfref_pdb)],
+             '-v', 'ncyc_magnforce=10',
+             *extra_jiggle_args,
+             str(parent)],
             cwd=tmpdir
         )
         p = tmpdir / f'conf{label}.pdb'
@@ -551,11 +1358,17 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
         conf_pdbs.append(p)
 
     if per_conf_geommin:
+        print(f'  per-conf geo min')
         # Minimize each single-conformer PDB independently and in parallel.
         def _minimize_one(conf_pdb):
             return step4_phenix_geommin(conf_pdb.name, tmpdir, log_tag=f'_{conf_pdb.stem}')
         with ThreadPoolExecutor(max_workers=n_altlocs) as pool:
             conf_pdbs = list(pool.map(_minimize_one, conf_pdbs))
+        # Each conformer is minimized independently, so they can drift apart
+        # rigidly even when local geometry is fine.  Least-squares-align every
+        # conformer to the first by CA positions to undo that drift.
+        print(f'  aligning CA atoms')
+        _align_conformers_by_ca(conf_pdbs)
     # else: use jigglepdb output directly (no per-conformer phenix.GM).
     # Geometry errors from jigglepdb are small (~0.05 Å bonds) given the
     # through-bond correlated displacement; refmac refinement in step9
@@ -578,6 +1391,42 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
             return out
         with ThreadPoolExecutor(max_workers=n_altlocs) as pool:
             conf_pdbs = list(pool.map(_reduce_one, conf_pdbs))
+
+    # Now that protein altlocs have been jiggled + minimized + CA-aligned +
+    # H-added, jiggle the waters separately (one byB jiggle per altloc seed,
+    # no phenix.geommin) and append into each conf*.pdb.  Waters thus get
+    # realistic spread without being scrambled by the protein-side phenix
+    # passes.  Only the ATOM/HETATM records of the water file are appended;
+    # CRYST1/header stays from the protein conf PDB.
+    if waters_pristine.exists():
+        water_seeds = [int(rng.integers(1000, 99999)) for _ in range(n_altlocs)]
+        for conf_pdb, w_seed, label in zip(conf_pdbs, water_seeds, labels):
+            water_result = run(
+                ['awk', '-f', str(JIGGLEPDB),
+                 '-v', f'seed={w_seed}',
+                 '-v', f'shift={jigglepdb_shift}',
+                 '-v', f'shift_scale={shift_scale}',
+                 '-v', 'dry_shift_scale=1.0',
+                 '-v', 'frac_thrubond=0.1',
+                 '-v', 'ncyc_thrubond=10',
+                 '-v', 'frac_magnforce=1.1',
+                 '-v', 'ncyc_magnforce=10',
+                 *extra_jiggle_args,
+                 str(waters_pristine)],
+                cwd=tmpdir
+            )
+            water_path = tmpdir / f'water{label}.pdb'
+            water_path.write_bytes(water_result.stdout)
+            # Append water ATOM/HETATM lines into the protein conf PDB,
+            # stripping its END so the merged file remains valid.
+            prot_lines = conf_pdb.read_text().splitlines()
+            water_lines = [ln for ln in water_path.read_text().splitlines()
+                           if ln.startswith(('ATOM', 'HETATM'))]
+            # Drop trailing END (if present) from protein, then append waters.
+            while prot_lines and prot_lines[-1].startswith(('END', 'MASTER', 'CONECT')):
+                prot_lines.pop()
+            merged = '\n'.join(prot_lines + water_lines + ['END', ''])
+            conf_pdb.write_text(merged)
 
     # Build multiconf.pdb in single-chain altloc form to match refmacout.pdb labeling:
     #   chain A: protein, every atom has altloc A,B,…,N (occ=1/N each)
@@ -642,6 +1491,30 @@ def step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng, shift_scale=0.5, n_altlo
         model_out.add_chain(water_chain)
 
     st_out.add_model(model_out)
+
+    # Riding-H B-factor fix: phenix.reduce gives H atoms a default low B
+    # (~3.87 Å²) and the bfac_source override only repopulates heavy-atom
+    # B's, leaving H at the default — Fc(model)+H then mis-weights H and
+    # the difference map shows positive density on every H.  For each H,
+    # copy the B of the nearest same-altloc heavy atom in the same residue.
+    for chain in st_out[0]:
+        for res in chain:
+            heavy = [a for a in res if a.element.name != 'H']
+            if not heavy:
+                continue
+            hpos = np.array([(a.pos.x, a.pos.y, a.pos.z) for a in heavy])
+            for atom in res:
+                if atom.element.name != 'H':
+                    continue
+                # Prefer same-altloc parent; fall back to nearest of any altloc.
+                same = [a for a in heavy if a.altloc == atom.altloc]
+                pool_atoms = same if same else heavy
+                pool_pos = (np.array([(a.pos.x, a.pos.y, a.pos.z) for a in pool_atoms])
+                            if same else hpos)
+                d = np.linalg.norm(
+                    pool_pos - np.array([atom.pos.x, atom.pos.y, atom.pos.z]),
+                    axis=1)
+                atom.b_iso = float(pool_atoms[int(np.argmin(d))].b_iso)
     st_out.write_pdb(str(tmpdir / 'multiconf.pdb'))
 
 
@@ -951,7 +1824,7 @@ def _sfcalc_parallel(pdb_path, mtz_out, tmpdir, n_workers=20):
 
 def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
                            solvent_radius=1.41, solvent_scale=0.334, solvent_B=50.0,
-                           sfcalc_workers=20):
+                           sfcalc_workers=20, fpart_out=None):
     """Compute structure factors including a bulk solvent contribution.
 
     Mirrors the model in ano_sfall.com (James Holton):
@@ -961,6 +1834,9 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
       3. Mask → SFs via gemmi FFT (transform_to_f_phi).
       4. Apply exp(-B_sol * s²/4) Debye-Waller envelope (B_sol = 50 Å²).
       5. F_total = F_protein + F_solvent.
+
+    If fpart_out is given, writes the bulk solvent contribution alone
+    (Fpart / PHIpart columns, same Wilson B correction as F_total) to that path.
 
     H must already be present in pdb_path (call step6_sfcalc which adds H first).
     """
@@ -1062,11 +1938,13 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     #     Applies exp(-ΔB · s²/4) where ΔB = B_ref - B_gen.  Brings simulated
     #     <F²> vs s² spectrum into line with the experimental reference so the
     #     CNN sees realistic resolution-dependent intensity falloff.
+    wilson_scale = np.ones(len(s_sq), dtype=np.float64)
     ref_B = _reference_wilson_b()
     if ref_B is not None:
         gen_B   = _wilson_b(fc_out, s_sq)
         delta_B = ref_B - gen_B
-        fc_out  = (fc_out * np.exp(-delta_B * s_sq / 4.0)).astype(np.float32)
+        wilson_scale = np.exp(-delta_B * s_sq / 4.0)
+        fc_out  = (fc_out * wilson_scale).astype(np.float32)
         print(f'    Wilson B: ref={ref_B:.2f} gen={gen_B:.2f} ΔB={delta_B:+.2f} Å² applied')
 
     out = gemmi.Mtz()
@@ -1081,6 +1959,21 @@ def _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir,
     out.set_data(np.column_stack([h_p, k_p, l_p, fc_out, phi_out]).astype(np.float32))
     out.write_to_file(str(mtz_out))
 
+    if fpart_out is not None:
+        fpart_amp = (np.abs(F_solv) * wilson_scale).astype(np.float32)
+        fpart_phi = np.degrees(np.angle(F_solv)).astype(np.float32)
+        fp = gemmi.Mtz()
+        fp.cell       = prot.cell
+        fp.spacegroup = prot.spacegroup
+        fp.add_dataset('HKL_base')
+        for lbl in ('H', 'K', 'L'):
+            fp.add_column(lbl, 'H')
+        fp.add_dataset('data')
+        fp.add_column('Fpart',   'F')
+        fp.add_column('PHIpart', 'P')
+        fp.set_data(np.column_stack([h_p, k_p, l_p, fpart_amp, fpart_phi]).astype(np.float32))
+        fp.write_to_file(str(fpart_out))
+
 
 def _pdb_has_hydrogens(pdb_path):
     """Quick scan: True if any ATOM record has element 'H' (cols 77-78)."""
@@ -1092,7 +1985,7 @@ def _pdb_has_hydrogens(pdb_path):
     return False
 
 
-def step6_sfcalc(pdb_path, mtz_out, tmpdir, bulk_solvent=True):
+def step6_sfcalc(pdb_path, mtz_out, tmpdir, bulk_solvent=True, fpart_out=None):
     """Add hydrogens to pdb_path (if not already present), then compute SFs.
 
     If bulk_solvent=True (default), includes a mask-based bulk solvent
@@ -1101,6 +1994,9 @@ def step6_sfcalc(pdb_path, mtz_out, tmpdir, bulk_solvent=True):
 
     Set bulk_solvent=False for internal steps (e.g. self-refinement B factors)
     where speed matters and absolute realism is not required.
+
+    fpart_out: if given, write the bulk solvent SFs (Fpart/PHIpart) to that path.
+    Only meaningful when bulk_solvent=True.
 
     pdb_path is overwritten with the H-containing model when reduce is run, so
     truth_full.pdb saved to the sample directory includes H either way.
@@ -1117,7 +2013,7 @@ def step6_sfcalc(pdb_path, mtz_out, tmpdir, bulk_solvent=True):
         pdb_with_h.replace(pdb_path)
 
     if bulk_solvent:
-        _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir)
+        _sfcalc_with_bulksolv(pdb_path, mtz_out, tmpdir, fpart_out=fpart_out)
     else:
         run(['gemmi', 'sfcalc', f'--dmin={DMIN}',
              f'--to-mtz={mtz_out}', str(pdb_path)],
@@ -1446,7 +2342,11 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
             for name in all_names:
                 _add_collapsed_atom(res_out, by_name[name])
         else:
-            res_max = min(n_conf, _GT48_NCONF.get(res0.name, 3))
+            # Floor 2 (for bimodal coverage), cap 10, per-residue _GT48_NCONF
+            # in between.  The 2-floor matches one altloc per bimodal cluster;
+            # the 10-cap keeps ARG/LYS/GLU/HIS (which gt48 gives 11-13) from
+            # bloating starthere.
+            res_max = min(n_conf, 10, max(2, _GT48_NCONF.get(res0.name, 2)))
             by_name, present = _reduce_conformers(by_name, all_names, max_confs=res_max)
 
             shuffled = list(present)
@@ -1581,7 +2481,8 @@ def step9_probe(tmpdir):
     Returns a set of (chain, resnum_int) tuples that should be deleted.
     """
     def _build_occ_bytes():
-        run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), 'starthere.pdb'],
+        run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'),
+             'starthere.pdb', 'allhet'],
             cwd=tmpdir)
         b = (tmpdir / 'refmac_opts_occ.txt').read_bytes()
         return b if b.endswith(b'\n') else b + b'\n'
@@ -1611,14 +2512,32 @@ def step9_probe(tmpdir):
     return _parse_unused_links(probe_log)
 
 
+def _max_abs_fofc_sigma(mtz_path):
+    """Return max |Fo-Fc| / σ(Fo-Fc) over the full unit cell map."""
+    mtz = gemmi.read_mtz_file(str(mtz_path))
+    grid = mtz.transform_f_phi_to_map('DELFWT', 'PHDELWT', sample_rate=SAMPLE_RATE)
+    arr  = np.asarray(grid, dtype=np.float64)
+    s    = float(arr.std())
+    return float(np.max(np.abs(arr)) / s) if s > 0 else 0.0
+
+
 def step9_refmac(tmpdir, ncyc_per_round=(20, 40), refine_occ=(False, True),
-                 weight_matrix=None):
+                 weight_matrix=None,
+                 water_round_ncyc=20, max_water_rounds=2, water_peak_threshold=5.0):
     """Run refmac in sequential rounds with per-round NCYC and occupancy control.
 
     ncyc_per_round: list of ints, one per round
     refine_occ:     list of bools (same length as ncyc_per_round); True enables
                     OCCUpancy GROUP keywords from refmac_occupancy_setup.com
     weight_matrix:  optional WEIGHT MATRIX override (default: refmac auto)
+
+    After the base rounds, optional "water-fill" rounds: if the Fo-Fc map
+    has any peak > water_peak_threshold σ, run add_waters.com to place new
+    waters at the peaks, then refmac with VDWREST 0 (so adjacent partial-
+    occ waters don't fight each other into the "water cannon" failure mode
+    where two overlapping waters refine to occ-sum>1, then suddenly repel
+    each other and smash into neighbouring atoms).  Repeat up to
+    max_water_rounds times; stop early when peaks drop below threshold.
 
     Splitting occupancy refinement off the first round avoids a refmac
     intermediate-state bond-stretching bug: when occ is refined in round 1,
@@ -1631,23 +2550,29 @@ def step9_refmac(tmpdir, ncyc_per_round=(20, 40), refine_occ=(False, True),
     assert len(refine_occ) == n_rounds, "ncyc_per_round and refine_occ must have same length"
 
     def _build_occ_bytes(xyzin):
-        run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), xyzin],
+        run([str(SCRIPT_DIR / 'refmac_occupancy_setup.com'), xyzin, 'allhet'],
             cwd=tmpdir)
         b = (tmpdir / 'refmac_opts_occ.txt').read_bytes()
         return b if b.endswith(b'\n') else b + b'\n'
 
     def _rwork_rfree(log):
-        for line in reversed(log.splitlines()):
-            if 'R factor' in line and rwork_re.search(line):
-                try:
-                    parts = line.split()
-                    return float(parts[-2]), float(parts[-1])
-                except Exception:
-                    pass
-        return None, None
-
-    import re
-    rwork_re = re.compile(r'\d\.\d{4}')
+        # Refmac's canonical R-factor report (one per refinement step):
+        #   Overall R factor                     =     0.0825
+        #   Free R factor                        =     0.1166
+        # The last occurrence is the final cycle.  Don't match the per-cycle
+        # loggraph table line ("R factor   prev   curr") — that prints
+        # *weighted* R-factors, not Rwork.  Match by '=' sign + leading
+        # keyword so the parser stays robust.
+        rw = rf = None
+        for line in log.splitlines():
+            s = line.strip()
+            if s.startswith('Overall R factor') and '=' in s:
+                try: rw = float(s.split('=')[-1].split()[0])
+                except Exception: pass
+            elif s.startswith('Free R factor') and '=' in s:
+                try: rf = float(s.split('=')[-1].split()[0])
+                except Exception: pass
+        return rw, rf
 
     full_log = ''
     xyzin = 'starthere.pdb'
@@ -1655,9 +2580,17 @@ def step9_refmac(tmpdir, ncyc_per_round=(20, 40), refine_occ=(False, True),
     for rnd in range(n_rounds):
         xyzout = 'refmacout.pdb'
         occ_bytes = _build_occ_bytes(xyzin) if refine_occ[rnd] else b''
+        hout_bytes = b'MAKE HOUT Y\n' if rnd == n_rounds - 1 else b''
+        # If the previous round did occupancy refinement, the partial-occ
+        # waters may have overlapping occupancies > 1; turning off the
+        # vdW restraint here prevents the "water cannon" repulsion that
+        # would otherwise launch them into neighbouring atoms.
+        vdw_bytes = b'VDWREST 0\n' if (rnd > 0 and refine_occ[rnd - 1]) else b''
         keywords = (
             occ_bytes +
             b'MAKE HYDR A NEWLIGAND NOEXIT\n' +
+            hout_bytes +
+            vdw_bytes +
             f'NCYC {ncyc_per_round[rnd]}\n'.encode() +
             (f'WEIGHT MATRIX {weight_matrix}\n'.encode() if weight_matrix is not None else b'') +
             b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
@@ -1687,6 +2620,72 @@ def step9_refmac(tmpdir, ncyc_per_round=(20, 40), refine_occ=(False, True),
         r_str = f'R={rw:.4f} Rf={rf:.4f}' if rw is not None else 'R=n/a'
         print(f'    refmac round {rnd+1}/{n_rounds}: {r_str}')
         xyzin = xyzout  # feed output into next round
+
+    # ── Water-fill rounds (optional) ─────────────────────────────────────────
+    # After the base refinement rounds, look for Fo-Fc peaks > threshold σ in
+    # refmacout.mtz.  If any exist, run add_waters.com to place waters at
+    # the peaks → new.pdb, re-generate occupancy groups, and refmac again
+    # with VDWREST 0 to prevent water-cannon repulsion between overlapping
+    # partial-occ waters.  Up to max_water_rounds passes.
+    for wrnd in range(max_water_rounds):
+        peak_sigma = _max_abs_fofc_sigma(tmpdir / 'refmacout.mtz')
+        if peak_sigma <= water_peak_threshold:
+            print(f'    water-fill skipped: max |Fo-Fc| = {peak_sigma:.2f}σ '
+                  f'≤ {water_peak_threshold:.1f}σ threshold')
+            break
+        # add_waters.com  <distance>  <pdb>  <mtz>   →  new.pdb
+        aw = subprocess.run(
+            ['add_waters.com', '0.8A', 'refmacout.pdb', 'refmacout.mtz'],
+            cwd=str(tmpdir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        (tmpdir / f'add_waters_{wrnd+1}.log').write_text(
+            aw.stdout.decode(errors='replace'))
+        new_pdb = tmpdir / 'new.pdb'
+        if aw.returncode != 0 or not new_pdb.exists():
+            print(f'    water-fill round {wrnd+1}: add_waters.com failed; '
+                  f'skipping remaining water rounds')
+            break
+        # Regenerate occ-group keywords from new.pdb (allhet → independent water occ)
+        occ_bytes = _build_occ_bytes('new.pdb')
+        # Final round → keep MAKE HOUT Y so H stay in refmacout.pdb
+        is_last = (wrnd == max_water_rounds - 1)
+        hout_bytes = b'MAKE HOUT Y\n' if is_last else b''
+        kw = (
+            occ_bytes +
+            b'MAKE HYDR A NEWLIGAND NOEXIT\n' +
+            hout_bytes +
+            f'NCYC {water_round_ncyc}\n'.encode() +
+            b'VDWREST 0\n' +
+            (f'WEIGHT MATRIX {weight_matrix}\n'.encode() if weight_matrix is not None else b'') +
+            b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
+            b'LABOUT FC=FC PHIC=PHIC FWT=FWT PHWT=PHWT '
+            b'DELFWT=DELFWT PHDELWT=PHDELWT\n'
+            b'MONI DIST 10\n'
+            b'END\n'
+        )
+        wresult = subprocess.run(
+            [str(REFMAC5),
+             'XYZIN',  'new.pdb',
+             'XYZOUT', 'refmacout.pdb',
+             'HKLIN',  'refme.mtz',
+             'HKLOUT', 'refmacout.mtz',
+             'LIBOUT',  'refmac.lib'],
+            input=kw,
+            cwd=str(tmpdir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        wlog = wresult.stdout.decode(errors='replace')
+        full_log += (f'\n{"="*60}\n refmac water-fill round {wrnd+1}'
+                     f' (vdwrest=0, peak was {peak_sigma:.2f}σ)\n{"="*60}\n' + wlog)
+        if wresult.returncode != 0:
+            (tmpdir / 'refmac.log').write_text(full_log)
+            raise RuntimeError(f'refmac water round {wrnd+1} failed:\n{wlog[-3000:]}')
+        rw, rf = _rwork_rfree(wlog)
+        r_str = f'R={rw:.4f} Rf={rf:.4f}' if rw is not None else 'R=n/a'
+        print(f'    refmac water-fill round {wrnd+1}: peak was {peak_sigma:.2f}σ; {r_str}')
 
     (tmpdir / 'refmac.log').write_text(full_log)
     return full_log
@@ -1740,13 +2739,14 @@ def step10_convert_maps(tmpdir, outdir):
 
 def _generate_flood_waters(truth_full_pdb, rng, n_flood, flood_occ,
                             collision_pdb=None):
-    """Append chain F flood waters to truth_full.pdb, avoiding full-occ atoms.
+    """Append chain F flood waters to truth_full.pdb, avoiding existing atoms.
 
-    Collision check uses heavy atoms from collision_pdb (single-conformer model
-    such as the self-refined PDB) if given, otherwise from truth_full_pdb.
-    Checking against one model is ~20× cheaper than against the 20-altloc
-    truth model, and the result is essentially identical because all 20 altlocs
-    are within ~1 Å of the single-conformer positions.
+    Flood waters are checked only against the protein/ordered-water atoms in
+    collision_pdb (or truth_full_pdb if not given); they do NOT exclude each
+    other, so overlapping flood waters are allowed.  Collision_pdb should be a
+    single-conformer model (e.g. the self-refined PDB) — ~20× cheaper than the
+    20-altloc truth model and essentially equivalent since altlocs are within
+    ~1 Å of single-conformer positions.
 
     Returns the number of flood waters actually placed.
     """
@@ -1787,7 +2787,6 @@ def _generate_flood_waters(truth_full_pdb, rng, n_flood, flood_occ,
         atom.b_iso   = b
         res.add_atom(atom)
         flood_chain.add_residue(res)
-        existing_xyz = np.vstack([existing_xyz, [x, y, z]])
         added += 1
     if added > 0:
         st[0].add_chain(flood_chain)
@@ -1802,9 +2801,13 @@ def _generate_flood_waters(truth_full_pdb, rng, n_flood, flood_occ,
 def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                     flood_avoid_fullocc=True, flood_occ=None, vary_flood=False,
                     shift_scale=0.5, n_altlocs=2, missing_fraction=0.05,
-                    never_collected_fraction=0.05, extra_b=0.0,
+                    never_collected_fraction=0.0, extra_b=0.0,
                     altloc_swaps_per_res=1.0, weight_matrix=None,
-                    per_conf_geommin=False,
+                    per_conf_geommin=True, reference_pdb=None,
+                    jiggle_distribution='byB',
+                    phenix_refine_starthere=False,
+                    skip_refmac=False,
+                    fast_refmac=False,
                     seed=None, debug=False):
     """Run the full pipeline for one sample. Returns (sample_idx, ok, info).
 
@@ -1822,15 +2825,27 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
     ccp4_scr = Path(os.environ.get('CCP4_SCR', '/tmp'))
     os.makedirs(ccp4_scr, exist_ok=True)
 
-    rng = np.random.default_rng(seed=sample_idx if seed is None else seed)
+    effective_seed = sample_idx if seed is None else seed + sample_idx
+    rng = np.random.default_rng(seed=effective_seed)
 
     if vary_flood and n_flood > 0:
-        rng_flood = np.random.default_rng(seed=(sample_idx if seed is None else seed) + 4)
-        log_nf  = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
-        n_flood = int(np.round(np.exp(log_nf)))
-        flood_occ = float(FLOOD_LINE_K / np.sqrt(n_flood))
+        rng_flood = np.random.default_rng(seed=effective_seed + 4)
+        #log_nf  = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
+        #n_flood = int(np.round(np.exp(log_nf)))
+        # flood_occ = float(FLOOD_LINE_K / np.sqrt(n_flood))
+        flood_occ = rng_flood.uniform(0.01, 0.05)
+        n_flood = int(np.round(rng_flood.uniform(1000,2000)))
 
-    seq = list(rng.choice(AA_NAMES, size=n_residues, p=AA_PROBS))
+    # Reference-PDB mode: sequence + per-(resnum,atom) RMSF come from the
+    # reference instead of random AA sampling / per-restype defaults.
+    ref = _parse_reference(reference_pdb) if reference_pdb else None
+    if ref is not None:
+        # Sort residues by seqid.num so build_n2c sees them in chain order.
+        ordered = sorted(ref['sequence'].items())
+        seq = [restype for _, restype in ordered]
+        n_residues = len(seq)
+    else:
+        seq = list(rng.choice(AA_NAMES, size=n_residues, p=AA_PROBS))
 
     tmpdir = Path(tempfile.mkdtemp(prefix=f'prot_{sample_idx:05d}_',
                                    dir=ccp4_scr))
@@ -1852,13 +2867,50 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         n_water_added = step3_setup_structure(tmpdir, rng, n_waters=n_waters)
         t = _t('setup_struct', t)
 
-        # 4: First geometry minimisation
-        minimized_pdb = step4_phenix_geommin('built.pdb', tmpdir, log_tag='_1st')
+        # In boiled-from-reference mode, phenix.geometry_minimization gets an
+        # .eff file with explicit bond edits to pull random-coil SGs together
+        # into the reference's disulfide pairs.  After minimisation we inject
+        # SSBOND+LINK records into the result so refmac downstream applies the
+        # same restraint.
+        ss_pairs = ref['disulfides'] if ref is not None else []
+
+        # 4: Geometry minimisation.  When ss_pairs are present and any SG-SG
+        #    distance exceeds the shortest cell axis, step4 temporarily widens
+        #    the cell to P1 / max_reasonable_bond Å so the long bond edits are
+        #    allowed; otherwise it runs in the target cell+SG directly.
+        minimized_pdb = step4_phenix_geommin(
+            'built.pdb', tmpdir, log_tag='_1st',
+            disulfide_pairs=ss_pairs,
+        )
+        if ss_pairs:
+            _inject_ssbonds(minimized_pdb, ss_pairs)
         t = _t('phenix_gm_1st', t)
 
-        # 4c: Check .geo file for severe heavy-atom nonbond clashes (obs < ideal,
-        #     LJ energy > 10).  Delete offenders NOW before building altlocs —
-        #     cheaper than re-running sfcalc/refmac later.
+        # 4a (boiled only): second symmetry-aware minimisation pass.
+        # The first pass ran in widened-cell P1 (so it could pull long SS
+        # bonds within phenix's "shortest cell axis" hard cap), which means
+        # no symmetry pressure compacted the chain.  This second pass runs in
+        # the target cell+SG with the SS bonds already short, so phenix's
+        # symmetry awareness packs the chain into the ASU before refmac sees
+        # it.  Without this, selfref refmac inherits a chain that crosses ASU
+        # boundaries and crushes the structure (and tangles the SGs because
+        # auto-link detection on the compacted ball finds bogus SS pairs).
+        # TODO: replace with a pre-positioning step on built.pdb so this
+        # second call is unnecessary.
+        if ss_pairs:
+            shutil.copy2(minimized_pdb, tmpdir / 'built_pack.pdb')
+            packed_pdb = step4_phenix_geommin(
+                'built_pack.pdb', tmpdir, log_tag='_2nd',
+                disulfide_pairs=ss_pairs, max_reasonable_bond=10.0,
+            )
+            _inject_ssbonds(packed_pdb, ss_pairs)
+            minimized_pdb = packed_pdb
+            t = _t('phenix_gm_2nd', t)
+
+        # 4c: Check .geo file for severe heavy-atom clashes — nonbond LJ > 10
+        #     and bond |delta| > 0.3 Å (stretched/compressed bonds indicate
+        #     irresolvable clashes).  Delete offenders NOW before building
+        #     altlocs — cheaper than re-running sfcalc/refmac later.
         geo_file = tmpdir / 'built_minimized.geo'
         geo_bad = _parse_geo_bad_nonbonds(geo_file)
         if geo_bad:
@@ -1867,27 +2919,51 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             _delete_residues_from_pdb(minimized_pdb, geo_bad)
         t = _t('geo_clash_check', t)
 
-        # 4b: Self-refine B factors (20 refmac cycles against own SFs)
-        #     Gives chemically correlated coordinates before jigglepdb.
-        #     Shifts overall B level so model Wilson B matches 1aho reference.
-        selfref_pdb = step4b_selfref_b_factors(
-            minimized_pdb, tmpdir, target_wilson_b=_reference_wilson_b())
-        t = _t('selfref_bfac', t)
-
-        # 4c: Save the selfref B-factors as the *truth* B-factors before
-        #     overriding selfref_pdb with gt48 target values for jigglepdb.
-        #     Truth-model B-factors come from selfref; gt48 B-factors only
-        #     drive jigglepdb displacement amplitude.
+        # 4b: Assign B factors from reference:
+        #   selfref_pdb (jigglepdb amplitude): B = 8π²·RMSF²/3 per atom
+        #   selfref_bfac_pdb (truth_full.pdb): mean B across conformers per atom
+        selfref_pdb = minimized_pdb
+        _set_target_bfactors(selfref_pdb,
+                             rmsf_by_resnum=ref['rmsf_table'] if ref else None)
         selfref_bfac_pdb = tmpdir / 'selfref_bfac_truth.pdb'
-        shutil.copy2(selfref_pdb, selfref_bfac_pdb)
-        _set_target_bfactors(selfref_pdb)
+        shutil.copy2(minimized_pdb, selfref_bfac_pdb)
+        if ref is not None:
+            _apply_bfac_table(selfref_bfac_pdb, ref['bfac_table'])
 
-        # 5: jigglepdb using target B factors → N full chains in multiconf.pdb;
-        #    truth B-factors restored from selfref in the merged output.
-        step5_jigglepdb_and_merge(selfref_pdb, tmpdir, rng,
+        # 4d (boiled only): if the reference flagged bimodal atoms, split the
+        # selfref model into two "parent" models that differ at those atoms
+        # by ±d_inter/2 along a fresh random direction.  Half of the altloc
+        # jiggle seeds will run from parent_A, half from parent_B — this
+        # reproduces the inter-cluster spread (which jiggle alone cannot,
+        # because it samples a unimodal distribution around one position).
+        parent_pdbs = selfref_pdb
+        if ref is not None and ref.get('bimodal_atoms'):
+            parent_A = tmpdir / 'parent_A.pdb'
+            parent_B = tmpdir / 'parent_B.pdb'
+            n_split  = _apply_bimodal_split(selfref_pdb,
+                                            ref['bimodal_atoms'],
+                                            parent_A, parent_B,
+                                            tmpdir, rng,
+                                            disulfide_pairs=ref.get('disulfides'))
+            print(f'  bimodal split: {n_split} atoms placed at ±d/2; '
+                  f'phenix braces relaxed bonded geometry')
+            # Interleave parents A/B so altloc labels alternate: A=parent_A,
+            # B=parent_B, C=parent_A, ...  _reduce_conformers drops the
+            # alphabetically-lowest labels first (ties broken by label), so
+            # grouping [A]*n_A + [B]*n_B would leave starthere with altlocs
+            # all from parent_B (e.g. R,S,T at n_altlocs=20).  Alternating
+            # guarantees the surviving max_confs altlocs straddle both
+            # clusters, so the partial model covers each bimodal mode.
+            parent_pdbs = [parent_A if i % 2 == 0 else parent_B
+                           for i in range(n_altlocs)]
+
+        # 5: jigglepdb using RMSF-derived B → N full chains in multiconf.pdb;
+        #    truth B-factors in merged output come from mean reference B (selfref_bfac_pdb).
+        step5_jigglepdb_and_merge(parent_pdbs, tmpdir, rng,
                                   shift_scale=shift_scale, n_altlocs=n_altlocs,
                                   per_conf_geommin=per_conf_geommin,
-                                  bfac_source_pdb=selfref_bfac_pdb)
+                                  bfac_source_pdb=selfref_bfac_pdb,
+                                  jiggle_shift=jiggle_distribution)
         t = _t('jiggle_and_merge', t)
 
         # 6: Each conformer was already minimized independently inside
@@ -1909,8 +2985,9 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         if extra_b:
             _add_extra_b(tmpdir / 'truth_full.pdb', extra_b)
 
-        # 7: sfcalc on truth_full → truth.mtz
-        step6_sfcalc(tmpdir / 'truth_full.pdb', tmpdir / 'truth.mtz', tmpdir)
+        # 7: sfcalc on truth_full → truth.mtz + Fpart.mtz (bulk solvent SFs)
+        step6_sfcalc(tmpdir / 'truth_full.pdb', tmpdir / 'truth.mtz', tmpdir,
+                     fpart_out=tmpdir / 'Fpart.mtz')
         t = _t('sfcalc', t)
 
         # 8: Build refme.mtz
@@ -1932,11 +3009,64 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
                                  altloc_swaps_per_res=altloc_swaps_per_res)
         t = _t('build_mixed_model', t)
 
+        # 9b (optional, gated by phenix_refine_starthere): vanilla phenix.refine
+        # on starthere.pdb against refme.mtz, so refmac inherits a partially-
+        # refined model (helps when starthere has large positional offsets from
+        # the truth).  Costs ~220 s; off by default since it has worsened R
+        # in current testing.  Output overwrites starthere.pdb.  Failure is
+        # non-fatal — fall through to refmac.  starthere0.pdb is always
+        # written as a backup (regardless of whether this step runs).
+        shutil.copy2(tmpdir / 'starthere.pdb', tmpdir / 'starthere0.pdb')
+        if phenix_refine_starthere:
+            try:
+                res = subprocess.run(
+                    ['phenix.refine', 'starthere.pdb', 'refme.mtz',
+                     'prefix=starthere_phx',
+                     'refinement.input.xray_data.r_free_flags.label=FreeR_flag',
+                     'main.number_of_macro_cycles=3',
+                     '--overwrite'],
+                    cwd=str(tmpdir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                (tmpdir / 'starthere_phx.log').write_text(res.stdout.decode(errors='replace'))
+                refined = tmpdir / 'starthere_phx_001.pdb'
+                if res.returncode == 0 and refined.exists():
+                    shutil.copy2(refined, tmpdir / 'starthere.pdb')
+                    print(f'  phenix.refine starthere: ok (replaced starthere.pdb)')
+                else:
+                    print(f'  phenix.refine starthere: failed rc={res.returncode}; '
+                          f'using unrefined starthere.pdb')
+            except FileNotFoundError:
+                print(f'  phenix.refine not on PATH; using unrefined starthere.pdb')
+            t = _t('phenix_refine_starthere', t)
+
         # 10: Refmac NCYC=20 × 2 rounds with occupancy refinement on both
-        refmac_log = step9_refmac(tmpdir,
-                                  ncyc_per_round=(20, 20), refine_occ=(True, True),
-                                  weight_matrix=weight_matrix)
-        t = _t('refmac_2x20', t)
+        if skip_refmac:
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(tmpdir / 'refme.mtz',     sample_dir / 'refme.mtz')
+            shutil.copy2(tmpdir / 'starthere.pdb', sample_dir / 'starthere.pdb')
+            shutil.copy2(tmpdir / 'truth_full.pdb', sample_dir / 'truth_full.pdb')
+            if debug:
+                debug_dir = sample_dir / 'debug'
+                if debug_dir.exists():
+                    subprocess.run(['rm', '-rf', str(debug_dir)], check=False)
+                shutil.copytree(str(tmpdir), str(debug_dir))
+            elapsed = time.time() - t0
+            timing_str = '  '.join(f'{k}={v}s' for k, v in timings.items())
+            return sample_idx, True, f'ok (refmac skipped) in {elapsed:.1f}s\n  {timing_str}'
+
+        if fast_refmac:
+            refmac_log = step9_refmac(tmpdir,
+                                      ncyc_per_round=(5,), refine_occ=(True,),
+                                      max_water_rounds=0,
+                                      weight_matrix=weight_matrix)
+            t = _t('refmac_fast1x5', t)
+        else:
+            refmac_log = step9_refmac(tmpdir,
+                                      ncyc_per_round=(20, 20), refine_occ=(True, True),
+                                      weight_matrix=weight_matrix)
+            t = _t('refmac_2x20', t)
 
         # Parse final Rwork from refmac log
         # "Overall R factor = 0.0201" appears once per cycle; last is final cycle.
@@ -1948,6 +3078,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         # 11: Convert to maps
         sample_dir.mkdir(parents=True, exist_ok=True)
         step10_convert_maps(tmpdir, sample_dir)
+        fofc_peak_sigma = None   # set below after refmacout.pdb is in sample_dir
 
         # Copy PDB and log files
         shutil.copy2(tmpdir / 'truth_full.pdb',  sample_dir / 'truth_full.pdb')
@@ -1956,15 +3087,51 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             shutil.copy2(tmpdir / 'refmacout.pdb', sample_dir / 'refmacout.pdb')
         if (tmpdir / 'refmacout.mtz').exists():
             shutil.copy2(tmpdir / 'refmacout.mtz', sample_dir / 'refmacout.mtz')
+        shutil.copy2(tmpdir / 'refme.mtz',        sample_dir / 'refme.mtz')
+        if (tmpdir / 'Fpart.mtz').exists():
+            shutil.copy2(tmpdir / 'Fpart.mtz',    sample_dir / 'Fpart.mtz')
         shutil.copy2(tmpdir / 'refmac.log',        sample_dir / 'refmac.log')
-        for plog in tmpdir.glob('*.phenix.log'):
-            shutil.copy2(plog, sample_dir / plog.name)
+        # (phenix logs land in debug/ via the debug copytree below — don't
+        # copy them into the main sample dir; with per_conf_geommin and the
+        # bimodal pipeline there are 20+ of them and they bloat large runs.)
+
+        # 11a: Pick the 5 most extreme Fo-Fc peaks and report their nearest
+        # atom — catches model/data inconsistencies before they reach the
+        # CNN. Runs against fofc.map + refmacout.pdb in sample_dir (must be
+        # after the copies above). Skips silently if pick.com isn't on PATH.
+        if shutil.which('pick.com') and (sample_dir / 'fofc.map').exists() and \
+                (sample_dir / 'refmacout.pdb').exists():
+            try:
+                pick_res = subprocess.run(
+                    ['pick.com', '-extreme=5', '-fast', 'fofc.map', 'refmacout.pdb'],
+                    cwd=str(sample_dir),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    timeout=120,
+                )
+                txt = pick_res.stdout.decode(errors='replace')
+                (sample_dir / 'pick_details.log').write_text(txt)
+                sigmas = []
+                for line in txt.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 7 and parts[3].isdigit():
+                        try:
+                            sigmas.append(abs(float(parts[4])))
+                        except ValueError:
+                            pass
+                if sigmas:
+                    fofc_peak_sigma = float(max(sigmas))
+                    log.info('step11a: max |Fo-Fc| peak = %.2fσ',
+                             fofc_peak_sigma)
+            except Exception as e:
+                log.warning('step11a pick.com failed: %s', e)
 
         # Debug: dump entire tmpdir
         if debug:
             debug_dir = sample_dir / 'debug'
             if debug_dir.exists():
-                shutil.rmtree(str(debug_dir))
+                # subprocess rm -rf instead of shutil.rmtree — the latter
+                # raises ENOTEMPTY on NFS due to a directory-cache race.
+                subprocess.run(['rm', '-rf', str(debug_dir)], check=False)
             shutil.copytree(str(tmpdir), str(debug_dir))
 
         t = _t('maps_and_copy', t)
@@ -1979,6 +3146,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
             n_flood_added=n_flood_added,
             n_clashing_residues_deleted=len(geo_bad),
             rwork_final=rwork,
+            max_fofc_peak_sigma=fofc_peak_sigma,
             missing_fraction=missing_fraction,
             n_reflections_missing=n_missing,
             never_collected_fraction=never_collected_fraction,
@@ -2005,11 +3173,13 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         msg = traceback.format_exc()
         sample_dir.mkdir(parents=True, exist_ok=True)
         (sample_dir / 'error.log').write_text(msg)
-        if debug:
-            debug_dir = sample_dir / 'debug'
-            if debug_dir.exists():
-                shutil.rmtree(str(debug_dir))
+        debug_dir = sample_dir / 'debug'
+        if debug_dir.exists():
+            subprocess.run(['rm', '-rf', str(debug_dir)], check=False)
+        try:
             shutil.copytree(str(tmpdir), str(debug_dir))
+        except Exception:
+            pass
         elapsed = time.time() - t0
         return sample_idx, False, f'FAILED in {elapsed:.1f}s: {e}'
 
@@ -2028,8 +3198,10 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
                        max_array=300, seed=None, flood_occ=None, cell=None,
                        dmin=2.0, spacegroup='P 1', partition='debug',
                        account=None, qos=None, time='00:10:00',
-                       weight_matrix=None, per_conf_geommin=False,
-                       exclude_nodes=None):
+                       weight_matrix=None, per_conf_geommin=True,
+                       exclude_nodes=None, reference_pdb=None,
+                       phenix_refine_starthere=False, skip_refmac=False,
+                       fast_refmac=False, debug=False):
     """Write and submit a SLURM array job script."""
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     python  = sys.executable
@@ -2053,6 +3225,11 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
     qos_line       = f'#SBATCH --qos={qos}\n'            if qos                  else ''
     exclude_line   = f'#SBATCH --exclude={exclude_nodes}\n' if exclude_nodes     else ''
     pcg_line       = f'    --per-conf-geommin \\\n'      if per_conf_geommin     else ''
+    refpdb_line    = f'    --reference-pdb {Path(reference_pdb).resolve()} \\\n' if reference_pdb else ''
+    phxstart_line  = f'    --phenix-refine-starthere \\\n'                        if phenix_refine_starthere else ''
+    skiprefmac_line  = f'    --skip-refmac \\\n'                                   if skip_refmac   else ''
+    fastrefmac_line  = f'    --fast-refmac \\\n'                                  if fast_refmac   else ''
+    debug_line       = f'    --debug \\\n'                                        if debug         else ''
     script_text = f"""\
 #!/bin/bash
 #SBATCH --job-name=prot_data
@@ -2060,7 +3237,6 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
 {account_line}{qos_line}{exclude_line}#SBATCH --array=0-{nsamples-1}%{max_array}
 #SBATCH --output={outdir}/logs/%A_%a.log
 #SBATCH --error={outdir}/logs/%A_%a.log
-#SBATCH --time={time}
 #SBATCH --cpus-per-task={cpus_per_task}
 
 mkdir -p {outdir}/logs
@@ -2076,7 +3252,7 @@ mkdir -p "${{CCP4_SCR:-/tmp}}"
     --n-altlocs {n_altlocs} \\
     --missing-fraction {missing_fraction} \\
     --never-collected-fraction {never_collected_fraction} \\
-{cell_line}{dmin_line}{sg_line}{flood_occ_line}{varflood_line}{extra_b_line}{scramble_line}{weight_line}{pcg_line}{seed_line}"""
+{cell_line}{dmin_line}{sg_line}{flood_occ_line}{varflood_line}{extra_b_line}{scramble_line}{weight_line}{pcg_line}{refpdb_line}{phxstart_line}{skiprefmac_line}{fastrefmac_line}{debug_line}{seed_line}"""
     script.write_text(script_text)
     script.chmod(0o755)
 
@@ -2161,12 +3337,38 @@ def main():
     parser.add_argument('--per-conf-geommin', action='store_true',
                         help='Run phenix.geometry_minimization on each conformer '
                              '(parallel via ThreadPoolExecutor; ~13s × n_altlocs)')
+    parser.add_argument('--phenix-refine-starthere', action='store_true',
+                        help='Run vanilla phenix.refine on starthere.pdb before '
+                             'the first refmac round (off by default)')
+    parser.add_argument('--skip-refmac', action='store_true',
+                        help='Skip refmac (and downstream map conversion); copy '
+                             'refme.mtz, starthere.pdb, and truth_full.pdb into '
+                             'the sample dir and exit early')
+    parser.add_argument('--fast-refmac', action='store_true',
+                        help='Run one refmac round at NCYC=5 (no water fill) '
+                             'instead of the default 2×NCYC=20 + water rounds; '
+                             'faster data generation at lower model quality')
     parser.add_argument('--exclude-nodes',  default=None,
                         help='SLURM --exclude= node list (e.g. "voltron,graphics2" '
                              'to keep CPU jobs off GPU nodes)')
     parser.add_argument('--seed',       type=int, default=None,
                         help='Fixed RNG seed (overrides sample-id as seed); '
                              'use to hold the protein structure constant while varying other params')
+    parser.add_argument('--reference-pdb', default=None,
+                        help='Multi-conformer PDB whose sequence, per-(resnum,atom) RMSF, '
+                             'and disulfide connectivity are used in place of the random/'
+                             'per-restype defaults. Cell+spacegroup also taken from the '
+                             'reference unless --cell/--spacegroup are explicit. Intended '
+                             'for "boiled-from-reference" runs (e.g. 1aho/gt48.pdb).')
+    parser.add_argument('--jiggle-distribution', default='byB',
+                        choices=['byB', 'LorentzB', 'uniformB'],
+                        help='jigglepdb displacement distribution. All three derive '
+                             'the magnitude from the per-atom B factor. byB = isotropic '
+                             'Gaussian (default); LorentzB = Lorentzian (heavy tails, '
+                             'occasional far outliers); uniformB = uniform within a '
+                             'sphere of radius shift (bounded, more "rotamer-like" '
+                             'jumps). Lorentz/uniform may give more bimodal-looking '
+                             'spread for high-B atoms.')
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2178,6 +3380,39 @@ def main():
     CELL       = tuple(args.cell)
     DMIN       = args.dmin
     SPACEGROUP = args.spacegroup
+
+    # Reference PDB overrides cell + spacegroup if neither was explicitly given.
+    # (argparse default is [40,40,40] / 'P 1' / 2.0; we treat those as "not set".)
+    if args.reference_pdb is not None:
+        ref = _parse_reference(args.reference_pdb)
+        if tuple(args.cell) == (40.0, 40.0, 40.0):
+            CELL = ref['cell'][:3]
+            print(f'  reference cell:       {CELL} (overrides default)')
+        if args.spacegroup == 'P 1':
+            SPACEGROUP = ref['spacegroup_hm']
+            print(f'  reference spacegroup: {SPACEGROUP!r} (overrides default)')
+        if args.dmin == 2.0 and ref.get('dmin') is not None:
+            DMIN = ref['dmin']
+            print(f'  reference dmin:       {DMIN} Å (overrides default 2.0)')
+        n_ref = len(ref['sequence'])
+        if args.nresidues != n_ref:
+            print(f'  reference sequence has {n_ref} residues → overriding --nresidues')
+            args.nresidues = n_ref
+        # Boiled mode defaults shift_scale=1.0 (vs the protein-v4 default 0.5).
+        # The reference's per-atom σ already encodes the full disorder, so the
+        # jiggle amplitude should hit it 1:1, not be cut in half.
+        if args.shift_scale == 0.5:
+            args.shift_scale = 1.0
+            print(f'  reference mode:       shift_scale → 1.0 (overrides default 0.5)')
+        # Auto-set n_waters to the reference's distinct-water-site count.
+        # (argparse default 30 ⇒ "not set"; user-provided values pass through.)
+        n_ref_waters = int(ref.get('n_water_sites', 0) or 0)
+        if args.nwaters == 30 and n_ref_waters > 0:
+            args.nwaters = n_ref_waters
+            print(f'  reference waters:     {args.nwaters} distinct ordered-water sites (overrides default 30)')
+        print(f'  reference disulfides: {ref["disulfides"]}')
+        print(f'  reference unpaired Cys: {ref["unpaired_cys"]}')
+        print(f'  reference bimodal:    {len(ref.get("bimodal_atoms", {}))} atoms')
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -2202,6 +3437,11 @@ def main():
             altloc_swaps_per_res=args.altloc_swaps_per_res,
             weight_matrix=args.weight_matrix,
             per_conf_geommin=args.per_conf_geommin,
+            reference_pdb=args.reference_pdb,
+            jiggle_distribution=args.jiggle_distribution,
+            phenix_refine_starthere=args.phenix_refine_starthere,
+            skip_refmac=args.skip_refmac,
+            fast_refmac=args.fast_refmac,
             seed=args.seed,
             debug=args.debug,
         )
@@ -2224,6 +3464,11 @@ def main():
             time=args.time,
             per_conf_geommin=args.per_conf_geommin,
             exclude_nodes=args.exclude_nodes,
+            reference_pdb=args.reference_pdb,
+            phenix_refine_starthere=args.phenix_refine_starthere,
+            skip_refmac=args.skip_refmac,
+            fast_refmac=args.fast_refmac,
+            debug=args.debug,
         )
         sys.exit(0 if ok else 1)
 
@@ -2240,6 +3485,11 @@ def main():
         never_collected_fraction=args.never_collected_fraction,
         extra_b=args.extra_b, altloc_swaps_per_res=args.altloc_swaps_per_res,
         weight_matrix=args.weight_matrix,
+        reference_pdb=args.reference_pdb,
+        jiggle_distribution=args.jiggle_distribution,
+        phenix_refine_starthere=args.phenix_refine_starthere,
+        skip_refmac=args.skip_refmac,
+        fast_refmac=args.fast_refmac,
         seed=args.seed, debug=args.debug,
     )
 

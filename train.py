@@ -150,6 +150,7 @@ def main():
         device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     is_rank0 = (rank == 0)
     n_gpus   = torch.cuda.device_count() if device.type == 'cuda' else 0
+    torch.backends.cudnn.benchmark = (device.type == 'cuda')
 
     # ── Log file (train_<suffix>.log beside the script) — rank 0 only ─────────
     if is_rank0:
@@ -210,7 +211,9 @@ def main():
                    base_features=args.base_features).to(device)
     raw_model = model
     if is_ddp:
-        # find_unused_parameters=True: pred_log_var/pred_log_scale heads have no gradient under MSE loss
+        # scale_head (params 30-31) has no gradient under MSE loss — pred_log_scale
+        # is never used in the loss function.  find_unused_parameters=True prevents
+        # DDP from hanging waiting for an all-reduce that never fires.
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     elif n_gpus > 1:
         model = nn.DataParallel(model)
