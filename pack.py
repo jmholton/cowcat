@@ -84,8 +84,8 @@ def process_sample(base, crossp_transform='signed_sqrt'):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data',    required=True,
-                        help='Directory containing sample_NNNNN/ subdirs')
+    parser.add_argument('--data',    required=True, action='append',
+                        help='Directory containing sample_NNNNN/ subdirs (repeatable)')
     parser.add_argument('--workers', type=int, default=8,
                         help='(ignored — packing is now sequential to bound memory)')
     parser.add_argument('--force',   action='store_true',
@@ -97,19 +97,28 @@ def main():
     args = parser.parse_args()
 
     crossp_transform = 'raw' if args.crossp_raw else 'signed_sqrt'
-    data = Path(args.data)
-    out  = Path(args.outdir) if args.outdir else data
+    data_dirs = [Path(d) for d in args.data]
+    if args.outdir:
+        out = Path(args.outdir)
+    elif len(data_dirs) == 1:
+        out = data_dirs[0]
+    else:
+        print('Error: --outdir required when multiple --data dirs are given.')
+        return
     out.mkdir(parents=True, exist_ok=True)
-    sample_dirs = sorted(
-        d for d in data.iterdir()
-        if d.is_dir() and d.name.startswith('sample_')
-        and REQUIRED.issubset({f.name for f in d.iterdir()})
-    )
+    sample_dirs = []
+    for data in data_dirs:
+        sample_dirs.extend(sorted(
+            d for d in data.iterdir()
+            if d.is_dir() and d.name.startswith('sample_')
+            and REQUIRED.issubset({f.name for f in d.iterdir()})
+        ))
     n = len(sample_dirs)
     if n == 0:
         print('No valid samples found.')
         return
-    print(f'Packing {n} samples from {data}  crossp={crossp_transform}  →  {out}')
+    src_str = ', '.join(str(d) for d in data_dirs)
+    print(f'Packing {n} samples from [{src_str}]  crossp={crossp_transform}  →  {out}')
 
     x_path = out / 'X.npy'
     if x_path.exists() and not args.force:
@@ -128,8 +137,10 @@ def main():
     def _open_npy(path, dtype, shape):
         """Open a .npy file for sequential writing, emit header, return file."""
         f = open(str(path), 'wb')
-        np.lib.format.write_array_header_2_0(f, np.lib.format.header_data_from_array_1_0(
-            np.empty(shape, dtype=dtype)))
+        header = {'descr': np.lib.format.dtype_to_descr(np.dtype(dtype)),
+                  'fortran_order': False,
+                  'shape': tuple(shape)}
+        np.lib.format.write_array_header_2_0(f, header)
         return f
 
     fx = _open_npy(out / 'X.npy', np.float32, tuple(x_shape))

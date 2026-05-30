@@ -228,9 +228,10 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr / 100)
 
-    start_epoch = 0
-    best_val    = float('inf')
-    log         = []
+    start_epoch   = 0
+    best_val      = float('inf')
+    best_rfree    = float('inf')
+    log           = []
 
     # ── Resume (full state) ───────────────────────────────────────────────────
     if args.resume and os.path.exists(args.resume):
@@ -239,7 +240,8 @@ def main():
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
         start_epoch = ckpt['epoch'] + 1
-        best_val    = ckpt.get('best_val', float('inf'))
+        best_val    = ckpt.get('best_val',   float('inf'))
+        best_rfree  = ckpt.get('best_rfree', float('inf'))
         log         = ckpt.get('log', [])
         if is_rank0:
             print(f'Resumed from epoch {ckpt["epoch"]}  best_val={best_val:.5f}')
@@ -314,7 +316,7 @@ def main():
             ckpt = dict(epoch=epoch, model=raw_model.state_dict(),
                         optimizer=optimizer.state_dict(),
                         scheduler=scheduler.state_dict(),
-                        best_val=best_val, log=log)
+                        best_val=best_val, best_rfree=best_rfree, log=log)
             torch.save(ckpt, outdir / 'latest.pt')
 
             if val_mse < best_val:
@@ -322,11 +324,18 @@ def main():
                 torch.save(ckpt, outdir / 'best.pt')
                 print(f'  ↳ new best val={best_val:.5f}')
 
+            if rfree_1aho is not None and rfree_1aho < best_rfree:
+                best_rfree = rfree_1aho
+                torch.save(ckpt, outdir / 'best_rfree.pt')
+                print(f'  ↳ new best Rfree_1aho={best_rfree:.4f}')
+
             (outdir / 'log.json').write_text(json.dumps(log, indent=2))
 
     if is_rank0:
         print(f'Done. Best val MSE: {best_val:.5f}')
-        print(f'Best checkpoint: {outdir / "best.pt"}')
+        print(f'Best checkpoint:       {outdir / "best.pt"}')
+        if best_rfree < float('inf'):
+            print(f'Best Rfree checkpoint: {outdir / "best_rfree.pt"}  (Rfree={best_rfree:.4f})')
 
     if is_ddp:
         dist.destroy_process_group()
