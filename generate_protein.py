@@ -694,6 +694,47 @@ def _apply_bimodal_split(in_pdb, bimodal_atoms, parent_A_pdb, parent_B_pdb,
             kept.append(line[:16] + ' ' + line[17:54] + '  1.00' + line[60:])
         parent_path.write_text(''.join(header) + ''.join(kept)
                                + ''.join(nonchain_lines) + 'END\n')
+
+    # Check the bimodal geo for ring-threading clashes that phenix geommin
+    # cannot resolve (the brace constraints can push side chains through
+    # backbone atoms; gradient descent cannot escape the ring).  Delete
+    # offending residues from both parents and from selfref (in_pdb) so the
+    # clash does not propagate into jiggled conformers or truth_full.pdb.
+    bimodal_geo = minim.with_suffix('.geo')
+    bimodal_bad = _parse_geo_bad_nonbonds(bimodal_geo, same_altloc_only=True)
+    if bimodal_bad:
+        log.info('_apply_bimodal_split: deleting %d residues with unresolvable '
+                 'bimodal clashes: %s', len(bimodal_bad), bimodal_bad)
+        for p in (parent_A_pdb, parent_B_pdb, Path(in_pdb)):
+            _delete_residues_from_pdb(p, bimodal_bad)
+
+    # Remove waters from parent PDBs that now clash with protein atoms.
+    # The bimodal brace can displace a side chain into a water position;
+    # the resulting protein-water overlap (<2.0 Å) propagates through all
+    # jiggle conformers and explodes into thousands of clashes in truth_full.
+    WATER_CLASH_DIST = 2.0   # Å — remove water if any protein heavy atom is closer
+    for parent_path in (parent_A_pdb, parent_B_pdb, Path(in_pdb)):
+        st = gemmi.read_structure(str(parent_path))
+        protein_pos = [a.pos
+                       for ch in st[0] for res in ch for a in res
+                       if ch.name == chain and a.element.name not in ('H', 'X')]
+        waters_to_remove = set()
+        for ch in st[0]:
+            for res in ch:
+                if res.name != 'HOH':
+                    continue
+                for atom in res:
+                    if atom.element.name in ('H', 'X'):
+                        continue
+                    for pp in protein_pos:
+                        if atom.pos.dist(pp) < WATER_CLASH_DIST:
+                            waters_to_remove.add((ch.name, res.seqid.num))
+                            break
+        if waters_to_remove:
+            log.info('_apply_bimodal_split %s: removing %d waters clashing with protein: %s',
+                     parent_path.name, len(waters_to_remove), sorted(waters_to_remove))
+            _delete_residues_from_pdb(parent_path, waters_to_remove)
+
     return n_split
 
 
@@ -933,7 +974,8 @@ def step3_setup_structure(tmpdir, rng, n_waters=10):
     return added
 
 
-def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0, bond_delta_threshold=0.3):
+def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0, bond_delta_threshold=0.3,
+                            same_altloc_only=False):
     """Return set of (chain, resnum) pairs involved in severe clashes.
 
     Parses phenix .geo files for two clash signatures:
@@ -949,7 +991,13 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0, bond_delta_threshold=0.
        geometry that geometry_minimization could not fully relax.
 
     Only heavy-atom pairs are checked in both cases.
-    Atom ID format in .geo: 15-char PDB string; chain at index 9, resnum 10:15.
+    Atom ID format in .geo: 15-char PDB string; chain at index 9, resnum 10:15,
+    altloc at index 4.
+
+    same_altloc_only: if True, skip pairs where the two atoms have different
+      altloc letters.  Use when checking a bimodal-combined .geo to avoid
+      flagging intentional cross-altloc contacts (A↔B brace restraints) as
+      clashes — only same-altloc (A↔A or B↔B) contacts matter there.
     """
     def _lj(r, r0):
         if r <= 0:
@@ -958,6 +1006,9 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0, bond_delta_threshold=0.
         def lj0(r):
             return 4 * ((s / r) ** 12 - (s / r) ** 6)
         return lj0(r) - lj0(6.0)
+
+    def _altloc(id_str):
+        return id_str[4] if len(id_str) >= 5 else ' '
 
     def _add_pair(id1, id2):
         for id_str in (id1, id2):
@@ -986,14 +1037,15 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0, bond_delta_threshold=0.
                 atom1 = id1[0:4].strip() if len(id1) >= 4 else ''
                 atom2 = id2[0:4].strip() if len(id2) >= 4 else ''
                 if not atom1.startswith('H') and not atom2.startswith('H'):
-                    parts = lines[i + 3].split()
-                    if len(parts) >= 2:
-                        try:
-                            obs, ideal = float(parts[0]), float(parts[1])
-                            if obs < ideal and _lj(obs, ideal) > lj_threshold:
-                                _add_pair(id1, id2)
-                        except ValueError:
-                            pass
+                    if not same_altloc_only or _altloc(id1) == _altloc(id2):
+                        parts = lines[i + 3].split()
+                        if len(parts) >= 2:
+                            try:
+                                obs, ideal = float(parts[0]), float(parts[1])
+                                if obs < ideal and _lj(obs, ideal) > lj_threshold:
+                                    _add_pair(id1, id2)
+                            except ValueError:
+                                pass
             i += 4
         elif 'bond pdb=' in line:
             m1 = re.search(r'"([^"]*)"', line)
@@ -1003,14 +1055,15 @@ def _parse_geo_bad_nonbonds(geo_file, lj_threshold=10.0, bond_delta_threshold=0.
                 atom1 = id1[0:4].strip() if len(id1) >= 4 else ''
                 atom2 = id2[0:4].strip() if len(id2) >= 4 else ''
                 if not atom1.startswith('H') and not atom2.startswith('H'):
-                    parts = lines[i + 3].split()
-                    # bond data line: ideal  model  delta  sigma  weight  residual
-                    if len(parts) >= 3:
-                        try:
-                            if abs(float(parts[2])) > bond_delta_threshold:
-                                _add_pair(id1, id2)
-                        except ValueError:
-                            pass
+                    if not same_altloc_only or _altloc(id1) == _altloc(id2):
+                        parts = lines[i + 3].split()
+                        # bond data line: ideal  model  delta  sigma  weight  residual
+                        if len(parts) >= 3:
+                            try:
+                                if abs(float(parts[2])) > bond_delta_threshold:
+                                    _add_pair(id1, id2)
+                            except ValueError:
+                                pass
             i += 4
         else:
             i += 1
@@ -2295,6 +2348,98 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
                 synth.append(r2)
             water_residues.setdefault(k, []).extend(synth)
 
+    # ── Fragment clustering for backbone-safe altloc scrambling ──────────────
+    # The bimodal split creates two parent structures (A and B) with backbone
+    # atoms at significantly different positions.  Scrambling altloc labels
+    # independently for adjacent residues can put C of residue i from parent A
+    # and N of residue i+1 from parent B in the same altloc → broken peptide
+    # bond.  Fix: identify residues with large backbone spread (coming from two
+    # parents), cluster consecutive such residues into fragments, and apply one
+    # consistent label permutation across each fragment.
+    _BB_ATOMS          = {'N', 'CA', 'C', 'O'}
+    _BB_BIMODAL_THRESH = 0.3   # Å — backbone spread threshold to flag a residue
+    _FULL_LABELS       = list(CONF_LABELS[:n_conf])
+
+    # Pass 1: measure backbone spread per residue (quick scan, no atom copies yet)
+    bb_spread = {}   # seqid_str → max backbone spread across altlocs
+    for key in seqid_order:
+        residues = prot_residues.get(key, [])
+        if len(residues) < 2:
+            bb_spread[key] = 0.0
+            continue
+        max_spread = 0.0
+        atom_pts = {}  # atom_name → list of (x,y,z)
+        for res in residues:
+            for atom in res:
+                if atom.name in _BB_ATOMS:
+                    atom_pts.setdefault(atom.name, []).append(
+                        (atom.pos.x, atom.pos.y, atom.pos.z))
+        for pts in atom_pts.values():
+            if len(pts) < 2:
+                continue
+            arr = np.array(pts)
+            centroid = arr.mean(0)
+            spread = float(np.sqrt(((arr - centroid) ** 2).sum(1)).max())
+            max_spread = max(max_spread, spread)
+        bb_spread[key] = max_spread
+
+    bimodal_bb_keys = {k for k, s in bb_spread.items() if s > _BB_BIMODAL_THRESH}
+
+    # Parse sequence numbers for adjacency (ignore insertion codes for grouping)
+    def _seqnum(key):
+        try:
+            return int(key)
+        except ValueError:
+            try:
+                return int(''.join(c for c in key if c.isdigit()))
+            except ValueError:
+                return None
+
+    key_to_sn = {k: _seqnum(k) for k in seqid_order}
+    sn_to_key = {}
+    for k, sn in key_to_sn.items():
+        if sn is not None:
+            sn_to_key.setdefault(sn, k)
+
+    # Union-find: merge bimodal residue with its sequence neighbours
+    uf_parent = {k: k for k in seqid_order}
+    def _find(x):
+        while uf_parent[x] != x:
+            uf_parent[x] = uf_parent[uf_parent[x]]
+            x = uf_parent[x]
+        return x
+    def _union(a, b):
+        uf_parent[_find(a)] = _find(b)
+
+    for key in bimodal_bb_keys:
+        sn = key_to_sn.get(key)
+        if sn is None:
+            continue
+        for adj_sn in (sn - 1, sn + 1):
+            adj_key = sn_to_key.get(adj_sn)
+            if adj_key is not None:
+                _union(key, adj_key)
+
+    # Assign one rng-drawn permutation per bimodal fragment (others get None)
+    fragment_perm = {}   # root_key → {old_label: new_label} or None
+    seen_roots = set()
+    for key in seqid_order:
+        root = _find(key)
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        # Only generate a shared perm if the fragment contains bimodal bb residues
+        members = [k for k in seqid_order if _find(k) == root]
+        if any(k in bimodal_bb_keys for k in members):
+            sh = list(_FULL_LABELS)
+            n_sw = int(rng.poisson(altloc_swaps_per_res))
+            for _ in range(n_sw):
+                ii, jj = rng.choice(len(sh), size=2, replace=False)
+                sh[ii], sh[jj] = sh[jj], sh[ii]
+            fragment_perm[root] = dict(zip(_FULL_LABELS, sh))
+        else:
+            fragment_perm[root] = None   # will use per-residue swap
+
     st_out = gemmi.Structure()
     st_out.cell          = st_in.cell
     st_out.spacegroup_hm = st_in.spacegroup_hm
@@ -2349,12 +2494,20 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
             res_max = min(n_conf, 10, max(2, _GT48_NCONF.get(res0.name, 2)))
             by_name, present = _reduce_conformers(by_name, all_names, max_confs=res_max)
 
-            shuffled = list(present)
-            n_swaps = int(rng.poisson(altloc_swaps_per_res))
-            for _ in range(n_swaps):
-                i, j = rng.choice(len(shuffled), size=2, replace=False)
-                shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-            label_map = dict(zip(present, shuffled))
+            root = _find(key)
+            shared_perm = fragment_perm.get(root)
+            if shared_perm is not None:
+                # Bimodal fragment: apply the shared permutation so adjacent
+                # residues consistently use conformers from the same parent.
+                label_map = {orig: shared_perm.get(orig, orig) for orig in present}
+            else:
+                # Non-bimodal: independent per-residue swap (original behaviour).
+                shuffled = list(present)
+                n_swaps = int(rng.poisson(altloc_swaps_per_res))
+                for _ in range(n_swaps):
+                    i, j = rng.choice(len(shuffled), size=2, replace=False)
+                    shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+                label_map = dict(zip(present, shuffled))
 
             for name in all_names:
                 for atom in by_name.get(name, []):
@@ -2830,11 +2983,9 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 
     if vary_flood and n_flood > 0:
         rng_flood = np.random.default_rng(seed=effective_seed + 4)
-        #log_nf  = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
-        #n_flood = int(np.round(np.exp(log_nf)))
-        # flood_occ = float(FLOOD_LINE_K / np.sqrt(n_flood))
+        log_nf  = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
+        n_flood = int(np.round(np.exp(log_nf)))
         flood_occ = rng_flood.uniform(0.01, 0.05)
-        n_flood = int(np.round(rng_flood.uniform(1000,2000)))
 
     # Reference-PDB mode: sequence + per-(resnum,atom) RMSF come from the
     # reference instead of random AA sampling / per-restype defaults.
@@ -2911,7 +3062,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         #     and bond |delta| > 0.3 Å (stretched/compressed bonds indicate
         #     irresolvable clashes).  Delete offenders NOW before building
         #     altlocs — cheaper than re-running sfcalc/refmac later.
-        geo_file = tmpdir / 'built_minimized.geo'
+        geo_file = minimized_pdb.with_suffix('.geo')  # built_minimized or built_pack_minimized
         geo_bad = _parse_geo_bad_nonbonds(geo_file)
         if geo_bad:
             log.info('step4c: deleting %d residues with severe nonbond clashes: %s',
