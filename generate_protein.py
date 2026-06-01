@@ -3054,9 +3054,29 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         # second call is unnecessary.
         if ss_pairs:
             shutil.copy2(minimized_pdb, tmpdir / 'built_pack.pdb')
+            # Set the second-pass bond-distance cap to the actual maximum SG-SG
+            # distance after the first pass, rounded up with 20% headroom.
+            # The first pass may occasionally fail to pull all SS pairs fully
+            # together, leaving one pair at 10-15 Å; a hard cap of 10.0 would
+            # then abort the second-pass geommin.
+            _sg_pos = {}
+            _st_tmp = gemmi.read_structure(str(minimized_pdb))
+            for _ch in _st_tmp[0]:
+                for _res in _ch:
+                    if _res.name == 'CYS':
+                        for _a in _res:
+                            if _a.name == 'SG':
+                                _sg_pos[_res.seqid.num] = _a.pos
+            _max_ss_dist = max(
+                (_sg_pos[a].dist(_sg_pos[b])
+                 for a, b in ss_pairs
+                 if a in _sg_pos and b in _sg_pos),
+                default=2.1,
+            )
+            _pack_bond_lim = max(10.0, _max_ss_dist * 1.2)
             packed_pdb = step4_phenix_geommin(
                 'built_pack.pdb', tmpdir, log_tag='_2nd',
-                disulfide_pairs=ss_pairs, max_reasonable_bond=10.0,
+                disulfide_pairs=ss_pairs, max_reasonable_bond=_pack_bond_lim,
             )
             _inject_ssbonds(packed_pdb, ss_pairs)
             minimized_pdb = packed_pdb
