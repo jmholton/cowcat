@@ -556,10 +556,14 @@ def _apply_bimodal_split(in_pdb, bimodal_atoms, parent_A_pdb, parent_B_pdb,
             f'      sigma            = {sigma:.4f}\n'
             f'    }}'
         )
-    # SS restraints inside each altloc so disulfides don't blow apart
-    if disulfide_pairs:
+    # SS restraints inside each altloc so disulfides don't blow apart.
+    # Only include pairs where both CYS residues survived the step-4c deletion.
+    present_resnums = {rn for rn, name, _pos in protein_atoms}
+    active_ss = [(a, b) for a, b in (disulfide_pairs or [])
+                 if a in present_resnums and b in present_resnums]
+    if active_ss:
         for altid in ('A', 'B'):
-            for a, b in disulfide_pairs:
+            for a, b in active_ss:
                 bond_blocks.append(
                     f'    bond {{\n'
                     f'      action = *add\n'
@@ -618,9 +622,9 @@ def _apply_bimodal_split(in_pdb, bimodal_atoms, parent_A_pdb, parent_B_pdb,
             f'      sigma            = 0.3000\n'
             f'    }}'
         )
-    if disulfide_pairs:
+    if active_ss:  # already filtered above against present_resnums
         for altid in ('A', 'B'):
-            for a, b in disulfide_pairs:
+            for a, b in active_ss:
                 inter_bonds.append(
                     f'    bond {{\n'
                     f'      action = *add\n'
