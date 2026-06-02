@@ -38,6 +38,90 @@ BEGIN{
     # user can set default Occupancy, B-factor (otherwise taken from main chain)
     if(! Occ)  Occ  = ""
     if(! Bfac) Bfac = ""
+
+    # Self-collision avoidance (opt-in: set avoid_clashes=1 on command line)
+    # avoid_clashes: enable clash checking and random chi retry (default off)
+    # CLASH_DIST:    minimum non-bonded heavy-atom distance in Angstroms
+    # MAX_RETRY:     random chi draws per side chain before giving up
+    if(avoid_clashes == "") avoid_clashes = 0
+    if(CLASH_DIST    == "") CLASH_DIST    = 3.0
+    if(MAX_RETRY     == "") MAX_RETRY     = 50
+    n_stored = 0
+    if(seed != "") srand(seed+0)
+    else           srand(1)
+}
+
+
+# Store a single atom position for clash checking.
+function store_atom(x, y, z, res) {
+    ++n_stored
+    stored_X[n_stored] = x
+    stored_Y[n_stored] = y
+    stored_Z[n_stored] = z
+    stored_res[n_stored] = res
+}
+
+# Parse a multi-line PDB string and store every atom in it.
+function store_chain_str(pdb_str, res,   n, lines, i, x, y, z) {
+    n = split(pdb_str, lines, "\n")
+    for(i = 1; i <= n; ++i) {
+        if(lines[i] !~ /^ATOM|^HETAT/) continue
+        x = substr(lines[i], 31, 8) + 0
+        y = substr(lines[i], 39, 8) + 0
+        z = substr(lines[i], 47, 8) + 0
+        store_atom(x, y, z, res)
+    }
+}
+
+# Return 1 if any atom in pdb_str (a multi-line PDB string) is within
+# CLASH_DIST of any stored atom from a different residue than cur_res.
+function check_clash_str(pdb_str, cur_res,   n, lines, i, x, y, z, j, dx, dy, dz) {
+    n = split(pdb_str, lines, "\n")
+    for(i = 1; i <= n; ++i) {
+        if(lines[i] !~ /^ATOM|^HETAT/) continue
+        x = substr(lines[i], 31, 8) + 0
+        y = substr(lines[i], 39, 8) + 0
+        z = substr(lines[i], 47, 8) + 0
+        for(j = 1; j <= n_stored; ++j) {
+            if(stored_res[j] == cur_res) continue
+            dx = x - stored_X[j]
+            dy = y - stored_Y[j]
+            dz = z - stored_Z[j]
+            if(dx*dx + dy*dy + dz*dz < CLASH_DIST*CLASH_DIST) return 1
+        }
+    }
+    return 0
+}
+
+# Dispatcher: call the appropriate build_XXX function and return the PDB string.
+function build_side_chain(rtyp, N, CA, C, c1, c2, c3, c4, c5) {
+    if(rtyp == "GLY") return ""
+    if(rtyp == "ALA") return build_ALA(N, CA, C)
+    if(rtyp == "SER") return build_SER(N, CA, C, c1)
+    if(rtyp == "CYS") return build_CYS(N, CA, C, c1)
+    if(rtyp == "VAL") return build_VAL(N, CA, C, c1)
+    if(rtyp == "THR") return build_THR(N, CA, C, c1)
+    if(rtyp == "ABU") return build_ABU(N, CA, C, c1)
+    if(rtyp == "LEU") return build_LEU(N, CA, C, c1, c2)
+    if(rtyp == "ILE") return build_ILE(N, CA, C, c1, c2)
+    if(rtyp == "IIL") return build_IIL(N, CA, C, c1, c2)
+    if(rtyp == "PRO") return build_PRO(N, CA, C, c1, c2)
+    if(rtyp == "ASP") return build_ASP(N, CA, C, c1, c2)
+    if(rtyp == "ASN") return build_ASN(N, CA, C, c1, c2)
+    if(rtyp == "NRV") return build_NRV(N, CA, C, c1, c2)
+    if(rtyp == "HIS") return build_HIS(N, CA, C, c1, c2)
+    if(rtyp == "PHE") return build_PHE(N, CA, C, c1, c2)
+    if(rtyp == "TYR") return build_TYR(N, CA, C, c1, c2)
+    if(rtyp == "TRP") return build_TRP(N, CA, C, c1, c2)
+    if(rtyp == "MET") return build_MET(N, CA, C, c1, c2, c3)
+    if(rtyp == "MSE") return build_MSE(N, CA, C, c1, c2, c3)
+    if(rtyp == "NRL") return build_NRL(N, CA, C, c1, c2, c3)
+    if(rtyp == "GLU") return build_GLU(N, CA, C, c1, c2, c3)
+    if(rtyp == "GLN") return build_GLN(N, CA, C, c1, c2, c3)
+    if(rtyp == "LYS") return build_LYS(N, CA, C, c1, c2, c3, c4)
+    if(rtyp == "GLA") return build_GLA(N, CA, C, c1, c2, c3, c4)
+    if(rtyp == "ARG") return build_ARG(N, CA, C, c1, c2, c3, c4, c5)
+    return ""
 }
 
 /^NEWONLY/ || /^ONLYNEW/ {onlynew = 1}
@@ -122,6 +206,7 @@ toupper($1) ~ /^BUILD/ && NF>=3{
     if(! BUILD[chain,resnum])
     {
         # nothing interesting to do here
+        if(avoid_clashes) store_atom(x, y, z, resnum)
         if(! onlynew) print;
         next
     }
@@ -196,40 +281,30 @@ toupper($1) ~ /^BUILD/ && NF>=3{
         # we have everything we need to build the side chain
         split(Build_angles[build], chi)
 
-        side_chain = ""
-        if(restyp == "GLY") side_chain = ""
-        if(restyp == "ALA") side_chain = build_ALA(N, CA, C);
+        side_chain = build_side_chain(restyp, N, CA, C,
+                                      chi[1], chi[2], chi[3], chi[4], chi[5])
 
-        if(restyp == "SER") side_chain = build_SER(N,CA,C, chi[1]);
-        if(restyp == "CYS") side_chain = build_CYS(N,CA,C, chi[1]);
-        if(restyp == "VAL") side_chain = build_VAL(N,CA,C, chi[1]);
-        if(restyp == "THR") side_chain = build_THR(N,CA,C, chi[1]);
-        if(restyp == "ABU") side_chain = build_ABU(N,CA,C, chi[1]);
+        if(avoid_clashes && check_clash_str(side_chain, resnum)) {
+            for(attempt = 1; attempt <= MAX_RETRY; ++attempt) {
+                trial = build_side_chain(restyp, N, CA, C,
+                                         -180 + 360*rand(),
+                                         -180 + 360*rand(),
+                                         -180 + 360*rand(),
+                                         -180 + 360*rand(),
+                                         "0")
+                if(!check_clash_str(trial, resnum)) {
+                    side_chain = trial
+                    break
+                }
+            }
+        }
 
-        if(restyp == "LEU") side_chain = build_LEU(N,CA,C, chi[1], chi[2]);
-        if(restyp == "ILE") side_chain = build_ILE(N,CA,C, chi[1], chi[2]);
-        if(restyp == "IIL") side_chain = build_IIL(N,CA,C, chi[1], chi[2]);
-        if(restyp == "PRO") side_chain = build_PRO(N,CA,C, chi[1], chi[2]);
-        if(restyp == "ASP") side_chain = build_ASP(N,CA,C, chi[1], chi[2]);
-        if(restyp == "ASN") side_chain = build_ASN(N,CA,C, chi[1], chi[2]);
-        if(restyp == "NRV") side_chain = build_NRV(N,CA,C, chi[1], chi[2]);
+        # store backbone and side chain atoms so later residues can check against them
+        if(avoid_clashes) {
+            store_chain_str(main_chain, resnum)
+            store_chain_str(side_chain, resnum)
+        }
 
-        if(restyp == "HIS") side_chain = build_HIS(N,CA,C, chi[1], chi[2]);
-        if(restyp == "PHE") side_chain = build_PHE(N,CA,C, chi[1], chi[2]);
-        if(restyp == "TYR") side_chain = build_TYR(N,CA,C, chi[1], chi[2]);
-        if(restyp == "TRP") side_chain = build_TRP(N,CA,C, chi[1], chi[2]);
-
-        if(restyp == "MET") side_chain = build_MET(N,CA,C, chi[1], chi[2], chi[3]);
-        if(restyp == "MSE") side_chain = build_MSE(N,CA,C, chi[1], chi[2], chi[3]);
-        if(restyp == "NRL") side_chain = build_NRL(N,CA,C, chi[1], chi[2], chi[3]);
-        if(restyp == "GLU") side_chain = build_GLU(N,CA,C, chi[1], chi[2], chi[3]);
-        if(restyp == "GLN") side_chain = build_GLN(N,CA,C, chi[1], chi[2], chi[3]);
-
-        if(restyp == "LYS") side_chain = build_LYS(N,CA,C, chi[1], chi[2], chi[3], chi[4]);
-        if(restyp == "GLA") side_chain = build_GLA(N,CA,C, chi[1], chi[2], chi[3], chi[4]);
-
-        if(restyp == "ARG") side_chain = build_ARG(N,CA,C, chi[1], chi[2], chi[3], chi[4], chi[5]);
-        
         # print it out
         printf "%s", side_chain
       }

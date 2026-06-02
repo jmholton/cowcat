@@ -27,6 +27,42 @@ BEGIN{
     O["Z"]=0
 
     last_omega=omega=180
+
+    # Self-collision avoidance (opt-in: set avoid_clashes=1 on the command line)
+    # avoid_clashes: enable clash checking and random-angle retry (default off)
+    # CLASH_DIST:    minimum non-bonded heavy-atom distance in Angstroms
+    # MAX_RETRY:     random phi/psi draws per residue before giving up
+    if(avoid_clashes == "") avoid_clashes = 0
+    if(CLASH_DIST    == "") CLASH_DIST    = 3.0
+    if(MAX_RETRY     == "") MAX_RETRY     = 100
+    n_stored = 0
+    if(seed != "") srand(seed+0)
+    else           srand(1)
+}
+
+
+################################################################################
+# check_clash(x, y, z, cur_resnum)
+# Returns 1 if (x,y,z) is within CLASH_DIST of any stored atom that is not
+# from the immediately adjacent residue (cur_resnum-1 or cur_resnum itself).
+################################################################################
+function check_clash(x, y, z, cur_res,   i, dx, dy, dz) {
+    for(i = 1; i <= n_stored; ++i) {
+        if(stored_res[i] >= cur_res - 1) continue
+        dx = x - stored_X[i]
+        dy = y - stored_Y[i]
+        dz = z - stored_Z[i]
+        if(dx*dx + dy*dy + dz*dz < CLASH_DIST*CLASH_DIST) return 1
+    }
+    return 0
+}
+
+function store_atom(x, y, z, res) {
+    ++n_stored
+    stored_X[n_stored] = x
+    stored_Y[n_stored] = y
+    stored_Z[n_stored] = z
+    stored_res[n_stored] = res
 }
 
 /^CRYST/
@@ -79,30 +115,81 @@ toupper($1) ~ /^BUILD/{
     }
     printf "%s", sprint_atom(N,"N",restyp,resnum);
     lastCA = resnum;
-    
+
     # position of CA follows from last carbonyl carbon
     next_atom(CA,C,N,last_omega,121.9,1.45);
     CA["X"]=new_atom["X"]; CA["Y"]=new_atom["Y"]; CA["Z"]=new_atom["Z"];
     printf "%s", sprint_atom(CA,"CA",restyp,resnum);
 
-    # position of the next carbonyl C follows from phi
-    next_atom(C,N,CA,phi,110.54,1.52);
-    C["X"]=new_atom["X"]; C["Y"]=new_atom["Y"]; C["Z"]=new_atom["Z"];
-    printf "%s", sprint_atom(C,"C",restyp,resnum);
+    if(avoid_clashes) {
+        # Store N and CA (positions are fixed; cannot be retried).
+        store_atom(N["X"],N["Y"],N["Z"],resnum);
+        store_atom(CA["X"],CA["Y"],CA["Z"],resnum);
 
-    # carbonyl O follows from psi+180
-    next_atom(N,CA,C,psi+180,121.1,1.23);
-    O["X"]=new_atom["X"]; O["Y"]=new_atom["Y"]; O["Z"]=new_atom["Z"];
-    printf "%s", sprint_atom(O,"O",restyp,resnum);
-    
-    # now print out CB (and rest of side chain?)
-    if(restyp != "GLY")
-    {
-        # position of CB should be 120 degrees away?
-        next_atom(C,N,CA,-120,110.5,1.52);
-        CB["X"]=new_atom["X"]; CB["Y"]=new_atom["Y"]; CB["Z"]=new_atom["Z"];
-        printf "%s", sprint_atom(CB,"CB",restyp,resnum);
-    }    
+        # C, O, CB depend on phi/psi and can be retried.
+        # Save the incoming C (previous residue's carbonyl C) for restore on retry.
+        save_C_X=C["X"]; save_C_Y=C["Y"]; save_C_Z=C["Z"];
+
+        for(attempt = 0; attempt <= MAX_RETRY; ++attempt) {
+            if(attempt > 0) {
+                phi = -180 + 360*rand();
+                psi = -180 + 360*rand();
+                C["X"]=save_C_X; C["Y"]=save_C_Y; C["Z"]=save_C_Z;
+            }
+
+            # trial C from phi
+            next_atom(C,N,CA,phi,110.54,1.52);
+            try_C_X=new_atom["X"]; try_C_Y=new_atom["Y"]; try_C_Z=new_atom["Z"];
+
+            # trial O from psi+180 (needs C at trial position)
+            C["X"]=try_C_X; C["Y"]=try_C_Y; C["Z"]=try_C_Z;
+            next_atom(N,CA,C,psi+180,121.1,1.23);
+            try_O_X=new_atom["X"]; try_O_Y=new_atom["Y"]; try_O_Z=new_atom["Z"];
+
+            clash = check_clash(try_C_X,try_C_Y,try_C_Z,resnum) ||
+                    check_clash(try_O_X,try_O_Y,try_O_Z,resnum);
+
+            # trial CB (fixed torsion -120; C already at trial position)
+            if(!clash && restyp != "GLY") {
+                next_atom(C,N,CA,-120,110.5,1.52);
+                clash = check_clash(new_atom["X"],new_atom["Y"],new_atom["Z"],resnum);
+            }
+
+            if(!clash || attempt == MAX_RETRY) break;
+        }
+
+        C["X"]=try_C_X; C["Y"]=try_C_Y; C["Z"]=try_C_Z;
+        printf "%s", sprint_atom(C,"C",restyp,resnum);
+        store_atom(C["X"],C["Y"],C["Z"],resnum);
+
+        O["X"]=try_O_X; O["Y"]=try_O_Y; O["Z"]=try_O_Z;
+        printf "%s", sprint_atom(O,"O",restyp,resnum);
+        store_atom(O["X"],O["Y"],O["Z"],resnum);
+
+        if(restyp != "GLY")
+        {
+            next_atom(C,N,CA,-120,110.5,1.52);
+            CB["X"]=new_atom["X"]; CB["Y"]=new_atom["Y"]; CB["Z"]=new_atom["Z"];
+            printf "%s", sprint_atom(CB,"CB",restyp,resnum);
+            store_atom(CB["X"],CB["Y"],CB["Z"],resnum);
+        }
+    } else {
+        # Original behaviour: place C, O, CB directly from given phi/psi.
+        next_atom(C,N,CA,phi,110.54,1.52);
+        C["X"]=new_atom["X"]; C["Y"]=new_atom["Y"]; C["Z"]=new_atom["Z"];
+        printf "%s", sprint_atom(C,"C",restyp,resnum);
+
+        next_atom(N,CA,C,psi+180,121.1,1.23);
+        O["X"]=new_atom["X"]; O["Y"]=new_atom["Y"]; O["Z"]=new_atom["Z"];
+        printf "%s", sprint_atom(O,"O",restyp,resnum);
+
+        if(restyp != "GLY")
+        {
+            next_atom(C,N,CA,-120,110.5,1.52);
+            CB["X"]=new_atom["X"]; CB["Y"]=new_atom["Y"]; CB["Z"]=new_atom["Z"];
+            printf "%s", sprint_atom(CB,"CB",restyp,resnum);
+        }
+    }
 
     # position of next N follows from psi
     next_atom(N,CA,C,psi,115.6,1.33);

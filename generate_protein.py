@@ -75,8 +75,8 @@ SPACEGROUP  = 'P 1'                 # space group HM symbol
 # Rfree = FLOOD_A * occ * sqrt(n_flood) + FLOOD_B  (calibrated on 1AHO grid)
 # Rfree ~11% lies on occ * sqrt(n_flood) = FLOOD_LINE_K
 FLOOD_LINE_K  = 5.27
-FLOOD_NF_MIN  = 700
-FLOOD_NF_MAX  = 4000
+FLOOD_NF_MIN  = 2000
+FLOOD_NF_MAX  = 9990
 BFAC_MU     = np.log(20.0)
 BFAC_SIGMA  = 0.7
 BFAC_MIN    = 5.0
@@ -887,8 +887,10 @@ def step1_build_backbone(seq, rng, tmpdir):
         phi, psi = sample_phi_psi(rng, aa)
         lines.append(f"BUILD {aa} {phi:.1f} {psi:.1f} 180")
     cmd_text = '\n'.join(lines) + '\n'
-    result = run(['awk', '-f', str(BUILD_N2C)], cwd=tmpdir,
-                 input_bytes=cmd_text.encode())
+    _seed = int(rng.integers(1, 2**31))
+    result = run(['awk', '-f', str(BUILD_N2C),
+                  '-v', 'avoid_clashes=1', '-v', f'seed={_seed}'],
+                 cwd=tmpdir, input_bytes=cmd_text.encode())
     (tmpdir / 'backbone.pdb').write_bytes(result.stdout)
 
 
@@ -900,9 +902,11 @@ def step2_build_sidechains(seq, rng, tmpdir):
         lines.append(f"BUILD {aa} {i} {' '.join(chis)}" if chis
                      else f"BUILD {aa} {i}")
     cmd_text = '\n'.join(lines) + '\n'
+    _seed = int(rng.integers(1, 2**31))
     backbone = (tmpdir / 'backbone.pdb').read_bytes()
-    result = run(['awk', '-f', str(BUILD_SIDE)], cwd=tmpdir,
-                 input_bytes=cmd_text.encode() + backbone)
+    result = run(['awk', '-f', str(BUILD_SIDE),
+                  '-v', 'avoid_clashes=1', '-v', f'seed={_seed}'],
+                 cwd=tmpdir, input_bytes=cmd_text.encode() + backbone)
     (tmpdir / 'side.pdb').write_bytes(result.stdout)
 
 
@@ -2989,7 +2993,7 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         rng_flood = np.random.default_rng(seed=effective_seed + 4)
         log_nf  = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
         n_flood = int(np.round(np.exp(log_nf)))
-        flood_occ = rng_flood.uniform(0.01, 0.05)
+        flood_occ = rng_flood.uniform(0.02, 0.1)
 
     # Reference-PDB mode: sequence + per-(resnum,atom) RMSF come from the
     # reference instead of random AA sampling / per-restype defaults.
@@ -3054,29 +3058,18 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
         # second call is unnecessary.
         if ss_pairs:
             shutil.copy2(minimized_pdb, tmpdir / 'built_pack.pdb')
-            # Set the second-pass bond-distance cap to the actual maximum SG-SG
-            # distance after the first pass, rounded up with 20% headroom.
-            # The first pass may occasionally fail to pull all SS pairs fully
-            # together, leaving one pair at 10-15 Å; a hard cap of 10.0 would
-            # then abort the second-pass geommin.
-            _sg_pos = {}
-            _st_tmp = gemmi.read_structure(str(minimized_pdb))
-            for _ch in _st_tmp[0]:
-                for _res in _ch:
-                    if _res.name == 'CYS':
-                        for _a in _res:
-                            if _a.name == 'SG':
-                                _sg_pos[_res.seqid.num] = _a.pos
-            _max_ss_dist = max(
-                (_sg_pos[a].dist(_sg_pos[b])
-                 for a, b in ss_pairs
-                 if a in _sg_pos and b in _sg_pos),
-                default=2.1,
-            )
-            _pack_bond_lim = max(10.0, _max_ss_dist * 1.2)
+            # Use a generous fixed limit for the second-pass geommin.
+            # max_reasonable_bond_distance is a global ceiling phenix applies to
+            # ALL bonds (including our custom SS restraints), so it must be at
+            # least as large as the longest SS distance remaining after the first
+            # pass.  The first pass occasionally leaves a pair at 10-15 A; a
+            # tight dynamic limit based on measured distances still fails when
+            # there is an unmeasured pair or phenix finds a slightly longer path.
+            # 20 A covers all observed failures with no risk of accepting garbage
+            # since link_none=True prevents phenix from auto-detecting non-SS bonds.
             packed_pdb = step4_phenix_geommin(
                 'built_pack.pdb', tmpdir, log_tag='_2nd',
-                disulfide_pairs=ss_pairs, max_reasonable_bond=_pack_bond_lim,
+                disulfide_pairs=ss_pairs, max_reasonable_bond=20.0,
             )
             _inject_ssbonds(packed_pdb, ss_pairs)
             minimized_pdb = packed_pdb
