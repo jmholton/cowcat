@@ -72,11 +72,14 @@ SAMPLE_RATE = 3.0                   # oversampling → 60×60×60 grid for 40 Å
 SPACEGROUP  = 'P 1'                 # space group HM symbol
 
 # ── Flood water iso-Rfree calibration ──────────────────────────────────────────
-# Rfree = FLOOD_A * occ * sqrt(n_flood) + FLOOD_B  (calibrated on 1AHO grid)
-# Rfree ~11% lies on occ * sqrt(n_flood) = FLOOD_LINE_K
-FLOOD_LINE_K  = 5.27
-FLOOD_NF_MIN  = 2000
-FLOOD_NF_MAX  = 9990
+# Calibrated on P2(1)2(1)2(1) boiled data (fitme.txt, N=1997 samples):
+#   Rfree = FLOOD_A * occ * sqrt(n_flood) + FLOOD_B   R2=0.836  RMSE=1.6%
+# Target Rfree=11% => occ * sqrt(n_flood) = FLOOD_LINE_K = (11-FLOOD_B)/FLOOD_A
+FLOOD_A       = 1.797   # slope (% per unit of occ*sqrt(n_flood))
+FLOOD_B       = 5.11    # intercept (% Rfree at zero flood contribution)
+FLOOD_LINE_K  = (11.0 - FLOOD_B) / FLOOD_A   # ~3.28: target occ*sqrt(n) for 11%
+FLOOD_NF_MIN  = 1000
+FLOOD_NF_MAX  = 4000
 BFAC_MU     = np.log(20.0)
 BFAC_SIGMA  = 0.7
 BFAC_MIN    = 5.0
@@ -2991,9 +2994,14 @@ def generate_sample(sample_idx, outdir, n_residues=20, n_waters=10, n_flood=0,
 
     if vary_flood and n_flood > 0:
         rng_flood = np.random.default_rng(seed=effective_seed + 4)
-        log_nf  = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
-        n_flood = int(np.round(np.exp(log_nf)))
-        flood_occ = rng_flood.uniform(0.02, 0.1)
+        # Draw n_flood log-uniformly, then set occ from the calibration line
+        # (Rfree = FLOOD_A * occ * sqrt(n) + FLOOD_B, target Rfree=11%) with
+        # +/-30% scatter so the dataset spans roughly 9-13% Rfree from floods.
+        log_nf    = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
+        n_flood   = int(np.round(np.exp(log_nf)))
+        scatter   = float(rng_flood.uniform(0.7, 1.3))
+        flood_occ = float(np.clip(scatter * FLOOD_LINE_K / np.sqrt(n_flood),
+                                  0.03, 0.20))
 
     # Reference-PDB mode: sequence + per-(resnum,atom) RMSF come from the
     # reference instead of random AA sampling / per-restype defaults.
