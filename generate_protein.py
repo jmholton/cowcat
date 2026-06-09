@@ -1150,6 +1150,9 @@ def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None,
            'correct_hydrogens=False']
     orig_cryst1 = None
     _needs_centering = False
+    # Read the original structure once before any CRYST1 modifications so
+    # both the SS check and the extent check use the real cell dimensions.
+    _st_orig = gemmi.read_structure(str(Path(tmpdir) / pdb_name))
     if disulfide_pairs:
         eff_path = Path(tmpdir) / f'{Path(pdb_name).stem}_disulfides.eff'
         bond_blocks = '\n'.join(f'''    bond {{
@@ -1176,15 +1179,14 @@ geometry_restraints {{
         # shortest cell axis (phenix's hard upper bound).  After the first
         # pull pass the SGs are within 2-3 Å, so a second symmetry-aware
         # pass can keep the target cell+SG (which is what packs the chain).
-        st_in = gemmi.read_structure(str(Path(tmpdir) / pdb_name))
         cur_ss_max = 0.0
-        chain_a = list(st_in[0])[0]
+        chain_a = list(_st_orig[0])[0]
         sg_pos = {r.seqid.num: at.pos for r in chain_a if r.name == 'CYS'
                   for at in r if at.name == 'SG'}
         for a, b in disulfide_pairs:
             if a in sg_pos and b in sg_pos:
                 cur_ss_max = max(cur_ss_max, sg_pos[a].dist(sg_pos[b]))
-        shortest_axis = min(st_in.cell.a, st_in.cell.b, st_in.cell.c)
+        shortest_axis = min(_st_orig.cell.a, _st_orig.cell.b, _st_orig.cell.c)
         if cur_ss_max > shortest_axis * 0.9:
             orig_cryst1 = _swap_cryst1(Path(tmpdir) / pdb_name,
                                        max_reasonable_bond, max_reasonable_bond,
@@ -1194,13 +1196,14 @@ geometry_restraints {{
     # inside the real P 21 21 21 cell then fails.  A large P1 cube lets
     # geommin pull bonds back to normal lengths, after which we centre the
     # result in the real cell and restore CRYST1.
-    _st_ext = gemmi.read_structure(str(Path(tmpdir) / pdb_name))
-    _xs = [at.pos.x for _m in _st_ext for _ch in _m for _r in _ch for at in _r]
-    _ys = [at.pos.y for _m in _st_ext for _ch in _m for _r in _ch for at in _r]
-    _zs = [at.pos.z for _m in _st_ext for _ch in _m for _r in _ch for at in _r]
+    # Use _st_orig (read before SS modifications) so we compare against the
+    # real cell, not the already-widened one.
+    _xs = [at.pos.x for _m in _st_orig for _ch in _m for _r in _ch for at in _r]
+    _ys = [at.pos.y for _m in _st_orig for _ch in _m for _r in _ch for at in _r]
+    _zs = [at.pos.z for _m in _st_orig for _ch in _m for _r in _ch for at in _r]
     if _xs:
         _extent = max(max(_xs) - min(_xs), max(_ys) - min(_ys), max(_zs) - min(_zs))
-        _short = min(_st_ext.cell.a, _st_ext.cell.b, _st_ext.cell.c)
+        _short = min(_st_orig.cell.a, _st_orig.cell.b, _st_orig.cell.c)
         if _extent > _short * 0.9:
             _big = _extent + 100.0
             if orig_cryst1 is None:
