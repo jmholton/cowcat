@@ -21,11 +21,18 @@ set outdir   = $1
 set nsamples = 1000
 if ($#argv >= 2) set nsamples = $2
 
-ccp4-python generate_protein.py --submit --nsamples $nsamples \
-    --outdir $outdir \
-    --cell 45.9 40.7 30.1 --dmin 0.965 --spacegroup "P 21 21 21" \
-    --nresidues 64 --nwaters 30 \
-    --n-altlocs 20 --n-flood 5000 --flood-occ 0.08 \
-    --altloc-swaps-per-res 5 \
-    --per-conf-geommin --exclude-nodes voltron,graphics2 \
-    --partition refmac --max-array 20 --time 00:15:00
+
+ccp4-python generate_protein.py --submit --nsamples 1000 \
+            --outdir data/data_boiled_s6000 --seed 6000 \
+            --reference-pdb 1aho/gt48.pdb \
+            --n-altlocs 20 \
+            --nwaters 76 \
+            --shift-scale 1.0 \
+            --altloc-swaps-per-res 20 \
+            --per-conf-geommin \
+            --n-flood 5000 --flood-occ 0.03 \
+            --partition refmac \
+            --max-array 300 \
+            --fast-refmac --vary-flood
+
+
