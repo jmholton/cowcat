@@ -1108,6 +1108,26 @@ def _swap_cryst1(pdb_path, new_a, new_b, new_c, new_sg='P 1', restore=None):
     return orig
 
 
+def _centre_pdb_in_cell(pdb_path):
+    """Translate all atoms so their centroid lands at the cell centre."""
+    st = gemmi.read_structure(str(pdb_path))
+    cell = st.cell
+    xs = [at.pos.x for m in st for ch in m for r in ch for at in r]
+    ys = [at.pos.y for m in st for ch in m for r in ch for at in r]
+    zs = [at.pos.z for m in st for ch in m for r in ch for at in r]
+    if not xs:
+        return
+    dx = cell.a / 2 - sum(xs) / len(xs)
+    dy = cell.b / 2 - sum(ys) / len(ys)
+    dz = cell.c / 2 - sum(zs) / len(zs)
+    for m in st:
+        for ch in m:
+            for r in ch:
+                for at in r:
+                    at.pos = gemmi.Position(at.pos.x + dx, at.pos.y + dy, at.pos.z + dz)
+    st.write_pdb(str(pdb_path))
+
+
 def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None,
                          disulfide_pairs=None, chain='A',
                          max_reasonable_bond=150.0):
@@ -1129,6 +1149,7 @@ def step4_phenix_geommin(pdb_name, tmpdir, log_tag=None,
            'link_all=False', 'link_none=True', 'link_ligands=False',
            'correct_hydrogens=False']
     orig_cryst1 = None
+    _needs_centering = False
     if disulfide_pairs:
         eff_path = Path(tmpdir) / f'{Path(pdb_name).stem}_disulfides.eff'
         bond_blocks = '\n'.join(f'''    bond {{
@@ -1168,6 +1189,26 @@ geometry_restraints {{
             orig_cryst1 = _swap_cryst1(Path(tmpdir) / pdb_name,
                                        max_reasonable_bond, max_reasonable_bond,
                                        max_reasonable_bond, new_sg='P 1')
+    # Widen to a P1 cube if atom extent exceeds the real cell.  A
+    # Ramachandran-sampled chain can diverge hundreds of Angstroms; geommin
+    # inside the real P 21 21 21 cell then fails.  A large P1 cube lets
+    # geommin pull bonds back to normal lengths, after which we centre the
+    # result in the real cell and restore CRYST1.
+    _st_ext = gemmi.read_structure(str(Path(tmpdir) / pdb_name))
+    _xs = [at.pos.x for _m in _st_ext for _ch in _m for _r in _ch for at in _r]
+    _ys = [at.pos.y for _m in _st_ext for _ch in _m for _r in _ch for at in _r]
+    _zs = [at.pos.z for _m in _st_ext for _ch in _m for _r in _ch for at in _r]
+    if _xs:
+        _extent = max(max(_xs) - min(_xs), max(_ys) - min(_ys), max(_zs) - min(_zs))
+        _short = min(_st_ext.cell.a, _st_ext.cell.b, _st_ext.cell.c)
+        if _extent > _short * 0.9:
+            _big = _extent + 100.0
+            if orig_cryst1 is None:
+                orig_cryst1 = _swap_cryst1(Path(tmpdir) / pdb_name,
+                                           _big, _big, _big, new_sg='P 1')
+            else:
+                _swap_cryst1(Path(tmpdir) / pdb_name, _big, _big, _big, new_sg='P 1')
+            _needs_centering = True
     result = run(cmd, cwd=tmpdir, check=False)
     stem = Path(pdb_name).stem
     log_name = f'{stem}{log_tag or ""}.phenix.log'
@@ -1185,6 +1226,8 @@ geometry_restraints {{
     if orig_cryst1 is not None:
         _swap_cryst1(Path(tmpdir) / pdb_name, 0, 0, 0, restore=orig_cryst1)
         _swap_cryst1(out, 0, 0, 0, restore=orig_cryst1)
+    if _needs_centering:
+        _centre_pdb_in_cell(out)
     return out
 
 
@@ -2569,7 +2612,7 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
     # Strip H atoms before writing — riding H from phenix geommin have partial occ
     # when collapsed (present in only k of N conformers → occ=k/N), which creates
     # spurious incomplete groups in refmac_occupancy_setup.com.
-    # refmac MAKE HYDR A adds them back with correct occ relative to their heavy atom.
+    # phenix.reduce re-adds H below with the correct per-altloc occupancy.
     H = gemmi.Element('H')
     for chain in model_out:
         for res in chain:
@@ -2579,6 +2622,21 @@ def step8_build_mixed_model(truth_full_pdb, tmpdir, rng, altloc_swaps_per_res=1.
 
     st_out.add_model(model_out)
     st_out.write_pdb(str(tmpdir / 'starthere.pdb'))
+
+    # Re-add H via phenix.reduce so starthere.pdb has the same H placement as
+    # truth_full.pdb.  Each altloc gets H at the correct occupancy (matching its
+    # heavy atoms).  refmac will then use these H via MAKE HYDR Y rather than
+    # generating idealized riding H that may not match truth.
+    reduce_result = subprocess.run(
+        [str(PHENIX_GM.parent / 'phenix.reduce'), str(tmpdir / 'starthere.pdb')],
+        cwd=str(tmpdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if reduce_result.returncode in (0, 1):  # reduce exits 1 on warnings, that is normal
+        (tmpdir / 'starthere.pdb').write_bytes(reduce_result.stdout)
+    else:
+        log.warning('step8: phenix.reduce failed (rc=%d); H will be absent from '
+                    'starthere.pdb, refmac MAKE HYDR Y will find no H to use',
+                    reduce_result.returncode)
 
 
 def _parse_unused_links(log_text):
@@ -2653,7 +2711,7 @@ def step9_probe(tmpdir):
 
     probe_kw = (
         _build_occ_bytes() +
-        b'MAKE HYDR A NEWLIGAND NOEXIT\n'
+        b'MAKE HYDR Y NEWLIGAND NOEXIT\n'
         b'NCYC 0\n'
         b'LABIN FP=F SIGFP=SIGF FREE=FreeR_flag\n'
         b'MONI DIST 10\n'
@@ -2744,7 +2802,7 @@ def step9_refmac(tmpdir, ncyc_per_round=(20, 40), refine_occ=(False, True),
     for rnd in range(n_rounds):
         xyzout = 'refmacout.pdb'
         occ_bytes = _build_occ_bytes(xyzin) if refine_occ[rnd] else b''
-        hout_bytes = b'MAKE HOUT Y\n' if rnd == n_rounds - 1 else b''
+        hout_bytes = b'MAKE HOUT Y\n'
         # If the previous round did occupancy refinement, the partial-occ
         # waters may have overlapping occupancies > 1; turning off the
         # vdW restraint here prevents the "water cannon" repulsion that
@@ -2752,7 +2810,7 @@ def step9_refmac(tmpdir, ncyc_per_round=(20, 40), refine_occ=(False, True),
         vdw_bytes = b'VDWREST 0\n' if (rnd > 0 and refine_occ[rnd - 1]) else b''
         keywords = (
             occ_bytes +
-            b'MAKE HYDR A NEWLIGAND NOEXIT\n' +
+            b'MAKE HYDR Y NEWLIGAND NOEXIT\n' +
             hout_bytes +
             vdw_bytes +
             f'NCYC {ncyc_per_round[rnd]}\n'.encode() +
@@ -2813,12 +2871,10 @@ def step9_refmac(tmpdir, ncyc_per_round=(20, 40), refine_occ=(False, True),
             break
         # Regenerate occ-group keywords from new.pdb (allhet → independent water occ)
         occ_bytes = _build_occ_bytes('new.pdb')
-        # Final round → keep MAKE HOUT Y so H stay in refmacout.pdb
-        is_last = (wrnd == max_water_rounds - 1)
-        hout_bytes = b'MAKE HOUT Y\n' if is_last else b''
+        hout_bytes = b'MAKE HOUT Y\n'
         kw = (
             occ_bytes +
-            b'MAKE HYDR A NEWLIGAND NOEXIT\n' +
+            b'MAKE HYDR Y NEWLIGAND NOEXIT\n' +
             hout_bytes +
             f'NCYC {water_round_ncyc}\n'.encode() +
             b'VDWREST 0\n' +
