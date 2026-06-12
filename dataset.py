@@ -53,14 +53,27 @@ def _signed_sqrt(arr):
     return np.sign(arr) * np.sqrt(np.abs(arr))
 
 
+def _unit_ratio_deconv(fofc_arr, fc_arr):
+    """Unit-ratio deconvolution — matches pack.py / infer.py / eval_1aho.py."""
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio  = F_fofc / (F_fc + eps)
+    amp    = np.abs(ratio)
+    W      = np.where(amp > 1.0, 1.0 / (amp + eps), amp)
+    unit_phase = ratio / (amp + eps)
+    return np.fft.irfftn(W * unit_phase, s=fc_arr.shape).real.astype(np.float32)
+
+
 class ElectronDensityDataset(Dataset):
-    def __init__(self, data_dir, sample_ids=None):
+    def __init__(self, data_dir, sample_ids=None, crossp_unitratio=False):
         """
         Args:
             data_dir:   root directory containing sample_NNNNN/ subdirectories
             sample_ids: optional list of subdirectory names; scans data_dir if None
         """
         self.data_dir = data_dir
+        self.crossp_unitratio = crossp_unitratio
         if sample_ids is None:
             self.sample_ids = sorted([
                 d for d in os.listdir(data_dir)
@@ -83,11 +96,14 @@ class ElectronDensityDataset(Dataset):
         ch1 = fofc_raw
         ch2 = fc_raw
 
-        crossp_path = os.path.join(base, 'crossp.npy')
-        if os.path.exists(crossp_path):
-            ch3 = _signed_sqrt(np.load(crossp_path))
+        if self.crossp_unitratio:
+            ch3 = _unit_ratio_deconv(fofc_raw, fc_raw)
         else:
-            ch3 = _signed_sqrt(_cross_patterson(fofc_raw, fc_raw))
+            crossp_path = os.path.join(base, 'crossp.npy')
+            if os.path.exists(crossp_path):
+                ch3 = _signed_sqrt(np.load(crossp_path))
+            else:
+                ch3 = _signed_sqrt(_cross_patterson(fofc_raw, fc_raw))
 
         truth_raw = _load_map(os.path.join(base, 'truth.map'))
         diff_raw  = truth_raw - fc_raw
