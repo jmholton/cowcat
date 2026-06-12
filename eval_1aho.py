@@ -48,15 +48,32 @@ def _signed_sqrt(arr):
     return np.sign(arr) * np.sqrt(np.abs(arr))
 
 
-def _build_input(twofofc, fofc, fc, crossp_raw=False):
+def _unit_ratio_deconv(fofc_arr, fc_arr):
+    """Unit-ratio deconvolution — matches pack.py / infer.py implementation."""
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio  = F_fofc / (F_fc + eps)
+    amp    = np.abs(ratio)
+    W      = np.where(amp > 1.0, 1.0 / (amp + eps), amp)
+    unit_phase = ratio / (amp + eps)
+    result = np.fft.irfftn(W * unit_phase, s=fc_arr.shape)
+    return result.real.astype(np.float32)
+
+
+def _build_input(twofofc, fofc, fc, crossp_raw=False, crossp_unitratio=False):
     """4-channel input tensor.
 
-    ch3 cross-Patterson is signed-sqrt compressed by default (matches `pack.py`
-    default = `*_ssqrt` packs). Pass crossp_raw=True for models trained on
-    `pack.py --crossp-raw` (i.e. `*_rawcrossp` packs).
+    ch3 encoding must match the pack.py variant used during training:
+      default           -- signed-sqrt cross-Patterson (*_ssqrt packs)
+      crossp_raw=True   -- raw cross-Patterson (*_rawcrossp packs)
+      crossp_unitratio  -- unit-ratio deconvolution (*_unitratio packs)
     """
-    crossp = _cross_patterson(fofc, fc)
-    ch3 = crossp if crossp_raw else _signed_sqrt(crossp)
+    if crossp_unitratio:
+        ch3 = _unit_ratio_deconv(fofc, fc)
+    else:
+        crossp = _cross_patterson(fofc, fc)
+        ch3 = crossp if crossp_raw else _signed_sqrt(crossp)
     x   = np.stack([twofofc, fofc, fc, ch3], axis=0).astype(np.float32)
     return torch.from_numpy(x[np.newaxis])   # (1, 4, D, H, W)
 
@@ -117,7 +134,8 @@ def _scale_kb(Fo, Fc, s2, n_cycles=4):
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def setup_1aho_eval(eval_dir, fo_label='FP', free_label='FreeR_flag',
-                    mtz_name='refmacout_minRfree.mtz', crossp_raw=False):
+                    mtz_name='refmacout_minRfree.mtz', crossp_raw=False,
+                    crossp_unitratio=False):
     """Build the context dict consumed by eval_rfree. Returns None on failure.
 
     Loads twofofc/fofc/fc maps + extracts MTZ data. ccp4-python must be on PATH
@@ -133,7 +151,8 @@ def setup_1aho_eval(eval_dir, fo_label='FP', free_label='FreeR_flag',
     twofofc = _load_ccp4_map(d / '2fofc.map')
     fofc    = _load_ccp4_map(d / 'fofc.map')
     fc      = _load_ccp4_map(d / 'fc.map')
-    x       = _build_input(twofofc, fofc, fc, crossp_raw=crossp_raw)
+    x       = _build_input(twofofc, fofc, fc, crossp_raw=crossp_raw,
+                           crossp_unitratio=crossp_unitratio)
 
     mtz = _read_mtz_via_ccp4python(d / mtz_name, fo_label, free_label)
     if mtz is None:
