@@ -64,17 +64,33 @@ def _cross_patterson(fofc_arr, fc_arr):
     ).real.astype(np.float32)
 
 
-def _build_input(twofofc, fofc, fc, crossp_raw=False):
+def _unit_ratio_deconv(fofc_arr, fc_arr):
+    """Unit-ratio deconvolution — see pack.py for details."""
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio  = F_fofc / (F_fc + eps)
+    amp    = np.abs(ratio)
+    W      = np.where(amp > 1.0, 1.0 / (amp + eps), amp)
+    unit_phase = ratio / (amp + eps)
+    result = np.fft.irfftn(W * unit_phase, s=fc_arr.shape)
+    return result.real.astype(np.float32)
+
+
+def _build_input(twofofc, fofc, fc, crossp_raw=False, crossp_unitratio=False):
     """Stack four channels and return a (1, 4, D, H, W) float32 tensor.
 
     ch0-2: raw e/Å³
-    ch3: cross-Patterson, signed-sqrt compressed by default (matches
-         `pack.py` default). Pass crossp_raw=True to feed the raw
-         cross-Patterson — required for models trained on `pack.py --crossp-raw`
-         datasets (e.g. `*_rawcrossp`).
+    ch3: cross-Patterson encoding (matches the pack.py variant used during training):
+         default       -- signed-sqrt cross-Patterson (*_ssqrt datasets)
+         crossp_raw    -- raw cross-Patterson (*_rawcrossp datasets)
+         crossp_unitratio -- unit-ratio deconvolution (*_unitratio datasets)
     """
-    crossp = _cross_patterson(fofc, fc)
-    ch3 = crossp if crossp_raw else _signed_sqrt(crossp)
+    if crossp_unitratio:
+        ch3 = _unit_ratio_deconv(fofc, fc)
+    else:
+        crossp = _cross_patterson(fofc, fc)
+        ch3 = crossp if crossp_raw else _signed_sqrt(crossp)
     x = np.stack([twofofc, fofc, fc, ch3], axis=0)
     return torch.from_numpy(x[np.newaxis].astype(np.float32))  # (1,4,D,H,W)
 
@@ -157,6 +173,9 @@ def main():
                         help='Feed RAW cross-Patterson at ch3 instead of the default '
                              'signed-sqrt. Required for models trained on '
                              '`pack.py --crossp-raw` datasets (e.g. *_rawcrossp).')
+    parser.add_argument('--crossp-unitratio', action='store_true',
+                        help='Feed unit-ratio deconvolution at ch3. Required for models '
+                             'trained on `pack.py --crossp-unitratio` datasets (e.g. *_unitratio).')
     args = parser.parse_args()
 
     device = torch.device('cpu' if args.cpu or not torch.cuda.is_available() else 'cuda')
@@ -168,8 +187,15 @@ def main():
     fc      = _load_map(args.fc)
     print(f'Grid shape: {twofofc.shape}')
 
-    x = _build_input(twofofc, fofc, fc, crossp_raw=args.crossp_raw)
-    print(f"cross-Patterson encoding (ch3): {'raw' if args.crossp_raw else 'signed-sqrt'}")
+    x = _build_input(twofofc, fofc, fc, crossp_raw=args.crossp_raw,
+                     crossp_unitratio=args.crossp_unitratio)
+    if args.crossp_unitratio:
+        enc_label = 'unit-ratio deconvolution'
+    elif args.crossp_raw:
+        enc_label = 'raw'
+    else:
+        enc_label = 'signed-sqrt'
+    print(f"cross-Patterson encoding (ch3): {enc_label}")
 
     # ── Load model ────────────────────────────────────────────────────────────
     sys.path.insert(0, str(Path(__file__).parent))

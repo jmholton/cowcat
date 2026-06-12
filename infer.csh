@@ -36,7 +36,8 @@ set real          = 1aho_test
 set real_fo_label = FP
 set real_mtz      = refmacout_minRfree.mtz
 set skip          = ""
-set crossp_raw    = 0    # 1 → pass --crossp-raw to infer.py (for *_rawcrossp-trained models)
+set crossp_raw      = 0    # 1 → pass --crossp-raw to infer.py (for *_rawcrossp-trained models)
+set crossp_unitratio = 0   # 1 → pass --crossp-unitratio to infer.py (for *_unitratio-trained models)
 
 # read command line: key=value pairs
 foreach Arg ( $* )
@@ -71,7 +72,8 @@ set PYTHON = /programs/pytorch/envs/pt/bin/python
 set SRUN   = "srun --partition=gpu --gres=gpu:1 --ntasks=1 --cpus-per-task=4"
 
 set infer_extra = ""
-if ( "$crossp_raw" == "1" ) set infer_extra = "$infer_extra --crossp-raw"
+if ( "$crossp_raw" == "1" )       set infer_extra = "$infer_extra --crossp-raw"
+if ( "$crossp_unitratio" == "1" ) set infer_extra = "$infer_extra --crossp-unitratio"
 
 echo "================================================================"
 echo "inference gamut"

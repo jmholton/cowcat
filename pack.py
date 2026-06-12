@@ -48,6 +48,29 @@ def _signed_sqrt(arr):
     return np.sign(arr) * np.sqrt(np.abs(arr))
 
 
+def _unit_ratio_deconv(fofc_arr, fc_arr):
+    """Unit-ratio deconvolution of Fo-Fc by Fc.
+
+    For each reciprocal-space frequency h, compute the complex ratio
+    r(h) = rfft(fofc)(h) / rfft(fc)(h), then weight by
+    W(h) = min(|r|, 1/|r|) -- bounded [0,1], maximum when |fofc|=|fc|.
+    The output is irfftn(W * r/|r|): phase difference weighted by how
+    similar the two amplitudes are at each frequency.
+
+    This suppresses Harker cross-terms (|fc|>>|fofc| -> W->0) and avoids
+    pure-deconvolution blowup (|fc|->0 -> ratio->inf -> W->0 too).
+    """
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio  = F_fofc / (F_fc + eps)
+    amp    = np.abs(ratio)
+    W      = np.where(amp > 1.0, 1.0 / (amp + eps), amp)
+    unit_phase = ratio / (amp + eps)
+    result = np.fft.irfftn(W * unit_phase, s=fc_arr.shape)
+    return result.real.astype(np.float32)
+
+
 def process_sample(base, crossp_transform='signed_sqrt'):
     """Return (x, y, s) for one sample directory.
 
@@ -55,7 +78,7 @@ def process_sample(base, crossp_transform='signed_sqrt'):
     y: (1,D,H,W) float32 — truth−Fc difference map in e/Å³
     s: float32            — std(truth−Fc) in e/Å³
 
-    crossp_transform: 'signed_sqrt' (default) or 'raw'
+    crossp_transform: 'signed_sqrt' (default), 'raw', or 'unitratio'
     """
     base = str(base)
     ch0      = _load_map(os.path.join(base, '2fofc.map'))
@@ -64,13 +87,16 @@ def process_sample(base, crossp_transform='signed_sqrt'):
     ch1 = fofc_raw
     ch2 = fc_raw
 
-    crossp_path = os.path.join(base, 'crossp.npy')
-    if os.path.exists(crossp_path):
-        _cp = np.load(crossp_path)
-        cp_raw = _cp if _cp.shape == ch0.shape else _cross_patterson(fofc_raw, fc_raw)
+    if crossp_transform == 'unitratio':
+        ch3 = _unit_ratio_deconv(fofc_raw, fc_raw)
     else:
-        cp_raw = _cross_patterson(fofc_raw, fc_raw)
-    ch3 = _signed_sqrt(cp_raw) if crossp_transform == 'signed_sqrt' else cp_raw.astype(np.float32)
+        crossp_path = os.path.join(base, 'crossp.npy')
+        if os.path.exists(crossp_path):
+            _cp = np.load(crossp_path)
+            cp_raw = _cp if _cp.shape == ch0.shape else _cross_patterson(fofc_raw, fc_raw)
+        else:
+            cp_raw = _cross_patterson(fofc_raw, fc_raw)
+        ch3 = _signed_sqrt(cp_raw) if crossp_transform == 'signed_sqrt' else cp_raw.astype(np.float32)
 
     truth_raw = _load_map(os.path.join(base, 'truth.map'))
     diff_raw  = truth_raw - fc_raw
@@ -92,11 +118,18 @@ def main():
                         help='Overwrite existing packs')
     parser.add_argument('--crossp-raw', action='store_true',
                         help='Store raw cross-Patterson in ch3 (default: signed-sqrt)')
+    parser.add_argument('--crossp-unitratio', action='store_true',
+                        help='Store unit-ratio deconvolution in ch3 instead of cross-Patterson')
     parser.add_argument('--outdir', default=None,
                         help='Output directory (default: same as --data)')
     args = parser.parse_args()
 
-    crossp_transform = 'raw' if args.crossp_raw else 'signed_sqrt'
+    if args.crossp_unitratio:
+        crossp_transform = 'unitratio'
+    elif args.crossp_raw:
+        crossp_transform = 'raw'
+    else:
+        crossp_transform = 'signed_sqrt'
     data_dirs = [Path(d) for d in args.data]
     if args.outdir:
         out = Path(args.outdir)
