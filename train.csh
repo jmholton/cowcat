@@ -15,6 +15,7 @@ set data   = ""
 set nGPUs         = 1
 set epochs        = 200
 set lr            = 1e-3
+set lr_min        = ""
 set base_features = 32
 set accum_steps   = 1
 set alpha         = 0.5
@@ -62,7 +63,8 @@ set name   = `basename $outdir`
 set extra = ""
 if ("$train_pretrain" != "")  set extra = "$extra --pretrain $train_pretrain"
 if ("$train_resume" != "")    set extra = "$extra --resume   $train_resume"
-if ("$eval_1aho" != "") set extra = "$extra --eval-1aho-dir $eval_1aho"
+if ("$eval_1aho" != "")       set extra = "$extra --eval-1aho-dir $eval_1aho"
+if ("$lr_min" != "")          set extra = "$extra --lr-min $lr_min"
 
 sbatch --partition=gpu --gres=gpu:$nGPUs --ntasks=1 --cpus-per-task=8 \
     --job-name=train_$name \

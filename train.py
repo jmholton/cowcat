@@ -109,6 +109,9 @@ def main():
     parser.add_argument('--epochs',      type=int, default=100)
     parser.add_argument('--batch-size',  type=int, default=2)
     parser.add_argument('--lr',          type=float, default=1e-3)
+    parser.add_argument('--lr-min',      type=float, default=None,
+                        help='CosineAnnealingLR eta_min (default: lr/100). '
+                             'Set equal to --lr for constant learning rate.')
     parser.add_argument('--val-frac',    type=float, default=0.2,
                         help='Fraction of data held out for validation')
     parser.add_argument('--base-features', type=int, default=32,
@@ -225,8 +228,9 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-4)
+    lr_min = args.lr_min if args.lr_min is not None else args.lr / 100
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr / 100)
+        optimizer, T_max=args.epochs, eta_min=lr_min)
 
     start_epoch   = 0
     best_val      = float('inf')
