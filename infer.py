@@ -77,16 +77,32 @@ def _unit_ratio_deconv(fofc_arr, fc_arr):
     return result.real.astype(np.float32)
 
 
-def _build_input(twofofc, fofc, fc, crossp_raw=False, crossp_unitratio=False):
+def _mobius_deconv(fofc_arr, fc_arr):
+    """Möbius-bounded Fc-deconvolution — see pack.py for details."""
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio      = F_fofc / (F_fc + eps)
+    amp        = np.abs(ratio)
+    f          = (amp - 1.0) / (amp + 1.0)
+    unit_phase = ratio / (amp + eps)
+    return np.fft.irfftn(f * unit_phase, s=fc_arr.shape).real.astype(np.float32)
+
+
+def _build_input(twofofc, fofc, fc, crossp_raw=False, crossp_unitratio=False,
+                 mobius=False):
     """Stack four channels and return a (1, 4, D, H, W) float32 tensor.
 
     ch0-2: raw e/Å³
-    ch3: cross-Patterson encoding (matches the pack.py variant used during training):
-         default       -- signed-sqrt cross-Patterson (*_ssqrt datasets)
-         crossp_raw    -- raw cross-Patterson (*_rawcrossp datasets)
+    ch3 encoding (must match the pack.py variant used during training):
+         mobius        -- Möbius-bounded Fc-deconvolution (*_mobius datasets)
          crossp_unitratio -- unit-ratio deconvolution (*_unitratio datasets)
+         crossp_raw    -- raw cross-Patterson (*_rawcrossp datasets)
+         default       -- signed-sqrt cross-Patterson (*_ssqrt datasets)
     """
-    if crossp_unitratio:
+    if mobius:
+        ch3 = _mobius_deconv(fofc, fc)
+    elif crossp_unitratio:
         ch3 = _unit_ratio_deconv(fofc, fc)
     else:
         crossp = _cross_patterson(fofc, fc)
@@ -176,6 +192,9 @@ def main():
     parser.add_argument('--crossp-unitratio', action='store_true',
                         help='Feed unit-ratio deconvolution at ch3. Required for models '
                              'trained on `pack.py --crossp-unitratio` datasets (e.g. *_unitratio).')
+    parser.add_argument('--mobius', action='store_true',
+                        help='Feed Möbius-bounded Fc-deconvolution at ch3. Required for '
+                             'models trained on `pack.py --mobius` datasets (e.g. *_mobius).')
     args = parser.parse_args()
 
     device = torch.device('cpu' if args.cpu or not torch.cuda.is_available() else 'cuda')
@@ -188,14 +207,16 @@ def main():
     print(f'Grid shape: {twofofc.shape}')
 
     x = _build_input(twofofc, fofc, fc, crossp_raw=args.crossp_raw,
-                     crossp_unitratio=args.crossp_unitratio)
-    if args.crossp_unitratio:
+                     crossp_unitratio=args.crossp_unitratio, mobius=args.mobius)
+    if args.mobius:
+        enc_label = 'Möbius deconvolution'
+    elif args.crossp_unitratio:
         enc_label = 'unit-ratio deconvolution'
     elif args.crossp_raw:
-        enc_label = 'raw'
+        enc_label = 'raw cross-Patterson'
     else:
-        enc_label = 'signed-sqrt'
-    print(f"cross-Patterson encoding (ch3): {enc_label}")
+        enc_label = 'signed-sqrt cross-Patterson'
+    print(f"ch3 encoding: {enc_label}")
 
     # ── Load model ────────────────────────────────────────────────────────────
     sys.path.insert(0, str(Path(__file__).parent))

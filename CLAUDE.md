@@ -20,8 +20,11 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 | `infer.py` | Inference on CCP4 map triples; writes `<output>` (predicted **diff**) and `predicted.map` (predicted **total** = pred+fc); --no-scale skips the demean+RMS-match-to-fofc rescale; auto-runs inline rfactor if `refmacout.mtz` present |
 | `rfactor.py` | F-space LM k+B scaling + R/Rfree against MTZ; **`--pred` expects the total map (pred+fc), not the diff** |
 | `dataset.py` | `ElectronDensityDataset`, `PackedDataset`, `PackedDatasetWithP` (for net2), `make_splits` / `make_splits_multi` |
-| `pack.py` | Packs `sample_NNNNN/` dirs into `X.npy`/`Y.npy`/`S.npy` for fast mmap loading; `--crossp-raw` skips signed-sqrt compression of channel 3 |
-| `generate.csh` / `pack.csh` / `train.csh` / `train1.csh` / `infer.csh` | tcsh wrappers with sane v4 defaults |
+| `pack.py` | Packs `sample_NNNNN/` dirs into `X.npy`/`Y.npy`/`S.npy`; ch3 encoding: `--mobius` (default new), `--crossp-unitratio`, `--crossp-raw`, or signed-sqrt |
+| `pack_with_pred.py` | Runs net1 inference over a packed dataset and appends `P.npy` (net1 predictions) for net2 training |
+| `train_sigma.py` | Trains net2 (5-channel UNet3D) to predict per-voxel log-variance of net1's residual via Gaussian NLL |
+| `infer_multisample.py` | Batch inference + R-factor stats over N synthetic samples |
+| `generate.csh` / `pack.csh` / `train.csh` / `infer.csh` | tcsh wrappers with sane v4 defaults |
 | `jigglepdb.awk` | Displaces atom positions to generate alternate conformers |
 | `explore_1aho_fusion.py` | Conformer scoring, rebuild, refmac utilities for the 1AHO iterative pipeline |
 | `swapscan_varconf.py` | Chain-letter swap optimisation: random/geo-targeted trials, refmac NCYC=50, wE scoring |
@@ -36,9 +39,14 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 
 ## Architecture
 
-- **Map channels (input)**: 2Fo-Fc (FWT/PHWT), Fo-Fc (DELFWT/PHDELWT), Fc (FC_ALL_LS/PHIC_ALL_LS), cross-Patterson (raw, no signed-sqrt compression — `pack.py --crossp-raw`)
+- **Map channels (input)**: 2Fo-Fc (FWT/PHWT), Fo-Fc (DELFWT/PHDELWT), Fc (FC_ALL_LS/PHIC_ALL_LS), ch3 deconvolution encoding (see options below)
+- **ch3 encoding** — must match between `pack.py`, `train.py`, `infer.py`, `eval_1aho.py`:
+  - `--mobius` → `(amp−1)/(amp+1)·sign(ratio)` where `ratio = FFT(fofc)/FFT(fc)` — bounded [−1,1], **injective** (monotonic), Fc phases cancel so ratio is real. Suffix `*_mobius`. *(current recommended)*
+  - `--crossp-unitratio` → `min(|r|,1/|r|)·sign` — bounded [−1,1] but **non-injective** (ratio=0.5 and 2.0 give same output). Suffix `*_unitratio`.
+  - `--crossp-raw` → raw cross-Patterson `IFFT(FFT(fofc)·conj(FFT(fc)))`. Suffix `*_rawcrossp`.
+  - *(default)* → signed-sqrt cross-Patterson. Suffix `*_ssqrt`.
 - **Target (Y)**: `znorm(truth.map − fc.map)` for older runs; plain `truth − fc` for current MSE-based runs
-- **Scale (S)**: `log(std(truth − fc))` — predicted by a scalar head; used in heteroscedastic NLL loss (legacy)
+- **Scale (S)**: `std(truth − fc)` in e/Å³ — stored in S.npy; predicted by `scale_head` (currently unused in loss, requires `find_unused_parameters=True` in DDP)
 - **Model**: UNet3D + parallel FNO branch, base_features=32, circular padding; **no BN** in `_ConvBlock` (Conv → ReLU only); fully convolutional (handles any grid size); 6,503,716 params
 - **FNO branch**: factorized full-band 3D spectral conv (F-FNO style) running parallel to the U-Net; rfftn → per-axis per-frequency channel mixing → irfftn; covers the entire spectrum at O(C²·m) per axis (no low-mode truncation). Sum into the head with the U-Net mean prediction
 - **Loss**: peak-weighted MSE `mean((1 + α|y|)·(pred-y)²)` with α=0.5 — current default; plain MSE returned as metric for Rrms comparability
@@ -185,13 +193,15 @@ Current loss is **peak-weighted MSE** (α=0.5). Plain MSE returned as metric so 
 
 **Key finding (2026-05-23):** lower synthetic val loss → higher real-1aho R_free. `fno_lr3e4` with best_val=0.0133 beats fc on real data; the no-BN run with best_val=0.0044 sits ~1% above fc. We're overfitting the synthetic peak distribution and losing real-data generalization. Either BN regularizes usefully, or `fno_lr3e4` simply caught the sweet spot (ep 27) before overfitting.
 
+**ch3 encoding progress (2026-06):** unit-ratio deconvolution (`--crossp-unitratio`) outperforms signed-sqrt cross-Patterson (urat3 Rfree_1aho=0.1128 vs ssqrt ~0.1154). Unit-ratio is a Fc-deconvolution in reciprocal space — physically more direct than the cross-Patterson for localising missing atoms. However it is **non-injective**: ratio=0.5 and ratio=2.0 give the same ch3 value. Replaced by `--mobius` encoding which is identical in physical interpretation but injective (monotonic Möbius transform), bounded [-1,1].
+
 ### eval pipeline validation
 
 The in-training Rfree_1aho column (printed by `eval_1aho.py` in `train.py`) and external `infer.csh` + `rfactor.py` agree to ~0.003–0.004 R_free. By default `infer.csh` runs whole-map inference (no `--tile`) — same as `eval_1aho.py` — so this isn't a patching artefact. Remaining gap likely comes from differences in how the amplitude rescale interacts with the saved-and-reloaded vs in-memory map values, and from `eval_1aho.py` skipping the demean step. Use eval_1aho for relative comparison across epochs; use infer.csh for the canonical reportable number.
 
 ### Datasets available (packed)
 
-Two cross-Patterson encodings of the same source dirs: `*_rawcrossp` keeps the raw `irfft(rfft(fofc)·conj(rfft(fc)))` at ch3; `*_ssqrt` applies signed-sqrt compression (`sign(x)·sqrt(|x|)`) to tame the spectral peaks of P 21 21 21 cross-Patterson.
+Four ch3 encodings exist; suffix indicates which was used at pack time. `--mobius` is the current recommended encoding (monotonic, injective, bounded [-1,1]).
 
 | Path | N | Grid | Notes |
 |------|---|------|-------|
@@ -203,6 +213,36 @@ Two cross-Patterson encodings of the same source dirs: `*_rawcrossp` keeps the r
 | `data/data_simple_v2_s0` | 1000 | 144×128×96 | 20 O-atoms, P 21 21 21 |
 
 `data/data_protein_v2_s0` is **corrupted** — 962 dirs but 519 X.npy rows zero-filled (pack.py ran before generation finished); regenerate before reuse. See gotchas.
+
+### generate_simple.py — signed missing-atom occupancy
+
+`--truth-occ-range MIN MAX` draws the missing atom's occupancy from `Uniform[MIN, MAX]`; all present atoms remain at occ=1.0. Negative occ produces a **negative** Fo-Fc peak at the missing atom position (model has density truth doesn't). The partial model always uses occ=1.0 for present atoms, so refmac works normally — refmac never sees the missing atom.
+
+```bash
+# Half negative, half positive peaks (uniform across [-1, 1]):
+ccp4-python generate_simple.py --submit --nsamples 1000 \
+    --outdir data/data_simple_negocc_s0 --truth-occ-range -1.0 1.0 \
+    --partition lr6 --account pc_als831 --qos lr_normal
+```
+
+### Net2 — per-voxel σ predictor
+
+Trains a second 5-channel UNet3D to predict per-voxel log-variance of net1's error using Gaussian NLL loss. **Must be trained on data net1 has never seen** — otherwise σ is falsely low where net1 overfits.
+
+```bash
+# 1. Pack a fresh batch of samples with net1's predictions (creates P.npy):
+python3 pack_with_pred.py \
+    --checkpoint checkpoints_my_run/best.pt \
+    --data data/data_protein_v4_s1000_mobius   # net1-unseen samples
+
+# 2. Train net2 (single GPU, no DDP needed for ~4000 samples):
+python3 train_sigma.py \
+    --data data/data_protein_v4_s1000_mobius \
+    --outdir checkpoints_sigma_my_run \
+    --epochs 200 --lr 3e-4
+```
+
+Prior run `logs_stage2_n10000_allclust5.txt` reached val_NLL=0.07852 at epoch 10 before SLURM timeout.
 
 ### Architectural changes (2026-05-22 → 2026-05-23)
 

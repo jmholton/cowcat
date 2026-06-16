@@ -120,6 +120,8 @@ def main():
                    help='Feed raw cross-Patterson at ch3 (required for *_rawcrossp models)')
     p.add_argument('--crossp-unitratio', action='store_true',
                    help='Feed unit-ratio deconvolution at ch3 (required for *_unitratio models)')
+    p.add_argument('--mobius', action='store_true',
+                   help='Feed Möbius-bounded Fc-deconvolution at ch3 (required for *_mobius models)')
     p.add_argument('--fo-label',   default='F')
     p.add_argument('--free-label', default='FreeR_flag')
     p.add_argument('--no-scale',   action='store_true',
@@ -181,7 +183,8 @@ def main():
         # Build input matching the model's training encoding.
         x = _build_input(twofofc, fofc, fc,
                          crossp_raw=args.crossp_raw,
-                         crossp_unitratio=args.crossp_unitratio).to(device)
+                         crossp_unitratio=args.crossp_unitratio,
+                         mobius=args.mobius).to(device)
 
         with torch.no_grad():
             out = model(x)

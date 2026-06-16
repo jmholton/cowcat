@@ -65,8 +65,20 @@ def _unit_ratio_deconv(fofc_arr, fc_arr):
     return np.fft.irfftn(W * unit_phase, s=fc_arr.shape).real.astype(np.float32)
 
 
+def _mobius_deconv(fofc_arr, fc_arr):
+    """Möbius-bounded Fc-deconvolution — matches pack.py / infer.py / eval_1aho.py."""
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio      = F_fofc / (F_fc + eps)
+    amp        = np.abs(ratio)
+    f          = (amp - 1.0) / (amp + 1.0)
+    unit_phase = ratio / (amp + eps)
+    return np.fft.irfftn(f * unit_phase, s=fc_arr.shape).real.astype(np.float32)
+
+
 class ElectronDensityDataset(Dataset):
-    def __init__(self, data_dir, sample_ids=None, crossp_unitratio=False):
+    def __init__(self, data_dir, sample_ids=None, crossp_unitratio=False, mobius=False):
         """
         Args:
             data_dir:   root directory containing sample_NNNNN/ subdirectories
@@ -74,6 +86,7 @@ class ElectronDensityDataset(Dataset):
         """
         self.data_dir = data_dir
         self.crossp_unitratio = crossp_unitratio
+        self.mobius = mobius
         if sample_ids is None:
             self.sample_ids = sorted([
                 d for d in os.listdir(data_dir)
@@ -96,7 +109,9 @@ class ElectronDensityDataset(Dataset):
         ch1 = fofc_raw
         ch2 = fc_raw
 
-        if self.crossp_unitratio:
+        if self.mobius:
+            ch3 = _mobius_deconv(fofc_raw, fc_raw)
+        elif self.crossp_unitratio:
             ch3 = _unit_ratio_deconv(fofc_raw, fc_raw)
         else:
             crossp_path = os.path.join(base, 'crossp.npy')

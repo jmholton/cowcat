@@ -71,6 +71,24 @@ def _unit_ratio_deconv(fofc_arr, fc_arr):
     return result.real.astype(np.float32)
 
 
+def _mobius_deconv(fofc_arr, fc_arr):
+    """Möbius-bounded Fc-deconvolution of Fo-Fc.
+
+    ratio = rfft(fofc) / rfft(fc)  — real (Fc phases cancel), may be large.
+    Mapped through (amp-1)/(amp+1) * sign, which is bounded [-1,1], monotonic,
+    and zero at unit ratio. Unlike unit-ratio, this is injective: ratio=0.5 and
+    ratio=2.0 give distinct outputs (-1/3 and +1/3 respectively).
+    """
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio      = F_fofc / (F_fc + eps)
+    amp        = np.abs(ratio)
+    f          = (amp - 1.0) / (amp + 1.0)   # Möbius: [-1, 1], monotonic
+    unit_phase = ratio / (amp + eps)          # ±1 (real, since ratio is real)
+    return np.fft.irfftn(f * unit_phase, s=fc_arr.shape).real.astype(np.float32)
+
+
 def process_sample(base, crossp_transform='signed_sqrt'):
     """Return (x, y, s) for one sample directory.
 
@@ -87,7 +105,9 @@ def process_sample(base, crossp_transform='signed_sqrt'):
     ch1 = fofc_raw
     ch2 = fc_raw
 
-    if crossp_transform == 'unitratio':
+    if crossp_transform == 'mobius':
+        ch3 = _mobius_deconv(fofc_raw, fc_raw)
+    elif crossp_transform == 'unitratio':
         ch3 = _unit_ratio_deconv(fofc_raw, fc_raw)
     else:
         crossp_path = os.path.join(base, 'crossp.npy')
@@ -120,11 +140,15 @@ def main():
                         help='Store raw cross-Patterson in ch3 (default: signed-sqrt)')
     parser.add_argument('--crossp-unitratio', action='store_true',
                         help='Store unit-ratio deconvolution in ch3 instead of cross-Patterson')
+    parser.add_argument('--mobius', action='store_true',
+                        help='Store Möbius-bounded Fc-deconvolution in ch3 (monotonic, bounded [-1,1])')
     parser.add_argument('--outdir', default=None,
                         help='Output directory (default: same as --data)')
     args = parser.parse_args()
 
-    if args.crossp_unitratio:
+    if args.mobius:
+        crossp_transform = 'mobius'
+    elif args.crossp_unitratio:
         crossp_transform = 'unitratio'
     elif args.crossp_raw:
         crossp_transform = 'raw'

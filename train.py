@@ -138,6 +138,8 @@ def main():
     parser.add_argument('--eval-1aho-mtz-name',   default='refmacout_minRfree.mtz')
     parser.add_argument('--crossp-unitratio', action='store_true',
                         help='Use unit-ratio deconvolution for ch3 (must match pack.py --crossp-unitratio)')
+    parser.add_argument('--mobius', action='store_true',
+                        help='Use Möbius-bounded Fc-deconvolution for ch3 (must match pack.py --mobius)')
     args = parser.parse_args()
 
     # ── DDP setup (torchrun sets LOCAL_RANK / WORLD_SIZE) ─────────────────────
@@ -275,6 +277,7 @@ def main():
             free_label=args.eval_1aho_free_label,
             mtz_name=args.eval_1aho_mtz_name,
             crossp_unitratio=args.crossp_unitratio,
+            mobius=args.mobius,
         )
 
     # ── Training loop ─────────────────────────────────────────────────────────

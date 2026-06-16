@@ -23,6 +23,7 @@ set eval_1aho     = 1aho_test
 set train_pretrain   = ""
 set train_resume     = ""
 set crossp_unitratio = 0
+set mobius           = 0
 
 # read the command line to update variables and other settings
 foreach Arg ( $* )
@@ -67,6 +68,7 @@ if ("$train_resume" != "")    set extra = "$extra --resume   $train_resume"
 if ("$eval_1aho" != "")       set extra = "$extra --eval-1aho-dir $eval_1aho"
 if ("$lr_min" != "")             set extra = "$extra --lr-min $lr_min"
 if ("$crossp_unitratio" == "1") set extra = "$extra --crossp-unitratio"
+if ("$mobius" == "1")           set extra = "$extra --mobius"
 
 sbatch --partition=gpu --gres=gpu:$nGPUs --ntasks=1 --cpus-per-task=8 \
     --job-name=train_$name \

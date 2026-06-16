@@ -73,7 +73,13 @@ def place_atoms(n, rng, min_dist=2.5, b_range=(10.0, 30.0)):
     return positions[:n]
 
 
-def write_pdb(positions, out_path):
+def write_pdb(positions, out_path, occs=None):
+    """Write PDB for a list of (x, y, z, b_iso) atoms.
+
+    occs: optional list of per-atom occupancies (default 1.0 for all).
+    Negative occupancies are valid — gemmi sfcalc subtracts the atomic
+    scattering contribution, producing negative density in truth.map.
+    """
     a, b, c, al, be, ga = CELL
     _sg = gemmi.find_spacegroup_by_name(SPACEGROUP)
     _z  = len(list(_sg.operations())) if _sg else 1
@@ -82,10 +88,11 @@ def write_pdb(positions, out_path):
         f'CRYST1{a:9.3f}{b:9.3f}{c:9.3f}{al:7.2f}{be:7.2f}{ga:7.2f} {_hm:<11s}{_z:3d}\n'
     ]
     for i, (x, y, z, b_iso) in enumerate(positions):
+        occ = occs[i] if occs is not None else 1.0
         lines.append(
             f'HETATM{i+1:5d}  O   HOH A{i+1:4d}    '
             f'{x:8.3f}{y:8.3f}{z:8.3f}'
-            f'{1.00:6.2f}{b_iso:6.2f}          '
+            f'{occ:6.2f}{b_iso:6.2f}          '
             f'  O\n'
         )
     lines.append('END\n')
@@ -558,6 +565,7 @@ def generate_sample(sample_idx, outdir, seed=None,
                     n_altconfs=1, altconf_rms=0.5,
                     n_clusters=1, all_clusters=False,
                     b_range=(10.0, 30.0),
+                    truth_occ_range=(1.0, 1.0),
                     no_refmac=False, verbose=False):
     outdir     = Path(outdir).resolve()
     sample_dir = outdir / f'sample_{sample_idx:05d}'
@@ -595,6 +603,8 @@ def generate_sample(sample_idx, outdir, seed=None,
         if len(positions) < n_atoms_eff:
             return sample_idx, False, f'only placed {len(positions)}/{n_atoms_eff} atoms'
 
+        occ_lo, occ_hi = truth_occ_range
+
         # Initialise partial-model metadata variables (altconf path skips the else block)
         missing_idx  = []
         sel_occ_idx  = []
@@ -606,6 +616,7 @@ def generate_sample(sample_idx, outdir, seed=None,
         # ── Alternate-conformer clusters ──────────────────────────────────────
         cluster_meta = None
         if n_altconfs >= 2:
+            # truth_occ_range not applied to altconf path (clusters have their own occ logic)
             truth_pos, partial_positions, cluster_meta = _insert_altconf_clusters(
                 positions, rng, n_altconfs, altconf_rms, n_clusters, all_clusters
             )
@@ -615,7 +626,8 @@ def generate_sample(sample_idx, outdir, seed=None,
             write_pdb(partial_positions, starthere_pdb)
         else:
             truth_pdb = tmpdir / 'truth.pdb'
-            write_pdb(positions, truth_pdb)
+            # truth_occs resolved in deletion path below after missing_idx is known
+            truth_occs = None
 
             # ── Build partial model (standard path) ───────────────────────────
             # Order of modifications: deletion → partial_occ → bfac_shift → xyz_shift
@@ -637,6 +649,13 @@ def generate_sample(sample_idx, outdir, seed=None,
                 partial_positions = [p for i, p in enumerate(partial_positions)
                                      if i not in missing_set]
                 link_indices = None
+                # Only the missing atom(s) get non-unity occ in truth; present atoms stay 1.0
+                if occ_lo != 1.0 or occ_hi != 1.0:
+                    truth_occs = [1.0] * len(positions)
+                    for idx in missing_idx:
+                        truth_occs[idx] = float(rng.uniform(occ_lo, occ_hi))
+            # write truth PDB now that truth_occs is finalised
+            write_pdb(positions, truth_pdb, occs=truth_occs)
 
             if bfac_shift is not None:
                 partial_positions, bfac_n_mod = apply_bfac_shift(
@@ -738,6 +757,10 @@ def generate_sample(sample_idx, outdir, seed=None,
             meta['n_clusters']  = len(cluster_meta)
             meta['all_clusters'] = all_clusters
             meta['clusters']    = cluster_meta
+        if occ_lo != 1.0 or occ_hi != 1.0:
+            meta['truth_occ_range'] = [round(occ_lo, 4), round(occ_hi, 4)]
+        if truth_occs is not None:
+            meta['truth_occs'] = [round(o, 4) for o in truth_occs]
         meta['no_refmac'] = no_refmac
 
         (sample_dir / 'metadata.json').write_text(json.dumps(meta, indent=2))
@@ -784,6 +807,8 @@ def _cli_flags_for_task(args):
         flags += ['--all-clusters']
     if args.b_range != [10.0, 30.0]:
         flags += [f'--b-range {args.b_range[0]} {args.b_range[1]}']
+    if args.truth_occ_range != [1.0, 1.0]:
+        flags += [f'--truth-occ-range {args.truth_occ_range[0]} {args.truth_occ_range[1]}']
     if args.no_refmac:
         flags += ['--no-refmac']
     if args.verbose:
@@ -891,6 +916,14 @@ def main():
     ap.add_argument('--all-clusters',    action='store_true',
                     help='Split every atom into an alt-conf cluster (overrides --n-clusters)')
 
+    # ── Truth occupancy ───────────────────────────────────────────────────────
+    ap.add_argument('--truth-occ-range', type=float, nargs=2, default=[1.0, 1.0],
+                    metavar=('MIN', 'MAX'),
+                    help='Draw per-atom truth occupancy from Uniform[MIN, MAX] '
+                         '(default: 1.0 1.0 = fixed at 1). Negative values produce '
+                         'negative-density atoms in truth.map, yielding negative '
+                         'Fo-Fc peaks where the partial model has spurious density.')
+
     # ── Pipeline control ──────────────────────────────────────────────────────
     ap.add_argument('--b-range',         type=float, nargs=2, default=[10.0, 30.0],
                     metavar=('MIN', 'MAX'),
@@ -946,6 +979,7 @@ def main():
             n_altconfs=args.n_altconfs, altconf_rms=args.altconf_rms,
             n_clusters=args.n_clusters, all_clusters=args.all_clusters,
             b_range=tuple(args.b_range),
+            truth_occ_range=tuple(args.truth_occ_range),
             no_refmac=args.no_refmac, verbose=args.verbose,
         )
         print(f'sample {idx}: {"ok" if ok else "FAILED"}  {msg}')
@@ -967,6 +1001,7 @@ def main():
             n_altconfs=args.n_altconfs, altconf_rms=args.altconf_rms,
             n_clusters=args.n_clusters, all_clusters=args.all_clusters,
             b_range=tuple(args.b_range),
+            truth_occ_range=tuple(args.truth_occ_range),
             no_refmac=args.no_refmac, verbose=args.verbose,
         )
         if success:

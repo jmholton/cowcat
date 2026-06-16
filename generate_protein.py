@@ -3473,6 +3473,7 @@ def submit_slurm_array(nsamples, outdir, n_residues, n_waters, n_flood=0,
 #SBATCH --output={outdir}/logs/%A_%a.log
 #SBATCH --error={outdir}/logs/%A_%a.log
 #SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --nice=1000
 
 mkdir -p {outdir}/logs
 mkdir -p "${{CCP4_SCR:-/tmp}}"

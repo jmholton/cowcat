@@ -38,6 +38,7 @@ set real_mtz      = refmacout_minRfree.mtz
 set skip          = ""
 set crossp_raw      = 0    # 1 → pass --crossp-raw to infer.py (for *_rawcrossp-trained models)
 set crossp_unitratio = 0   # 1 → pass --crossp-unitratio to infer.py (for *_unitratio-trained models)
+set mobius           = 0   # 1 → pass --mobius to infer.py (for *_mobius-trained models)
 
 # read command line: key=value pairs
 foreach Arg ( $* )
@@ -74,6 +75,7 @@ set SRUN   = "srun --partition=gpu --gres=gpu:1 --ntasks=1 --cpus-per-task=4"
 set infer_extra = ""
 if ( "$crossp_raw" == "1" )       set infer_extra = "$infer_extra --crossp-raw"
 if ( "$crossp_unitratio" == "1" ) set infer_extra = "$infer_extra --crossp-unitratio"
+if ( "$mobius" == "1" )           set infer_extra = "$infer_extra --mobius"
 
 echo "================================================================"
 echo "inference gamut"
