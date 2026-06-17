@@ -77,6 +77,16 @@ def _unit_ratio_deconv(fofc_arr, fc_arr):
     return result.real.astype(np.float32)
 
 
+def _softsign_deconv(fofc_arr, fc_arr):
+    """Softsign Fc-deconvolution — see pack.py for details."""
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio  = F_fofc / (F_fc + eps)
+    amp    = np.abs(ratio)
+    return np.fft.irfftn(ratio / (1.0 + amp), s=fc_arr.shape).real.astype(np.float32)
+
+
 def _mobius_deconv(fofc_arr, fc_arr):
     """Möbius-bounded Fc-deconvolution — see pack.py for details."""
     eps = 1e-6
@@ -90,7 +100,7 @@ def _mobius_deconv(fofc_arr, fc_arr):
 
 
 def _build_input(twofofc, fofc, fc, crossp_raw=False, crossp_unitratio=False,
-                 mobius=False):
+                 mobius=False, softsign=False):
     """Stack four channels and return a (1, 4, D, H, W) float32 tensor.
 
     ch0-2: raw e/Å³
@@ -100,7 +110,9 @@ def _build_input(twofofc, fofc, fc, crossp_raw=False, crossp_unitratio=False,
          crossp_raw    -- raw cross-Patterson (*_rawcrossp datasets)
          default       -- signed-sqrt cross-Patterson (*_ssqrt datasets)
     """
-    if mobius:
+    if softsign:
+        ch3 = _softsign_deconv(fofc, fc)
+    elif mobius:
         ch3 = _mobius_deconv(fofc, fc)
     elif crossp_unitratio:
         ch3 = _unit_ratio_deconv(fofc, fc)
@@ -192,6 +204,9 @@ def main():
     parser.add_argument('--crossp-unitratio', action='store_true',
                         help='Feed unit-ratio deconvolution at ch3. Required for models '
                              'trained on `pack.py --crossp-unitratio` datasets (e.g. *_unitratio).')
+    parser.add_argument('--softsign', action='store_true',
+                        help='Feed softsign Fc-deconvolution at ch3: ratio/(1+|ratio|). '
+                             'Required for models trained on `pack.py --softsign` datasets.')
     parser.add_argument('--mobius', action='store_true',
                         help='Feed Möbius-bounded Fc-deconvolution at ch3. Required for '
                              'models trained on `pack.py --mobius` datasets (e.g. *_mobius).')
@@ -207,8 +222,11 @@ def main():
     print(f'Grid shape: {twofofc.shape}')
 
     x = _build_input(twofofc, fofc, fc, crossp_raw=args.crossp_raw,
-                     crossp_unitratio=args.crossp_unitratio, mobius=args.mobius)
-    if args.mobius:
+                     crossp_unitratio=args.crossp_unitratio, mobius=args.mobius,
+                     softsign=args.softsign)
+    if args.softsign:
+        enc_label = 'softsign deconvolution'
+    elif args.mobius:
         enc_label = 'Möbius deconvolution'
     elif args.crossp_unitratio:
         enc_label = 'unit-ratio deconvolution'

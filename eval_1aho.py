@@ -61,6 +61,16 @@ def _unit_ratio_deconv(fofc_arr, fc_arr):
     return result.real.astype(np.float32)
 
 
+def _softsign_deconv(fofc_arr, fc_arr):
+    """Softsign Fc-deconvolution — matches pack.py / infer.py implementation."""
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio  = F_fofc / (F_fc + eps)
+    amp    = np.abs(ratio)
+    return np.fft.irfftn(ratio / (1.0 + amp), s=fc_arr.shape).real.astype(np.float32)
+
+
 def _mobius_deconv(fofc_arr, fc_arr):
     """Möbius-bounded Fc-deconvolution — matches pack.py / infer.py implementation."""
     eps = 1e-6
@@ -74,7 +84,7 @@ def _mobius_deconv(fofc_arr, fc_arr):
 
 
 def _build_input(twofofc, fofc, fc, crossp_raw=False, crossp_unitratio=False,
-                 mobius=False):
+                 mobius=False, softsign=False):
     """4-channel input tensor.
 
     ch3 encoding must match the pack.py variant used during training:
@@ -83,7 +93,9 @@ def _build_input(twofofc, fofc, fc, crossp_raw=False, crossp_unitratio=False,
       crossp_raw=True   -- raw cross-Patterson (*_rawcrossp packs)
       default           -- signed-sqrt cross-Patterson (*_ssqrt packs)
     """
-    if mobius:
+    if softsign:
+        ch3 = _softsign_deconv(fofc, fc)
+    elif mobius:
         ch3 = _mobius_deconv(fofc, fc)
     elif crossp_unitratio:
         ch3 = _unit_ratio_deconv(fofc, fc)
@@ -151,7 +163,7 @@ def _scale_kb(Fo, Fc, s2, n_cycles=4):
 
 def setup_1aho_eval(eval_dir, fo_label='FP', free_label='FreeR_flag',
                     mtz_name='refmacout_minRfree.mtz', crossp_raw=False,
-                    crossp_unitratio=False, mobius=False):
+                    crossp_unitratio=False, mobius=False, softsign=False):
     """Build the context dict consumed by eval_rfree. Returns None on failure.
 
     Loads twofofc/fofc/fc maps + extracts MTZ data. ccp4-python must be on PATH
@@ -168,7 +180,8 @@ def setup_1aho_eval(eval_dir, fo_label='FP', free_label='FreeR_flag',
     fofc    = _load_ccp4_map(d / 'fofc.map')
     fc      = _load_ccp4_map(d / 'fc.map')
     x       = _build_input(twofofc, fofc, fc, crossp_raw=crossp_raw,
-                           crossp_unitratio=crossp_unitratio, mobius=mobius)
+                           crossp_unitratio=crossp_unitratio, mobius=mobius,
+                           softsign=softsign)
 
     mtz = _read_mtz_via_ccp4python(d / mtz_name, fo_label, free_label)
     if mtz is None:

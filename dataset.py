@@ -65,6 +65,16 @@ def _unit_ratio_deconv(fofc_arr, fc_arr):
     return np.fft.irfftn(W * unit_phase, s=fc_arr.shape).real.astype(np.float32)
 
 
+def _softsign_deconv(fofc_arr, fc_arr):
+    """Softsign Fc-deconvolution — matches pack.py / infer.py / eval_1aho.py."""
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio  = F_fofc / (F_fc + eps)
+    amp    = np.abs(ratio)
+    return np.fft.irfftn(ratio / (1.0 + amp), s=fc_arr.shape).real.astype(np.float32)
+
+
 def _mobius_deconv(fofc_arr, fc_arr):
     """Möbius-bounded Fc-deconvolution — matches pack.py / infer.py / eval_1aho.py."""
     eps = 1e-6
@@ -78,7 +88,8 @@ def _mobius_deconv(fofc_arr, fc_arr):
 
 
 class ElectronDensityDataset(Dataset):
-    def __init__(self, data_dir, sample_ids=None, crossp_unitratio=False, mobius=False):
+    def __init__(self, data_dir, sample_ids=None, crossp_unitratio=False, mobius=False,
+                 softsign=False):
         """
         Args:
             data_dir:   root directory containing sample_NNNNN/ subdirectories
@@ -87,6 +98,7 @@ class ElectronDensityDataset(Dataset):
         self.data_dir = data_dir
         self.crossp_unitratio = crossp_unitratio
         self.mobius = mobius
+        self.softsign = softsign
         if sample_ids is None:
             self.sample_ids = sorted([
                 d for d in os.listdir(data_dir)
@@ -109,7 +121,9 @@ class ElectronDensityDataset(Dataset):
         ch1 = fofc_raw
         ch2 = fc_raw
 
-        if self.mobius:
+        if self.softsign:
+            ch3 = _softsign_deconv(fofc_raw, fc_raw)
+        elif self.mobius:
             ch3 = _mobius_deconv(fofc_raw, fc_raw)
         elif self.crossp_unitratio:
             ch3 = _unit_ratio_deconv(fofc_raw, fc_raw)

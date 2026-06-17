@@ -120,6 +120,8 @@ def main():
                    help='Feed raw cross-Patterson at ch3 (required for *_rawcrossp models)')
     p.add_argument('--crossp-unitratio', action='store_true',
                    help='Feed unit-ratio deconvolution at ch3 (required for *_unitratio models)')
+    p.add_argument('--softsign', action='store_true',
+                   help='Feed softsign Fc-deconvolution at ch3 (required for *_softsign models)')
     p.add_argument('--mobius', action='store_true',
                    help='Feed Möbius-bounded Fc-deconvolution at ch3 (required for *_mobius models)')
     p.add_argument('--fo-label',   default='F')
@@ -184,7 +186,8 @@ def main():
         x = _build_input(twofofc, fofc, fc,
                          crossp_raw=args.crossp_raw,
                          crossp_unitratio=args.crossp_unitratio,
-                         mobius=args.mobius).to(device)
+                         mobius=args.mobius,
+                         softsign=args.softsign).to(device)
 
         with torch.no_grad():
             out = model(x)

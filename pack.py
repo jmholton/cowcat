@@ -71,6 +71,22 @@ def _unit_ratio_deconv(fofc_arr, fc_arr):
     return result.real.astype(np.float32)
 
 
+def _softsign_deconv(fofc_arr, fc_arr):
+    """Softsign Fc-deconvolution: ratio / (1 + |ratio|).
+
+    Bounded (-1, 1), monotonic, zero at perfect fit (ratio=0), only saturates
+    at the high end. Unlike Möbius, the zero-crossing is at ratio=0 (not at
+    unit ratio), so well-fitted reflections map near 0 and large discrepancies
+    approach ±1.
+    """
+    eps = 1e-6
+    F_fofc = np.fft.rfftn(fofc_arr)
+    F_fc   = np.fft.rfftn(fc_arr)
+    ratio  = F_fofc / (F_fc + eps)
+    amp    = np.abs(ratio)
+    return np.fft.irfftn(ratio / (1.0 + amp), s=fc_arr.shape).real.astype(np.float32)
+
+
 def _mobius_deconv(fofc_arr, fc_arr):
     """Möbius-bounded Fc-deconvolution of Fo-Fc.
 
@@ -105,7 +121,9 @@ def process_sample(base, crossp_transform='signed_sqrt'):
     ch1 = fofc_raw
     ch2 = fc_raw
 
-    if crossp_transform == 'mobius':
+    if crossp_transform == 'softsign':
+        ch3 = _softsign_deconv(fofc_raw, fc_raw)
+    elif crossp_transform == 'mobius':
         ch3 = _mobius_deconv(fofc_raw, fc_raw)
     elif crossp_transform == 'unitratio':
         ch3 = _unit_ratio_deconv(fofc_raw, fc_raw)
@@ -140,13 +158,18 @@ def main():
                         help='Store raw cross-Patterson in ch3 (default: signed-sqrt)')
     parser.add_argument('--crossp-unitratio', action='store_true',
                         help='Store unit-ratio deconvolution in ch3 instead of cross-Patterson')
+    parser.add_argument('--softsign', action='store_true',
+                        help='Store softsign Fc-deconvolution in ch3: ratio/(1+|ratio|), '
+                             'bounded (-1,1), zero at perfect fit')
     parser.add_argument('--mobius', action='store_true',
                         help='Store Möbius-bounded Fc-deconvolution in ch3 (monotonic, bounded [-1,1])')
     parser.add_argument('--outdir', default=None,
                         help='Output directory (default: same as --data)')
     args = parser.parse_args()
 
-    if args.mobius:
+    if args.softsign:
+        crossp_transform = 'softsign'
+    elif args.mobius:
         crossp_transform = 'mobius'
     elif args.crossp_unitratio:
         crossp_transform = 'unitratio'
