@@ -1088,23 +1088,36 @@ def _swap_cryst1(pdb_path, new_a, new_b, new_c, new_sg='P 1', restore=None):
     If restore is given, it should be the previously returned CRYST1 line
     (including the trailing newline) and the function will swap it back in
     place of whatever CRYST1 line currently exists in the file.
+
+    SCALE records are always stripped — they encode 1/cell and become stale
+    after any cell change. Programs that write proper PDB output (refmac,
+    phenix, gemmi write_pdb) regenerate SCALE from CRYST1 automatically.
     """
     p = Path(pdb_path)
     lines = p.read_text().splitlines(keepends=True)
     orig = None
-    for i, ln in enumerate(lines):
+    new_lines = []
+    for ln in lines:
         if ln.startswith('CRYST1'):
-            orig = ln
-            break
-    new_line = (f'CRYST1{new_a:9.3f}{new_b:9.3f}{new_c:9.3f}'
-                f'  90.00  90.00  90.00 {new_sg:<11s}\n')
-    if restore is not None:
-        new_line = restore
+            if orig is None:
+                orig = ln
+            # replace with new CRYST1 (or restored one)
+            new_line = (f'CRYST1{new_a:9.3f}{new_b:9.3f}{new_c:9.3f}'
+                        f'  90.00  90.00  90.00 {new_sg:<11s}\n')
+            if restore is not None:
+                new_line = restore
+            new_lines.append(new_line)
+        elif ln.startswith('SCALE'):
+            pass   # strip stale SCALE records; will be regenerated from CRYST1
+        else:
+            new_lines.append(ln)
     if orig is None:
-        lines.insert(0, new_line)
-    else:
-        lines[i] = new_line
-    p.write_text(''.join(lines))
+        new_line = (f'CRYST1{new_a:9.3f}{new_b:9.3f}{new_c:9.3f}'
+                    f'  90.00  90.00  90.00 {new_sg:<11s}\n')
+        if restore is not None:
+            new_line = restore
+        new_lines.insert(0, new_line)
+    p.write_text(''.join(new_lines))
     return orig
 
 
