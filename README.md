@@ -1,5 +1,18 @@
 # CowCat — Convolutional Neural Network (CNN) Electron Density Reconstruction
 
+![CowCat](cowcat.png)
+
+This image — from Dr. Cowtan's
+[A Tail of Two Cats](http://www.ysbl.york.ac.uk/~cowtan/fourier/coeff.html) —
+inspired this project. It shows a cat reconstructed using observed Fourier
+magnitudes from a complete cat image combined with phases from a *Manx* (tailless)
+cat, producing the crystallographic analogue of a 2Fo-Fc map. The wispy cloud
+above the ear is a ghost peak of the missing tail: the correct density is present
+in the magnitudes but the wrong phases displace it to the wrong location. The
+CNN in this project learns to correct exactly this kind of error — recovering
+missing or misplaced density from the residual signal in the 2Fo-Fc and Fo-Fc
+map coefficients.
+
 A 3D U-Net + Fourier Neural Operator (FNO) network that reconstructs ground-truth
 electron density from phased maps containing systematic errors due to alternate
 conformations. Given the 2Fo-Fc, Fo-Fc, Fc, and a deconvolution channel (ch3) from
