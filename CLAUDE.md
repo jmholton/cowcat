@@ -20,7 +20,7 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 | `infer.py` | Inference on CCP4 map triples; writes `<output>` (predicted **diff**) and `predicted.map` (predicted **total** = pred+fc); --no-scale skips the demean+RMS-match-to-fofc rescale; auto-runs inline rfactor if `refmacout.mtz` present |
 | `rfactor.py` | F-space LM k+B scaling + R/Rfree against MTZ; **`--pred` expects the total map (pred+fc), not the diff** |
 | `dataset.py` | `ElectronDensityDataset`, `PackedDataset`, `PackedDatasetWithP` (for net2), `make_splits` / `make_splits_multi` |
-| `pack.py` | Packs `sample_NNNNN/` dirs into `X.npy`/`Y.npy`/`S.npy`; ch3 encoding: `--mobius` (default new), `--crossp-unitratio`, `--crossp-raw`, or signed-sqrt |
+| `pack.py` | Packs `sample_NNNNN/` dirs into `X.npy`/`Y.npy`/`S.npy`; ch3 encoding: `--softsign` (recommended), `--mobius`, `--crossp-unitratio`, `--crossp-raw`, or signed-sqrt (default) |
 | `pack_with_pred.py` | Runs net1 inference over a packed dataset and appends `P.npy` (net1 predictions) for net2 training |
 | `train_sigma.py` | Trains net2 (5-channel UNet3D) to predict per-voxel log-variance of net1's residual via Gaussian NLL |
 | `infer_multisample.py` | Batch inference + R-factor stats over N synthetic samples |
@@ -30,7 +30,7 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 | `swapscan_varconf.py` | Chain-letter swap optimisation: random/geo-targeted trials, refmac NCYC=50, wE scoring |
 | `swapscan_to_samples.py` | Convert swapscan `refmacout.mtz` files → `sample_NNNNN/` dirs for UNet3D training |
 | `rebuild_iterate.py` | Standalone iterative rebuild loop: score Fo-Fc outliers → rebuild → refmac → repeat |
-| `run_untangler_1aho.py` | Wrapper to run Untangler ILP on 1AHO varconf structure via SLURM |
+| `run_untangler_1aho.py` | Wrapper to run Untangler Integer Linear Programming (ILP) on 1AHO varconf structure via SLURM |
 | `condense_bb.py` | Backbone(+SS)-only maximin condensation sweep (gt48 → various k) |
 | `condense_bb_varconf.py` | Per-residue varconf condensation on a multi-chain conformer model |
 | `condense_singlechain.py` | Per-residue altloc maximin on a single-chain altloc PDB |
@@ -40,8 +40,9 @@ Train a 3D U-Net to reconstruct ground-truth electron density (Fo) from phased m
 ## Architecture
 
 - **Map channels (input)**: 2Fo-Fc (FWT/PHWT), Fo-Fc (DELFWT/PHDELWT), Fc (FC_ALL_LS/PHIC_ALL_LS), ch3 deconvolution encoding (see options below)
-- **ch3 encoding** — must match between `pack.py`, `train.py`, `infer.py`, `eval_1aho.py`:
-  - `--mobius` → `(amp−1)/(amp+1)·sign(ratio)` where `ratio = FFT(fofc)/FFT(fc)` — bounded [−1,1], **injective** (monotonic), Fc phases cancel so ratio is real. Suffix `*_mobius`. *(current recommended)*
+- **ch3 encoding** — must match between `pack.py`, `train.py`, `infer.py`, `eval_1aho.py`. In all cases `ratio = FFT(Fo-Fc)/FFT(Fc)` (real-valued — Fc phases cancel):
+  - `--softsign` → `ratio/(1+|ratio|)` — bounded (−1,1), zero at perfect fit (ratio=0), monotonic. Suffix `*_softsign`. *(current recommended)*
+  - `--mobius` → `(|ratio|−1)/(|ratio|+1)·sign` — bounded [−1,1], **injective** (monotonic). Suffix `*_mobius`.
   - `--crossp-unitratio` → `min(|r|,1/|r|)·sign` — bounded [−1,1] but **non-injective** (ratio=0.5 and 2.0 give same output). Suffix `*_unitratio`.
   - `--crossp-raw` → raw cross-Patterson `IFFT(FFT(fofc)·conj(FFT(fc)))`. Suffix `*_rawcrossp`.
   - *(default)* → signed-sqrt cross-Patterson. Suffix `*_ssqrt`.
@@ -177,7 +178,7 @@ UNIQUEIFY  = 'uniqueify'   # on PATH via CCP4 environment
 
 ---
 
-## Current Training Status (as of 2026-05-23)
+## Current Training Status (as of 2026-06-17)
 
 Current loss is **peak-weighted MSE** (α=0.5). Plain MSE returned as metric so `Rrms = sqrt(val_MSE) / sqrt(mean(truth²))` stays comparable across runs.
 
@@ -186,14 +187,20 @@ Current loss is **peak-weighted MSE** (α=0.5). Plain MSE returned as metric so 
 | checkpoint | R_work | R_free | best_val | ep | arch |
 |---|---|---|---|---|---|
 | **`fno_lr3e4_4gpu_rc/best.pt`** | **0.0687** | **0.1083** | 0.0133 | 27 | FNO+BN, lr=3e-4 — **only model to beat fc** |
+| mobius run `best_rfree.pt` | — | 0.1121 | 0.00801 | 12 | FNO no-BN, Möbius ch3, boil+simple data |
+| ssqrt+lr3e4 warm-start (ep 1) | — | 0.1173 | 0.00451 | 1 | FNO no-BN, ssqrt ch3, warm-start strict=False |
 | `fno_4gpu_rc/best.pt` | 0.1010 | 0.1138 | 0.0099 | 40 | FNO+BN, lr=1e-3 |
-| `fno_noBN_4gpu_rc/latest.pt` | 0.0909 | 0.1192 | 0.0044 | 50 | FNO no-BN (current run) |
+| `fno_noBN_4gpu_rc/latest.pt` | 0.0909 | 0.1192 | 0.0044 | 50 | FNO no-BN, ssqrt ch3 |
 | `fno_acc4_4gpu_rc/best.pt` | 0.0835 | 0.1247 | 0.0047 | 89 | FNO+BN, accum 4 |
 | fc baseline | 0.0840 | 0.1097 | — | — | — |
 
-**Key finding (2026-05-23):** lower synthetic val loss → higher real-1aho R_free. `fno_lr3e4` with best_val=0.0133 beats fc on real data; the no-BN run with best_val=0.0044 sits ~1% above fc. We're overfitting the synthetic peak distribution and losing real-data generalization. Either BN regularizes usefully, or `fno_lr3e4` simply caught the sweet spot (ep 27) before overfitting.
+**Key finding:** lower synthetic val loss → higher real-1aho R_free (anti-correlated). `fno_lr3e4` at best_val=0.0133 beats fc; no-BN runs at best_val~0.004 sit ~1% above fc. The epoch with the worst val spike is often the best Rfree checkpoint. Overfitting the synthetic peak distribution is the dominant failure mode. Batch Normalization (BN) regularises usefully despite batch=1.
 
-**ch3 encoding progress (2026-06):** unit-ratio deconvolution (`--crossp-unitratio`) outperforms signed-sqrt cross-Patterson (urat3 Rfree_1aho=0.1128 vs ssqrt ~0.1154). Unit-ratio is a Fc-deconvolution in reciprocal space — physically more direct than the cross-Patterson for localising missing atoms. However it is **non-injective**: ratio=0.5 and ratio=2.0 give the same ch3 value. Replaced by `--mobius` encoding which is identical in physical interpretation but injective (monotonic Möbius transform), bounded [-1,1].
+**ch3 encoding progression (2026-06):**
+- Signed-sqrt cross-Patterson (default) → spiky in P 2₁ 2₁ 2₁ due to Harker cross-terms
+- `--crossp-unitratio` (Rfree ~0.1128) — Fc-deconvolution, physically direct, but non-injective (ratio=0.5 and 2.0 map to the same output)
+- `--mobius` (Rfree ~0.1121) — same physics, injective Möbius transform, but sign-flips for 0<|ratio|<1 (positive Fo-Fc peak with small amplitude gives negative ch3)
+- `--softsign` (current recommended) — `ratio/(1+|ratio|)`, zero at perfect fit, monotonic through zero, no sign flip anomaly
 
 ### eval pipeline validation
 
@@ -271,15 +278,13 @@ Revert before resuming training. Pre-FNO checkpoints (88 keys, no FNO branch) ad
 
 The Lawrencium `train.py` uses **`strict=False`** when loading `--pretrain`, which silently drops mismatched keys: a 100-key FNO+BN checkpoint loaded into the no-BN model gives `missing keys (random init): 21  unexpected keys (ignored): 77`. The 23 conv weights and the entire FNO branch transfer, but BN's per-channel scale is lost — ep 0 train loss spikes (~120) while the optimizer re-fits the missing pieces. The Voltron `train.py` uses `strict=True` and will error in the same situation. Backport `strict=False` if you want to warm-start across architecture changes here too.
 
-### Ongoing runs (as of 2026-05-23 evening)
+### Ongoing runs (as of 2026-06-17)
 
-| job | host | data | warm-start | ep | best_val | Rfree_1aho |
+| job | host | data | warm-start | ep | best_val | best_Rfree_1aho |
 |---|---|---|---|---|---|---|
-| `26568133` train_v4_b10_fno_noBN_4gpu_rc | Voltron 4×TITAN V | rawcrossp | none (scratch) | 118 | 0.00384 (ep 116) | 0.1203 |
-| `26569602` train_v4_b10_fno_noBN_ssqrt_2gpu_rc | Voltron 2×TITAN V | ssqrt | `fno_noBN_4gpu_rc/best.pt` | 12 | 0.00378 (ep 12) | 0.1210 |
-| Lawrencium `train_v4_ssqrt_pretrain` | Lawrencium 1×A40 | ssqrt | `fno_lr3e4_4gpu_rc/best.pt` (strict=False) | 2 | 0.00451 (ep 2) | **0.1173** (ep 1) |
+| mobius boil+simple run | Voltron 6×TITAN V | boil+simple_occsign (mobius) | `fno_lr3e4_4gpu_rc/best.pt` (strict=False) | 28 | 0.00801 (ep 28) | **0.1121** (ep 12) |
 
-Lawrencium's `lr3e4`-warm-start + ssqrt is the most promising of the three so far — Rfree_1aho 0.1173 after just 1 epoch, second-best real-data result behind lr3e4 itself (0.1083). The other two runs are stuck at the ~0.121 plateau characteristic of from-scratch noBN training.
+The mobius run's best Rfree (0.1121) occurred at ep 12 alongside the worst val spike (0.01551) — consistent with the synthetic-val / real-Rfree anti-correlation. The checkpoint at val=0.00801 (ep 28) scores worse on real data than the spike epoch.
 
 ### GPU hardware
 
@@ -494,124 +499,7 @@ ccp4-python -c "import json; d=json.load(open('1aho/condense_singlechain/floor2/
 
 ## Untangler (ILP Conformer Label Optimisation)
 
-`untangler/` is a git submodule (branch `2_conformer_challenge_solution` of github.com/Phoelionix/Untangler). It resolves tangled altloc assignments by ILP, scoring via wE (phenix geometry) + Rfree from phenix.refine.
-
-**Run:**
-```bash
-sbatch slurm_untangler_1aho.sh --pdb 1aho/conf3norm_fitGT48.pdb \
-    --altloc-subset-size 3 --max-runs 5
-```
-
-**Input requirements (critical):**
-- Single-chain altloc format: all protein atoms in chain A with altloc letters (A, B, C, ...)
-- **Uniform altloc coverage**: every disordered residue must have ALL altloc letters present — no partial sets (e.g., B+C without A). Fill gaps by copying the available altloc line with the altloc column changed.
-- **Aromatic side chains required**: `relabel_ring` crashes on backbone-only structures. Use full-atom PDB.
-- `altloc_subset_size` must equal the number of conformers, or the highest-letter conformer is left unpaired.
-
-**`1aho/conf3norm_fitGT48.pdb`** (working 3-conformer input):
-- 2865 atoms = 955 atoms × 3 altlocs (A, B, C), fully normalized coverage
-- Derived from `under20_fitGT48.pdb` altlocs A/B/C; missing altlocs filled by copying nearest available
-
-**Submodule patches** (applied directly in `untangler/`, not committable from parent):
-- `LinearOptimizer/ConstraintsHandler.py` lines 641–644: changed duplicate clash-distance `assert` to a warning (f-string bug accessed wrong dict key during assert message formatting)
-- `LinearOptimizer/Solver.py` lines ~1144 and ~1316: changed `if lp_problem.sol_status==LpStatusInfeasible` → `if lp_problem.sol_status != 1` — PuLP returns `sol_status=0` (no solution found) for infeasible next-best problems, not `-1` (infeasible), so the original guard was never triggered
-- `untangle.py` line ~1503: replaced `shutil.rmtree(tmp_refine_subdir)` with `subprocess.run(['rm', '-rf', tmp_refine_subdir], check=False)` — `shutil.rmtree` raises `OSError: ENOTEMPTY` on NFS after unlinking files (NFS directory-cache race); `rm -rf` is more robust
-
-**SLURM routing:** `Untangler.refine_shell_file` is set to `untangler/Refinement/Refine_slurm.sh`, which submits each phenix.refine call to the `refmac` partition via `sbatch --parsable`, polls until the job exits, and cancels the SLURM job via `trap "scancel $SLURM_JOB_ID" EXIT` if the wrapper is killed (e.g. by Python's subprocess timeout). This prevents zombie jobs from piling up in the refmac queue.
-
-**Skip cross-conformer subprocess calls:** set BOTH `NonbondConstraint: 0` AND `ClashConstraint: 0` in `weight_factors`. Setting only one still runs both cross-conformer scripts (see `skip_nonbonds` logic in ConstraintsHandler.py).
-
-**Performance note:** `GenerateHoltonData.sh` → `untangle_score_weighted.csh` → `phenix.molprobity` runs single-threaded on the full model every ILP loop. With 22 conformers (~10,000 atoms) this is hours per call; the 3-conformer model (~955 atoms) is fast.
-
-**For Untangler to make swaps**, the input must be deliberately tangled (conformer labels not yet optimized). A well-refined structure scores 0 high-tension connections each ILP loop and makes no moves (`"moves": {}` in every `xLO-toFlip_*.json`). Score improvements in that case come entirely from the phenix.refine cycles Untangler runs between ILP iterations, not from any relabelling.
-
-**Completed run on `conf3norm_fitGT48.pdb`** (5 loops, `--altloc-subset-size 3`):
-- No altloc swaps in any loop — input was already optimally labelled
-- Rfree improved 18.62 → 18.51% purely from refinement; wE 87.7 → 84.0
-- Final output: `untangler/output/conf3norm_fitGT48_loopEnd4.pdb` (same conformer assignments, slightly better geometry)
-
----
-
-## Backbone Conformer Condensation
-
-Three scripts implement increasingly sophisticated conformer-count reduction on 1AHO models, all refining a backbone+disulfide-only model against Fc data computed from the same backbone+SS atoms.
-
-| script | input format | conformer selection | starting atoms |
-|--------|--------------|--------------------|----------------|
-| `condense_bb.py` | multi-chain (e.g. gt48.pdb, 48 chains) | global maximin → flat k chains | ~18,700 (gt48 backbone) |
-| `condense_bb_varconf.py` | multi-chain | per-residue maximin via `build_varconf_pdb` (uses chain A as residue/atom template) | as input |
-| `condense_singlechain.py` | single-chain altloc (e.g. deconform output) | per-residue altloc maximin (no template, no duplicates) | as input |
-
-**Pipeline (`condense_singlechain.py`, the current best):**
-
-1. Strip input PDB to backbone + cysteine CB/SG (preserves disulfide network) → `bbss.pdb`
-2. Compute Fobs MTZ as `FP = |Fc(bbss)|`, `Fpart = 0`, `FreeR_flag` from `1aho/refme_minRfree.mtz` (the actual diffraction free-R split)
-3. For each residue: heavy-atom max-deviation across altlocs → look up target k from a threshold table → maximin-pick that many altlocs
-4. `reoccupy.awk` (`~/Develop/`) renormalizes per-residue occupancies to sum=1
-5. 4 rounds of refmac5-newhess weight-snap (NCYC 10 each at wm 0.01→0.1→1→10→0.5)
-6. Rounds ≥3 generate occupancy-group refmac keywords via `~/Develop/refmac_occupancy_setup.com` (instead of the built-in `generate_occ_groups`)
-
-**Threshold sets** are defined in `condense_singlechain.py:THRESHOLD_SETS` (top of the file). To list available names from the CLI: `ccp4-python condense_singlechain.py --help` shows them under `--threshold-set`. Each set maps heavy-atom max-deviation (Å) to per-residue k:
-
-| set | (dev, k) brackets | bottom k |
-|---|---|---|
-| `floor1lean` | (0.5,1) (0.8,2) (1.2,3) (1.8,5) (2.5,7) (99,10) | 1 |
-| `floor1` | (0.4,1) (0.6,2) (0.8,3) (1.2,5) (2.0,8) (99,12) | 1 |
-| `floor2` | (0.6,2) (0.8,3) (1.2,5) (2.0,8) (99,12) | 2 |
-| `default` | (0.6,2) (0.8,4) (1.0,6) (1.5,8) (2.5,12) (99,16) | 2 |
-| `lean` | (0.6,1) (0.8,2) (1.0,4) (1.5,6) (2.5,8) (99,12) | 1 |
-| `midrich` | (0.6,3) (0.8,5) (1.0,7) (1.5,10) (2.5,14) (99,20) | 3 |
-| `rich` | (0.6,4) (0.8,6) (1.0,8) (1.5,12) (2.5,16) (99,24) | 4 |
-
-**Best results from `1aho/deconform_under20_best_0025.pdb` (22-altloc deconform output)** — backbone+SS, 4 weight-snap rounds, `--cys-floor 3`:
-
-| set | atoms | R rd 4 | Rfree rd 4 |
-|---|---|---|---|
-| floor1lean | 945 | 6.69% | 6.82% |
-| floor1 | 1281 | 5.57% | 5.80% |
-| **floor2** | **1381** | **4.40%** | **4.71%** |
-| midrich | 1966 | 3.16% | 3.37% |
-
-`floor2` is the sweet spot: under 5% Rfree budget, ~30% smaller atom count than `midrich`.
-
-### floor2 recipe (Lawrencium)
-
-```bash
-# On Lawrencium (lr6 partition, pc_als831 account, lr_normal QOS).
-# Source code already includes refmac5-newhess override and reoccupy/occ-setup wiring.
-
-cd /path/to/claude_CNN
-source cluster.sh && setup_ccp4
-
-# Verify required external tools are reachable from the compute node
-ls ~/Develop/reoccupy.awk ~/Develop/refmac_occupancy_setup.com
-which refmac5-newhess  # path is hardcoded in condense_singlechain.py:
-                       # /programs/ccp4-8.0/bin/refmac5-newhess — adjust if cluster differs
-
-sbatch --partition=lr6 --account=pc_als831 --qos=lr_normal \
-       --ntasks=1 --cpus-per-task=1 --mem=8G --export=ALL \
-       --job-name=floor2 --output=floor2_%j.log \
-       --wrap="cd \$SLURM_SUBMIT_DIR && \
-               ccp4-python condense_singlechain.py \
-                 --threshold-set floor2 --n-rounds 4 --cys-floor 3 \
-                 --singlechain-pdb 1aho/deconform_under20_best_0025.pdb \
-                 --outdir 1aho/condense_singlechain"
-
-# Single ~10-minute job. Result lands in 1aho/condense_singlechain/floor2/result.json
-ccp4-python -c "import json; d=json.load(open('1aho/condense_singlechain/floor2/result.json')); print(d['rounds'][-1])"
-```
-
-**Notes for the Lawrencium counterpart:**
-- The hardcoded refmac5-newhess path (`/programs/ccp4-8.0/bin/refmac5-newhess`) in `condense_singlechain.py` works on the original cluster only. On Lawrencium, point it at the equivalent newhess binary or revert to plain refmac5 in `ccp4-9` if newhess is unavailable.
-- `~/Develop/reoccupy.awk` and `~/Develop/refmac_occupancy_setup.com` are NFS-mounted from the user's home, so they should be available on Lawrencium compute nodes.
-- The `--cys-floor 3` keeps the disulfide-bonded cysteines at ≥3 conformers, which buys ~0.2–0.7 % Rfree at +60–100 atom cost — worth it for SS-rich structures like 1AHO (4 disulfides).
-- Threshold sets are defined inline in `condense_singlechain.py:THRESHOLD_SETS`; add new ones there.
-
----
-
-## Untangler (ILP Conformer Label Optimisation)
-
-`untangler/` is a git submodule (branch `2_conformer_challenge_solution` of github.com/Phoelionix/Untangler). It resolves tangled altloc assignments by ILP, scoring via wE (phenix geometry) + Rfree from phenix.refine.
+Untangler (github.com/Phoelionix/Untangler, branch `2_conformer_challenge_solution`) resolves tangled altloc assignments by Integer Linear Programming (ILP), scoring via wE (phenix geometry) + Rfree from phenix.refine. It is **not** tracked in this repo — clone separately into `untangler/` if needed. The patches below were applied to the local clone.
 
 **Run:**
 ```bash
@@ -657,7 +545,8 @@ sbatch slurm_untangler_1aho.sh --pdb 1aho/conf3norm_fitGT48.pdb \
 - **Full unit cell in maps**: `transform_f_phi_to_map` returns the full P1 unit cell regardless of space group. For P 21 21 21, the network sees 4 ASU copies of the protein.
 - **Cross-Patterson spikiness in P 21 21 21**: the full-cell map has 4 ASU copies → cross-Patterson accumulates Harker cross-terms → much spikier than P1. May cause extreme X.npy values and training instability.
 - **Heteroscedastic NLL overconfidence collapse**: with batch_size=1, the model quickly learns to set log_var→-3 (clamp floor) on training samples. Val loss explodes when it's wrong with high confidence. Fix: use `--accum-steps 8` to simulate larger batch.
-- **--vary-flood overrides --n-flood**: when `--vary-flood` is set, n_flood is drawn randomly from log-uniform [FLOOD_NF_MIN=700, FLOOD_NF_MAX=4000] ignoring --n-flood. Use `--n-flood N --flood-occ O` without `--vary-flood` for deterministic flood parameters.
+- **`--vary-flood` requires `--n-flood N` (any N > 0) to fire**: the vary-flood block is gated by `if vary_flood and n_flood > 0`. With the default `n_flood=0` and no `--n-flood`, the block is a complete no-op — no flood waters are generated. Once fired, `n_flood` is redrawn from log-uniform [700, 4000] (ignoring the CLI value), so the exact N passed doesn't matter. Use `--n-flood N --flood-occ O` without `--vary-flood` for deterministic flood parameters.
+- **`--flood-occ` is ignored when `--vary-flood` is active**: the vary-flood block always computes `flood_occ = clip(scatter · FLOOD_LINE_K / sqrt(n_flood), 0.03, 0.20)` — the CLI `--flood-occ` value is never read inside that block.
 - **--flood-avoid-fullocc is a no-op**: accepted by argparse and passed through but never used in `_generate_flood_waters` (which always avoids all existing atoms).
 - **SLURM bash arrays**: bash array indexing `${arr[$ID]}` fails silently on compute nodes. Use Python to decode task ID: `N=$(python3 -c "print([200,500,1000][$SLURM_ARRAY_TASK_ID])")`.
 - **Data generation directories**: keep ≤1000 samples per directory to avoid Lustre metadata slowdown.
@@ -682,3 +571,4 @@ sbatch slurm_untangler_1aho.sh --pdb 1aho/conf3norm_fitGT48.pdb \
 - **torchrun port collision when two DDP jobs land on the same node**: torchrun's default rendezvous port is `29500`. If SLURM places a second multi-GPU job on a node already running another torchrun-launched job, both try to bind the same port → `Address already in use` on the second. Pass `--master-port=<unique>` to torchrun (e.g. 29550 / 29551) for any concurrent runs, or use `--master-port=0` to pick freely. `train.csh`/`train1.csh` currently hard-code the default port — fix when running multiple jobs on the same node.
 - **Voltron vs Lawrencium GPU comparisons need GPU-count normalisation**: Voltron = TITAN V (12 GB Volta, 2017), Lawrencium es1 = A40 (48 GB Ampere, 2020). A40 is ~1.7× faster per card. Wall-clock per epoch is therefore misleading across clusters: 1× A40 ≈ 4× TITAN V for the same epoch time. Use s-per-sample-per-GPU = (wall × n_gpus) / 1600 to compare.
 - **train.py strict-load asymmetry across clusters**: Voltron `train.py` does `load_state_dict(sd)` (strict=True), Lawrencium does `load_state_dict(sd, strict=False)`. The latter silently accepts mismatched key sets — useful for warm-starting across architecture changes (e.g. loading a FNO+BN checkpoint into the no-BN model). Backport if you want this on Voltron too.
+- **SCALE records in PDB must be stripped after any cell change**: phenix geometry minimization writes SCALE records matching its working cell (often an oversized P1 box, e.g. ~145 Å). If those SCALE records propagate into subsequent PDBs (e.g. via jigglepdb header copying), programs reading them interpret the structure as being in the wrong cell — Coot shows a giant cell; refmac maps atoms outside the real cell, collapsing everything into a small ball. `_swap_cryst1` in `generate_protein.py` strips all SCALE lines whenever CRYST1 is changed (fixed commit 4a2584a). Always strip SCALE records after a cell change and let the consuming program regenerate them from CRYST1.
