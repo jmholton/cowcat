@@ -228,110 +228,84 @@ def sample_flood_bfactors(n_flood, b_lo, b_hi, seed):
 
 
 # ── Peak-height-controlled flood water sampling ───────────────────────────────
-# Oxygen IT92 scattering factor: f_O(stol2) = Σ a_i·exp(-b_i·stol2) + c
-# where stol2 = sin²θ/λ² = (1/d)²/4 = s²/4.
-_O_A = np.array([3.0485, 2.2868, 1.5463, 0.8670])
-_O_B = np.array([13.2771, 5.7011, 0.3239, 32.9089])
-_O_C = 0.2508
+# Peak density of a 1-electron pure-Gaussian atom at its centre (x=0):
+#   ano_ff(B) = (4π/B)^1.5   [e/Å³ per electron]
+# This gives the maximum contribution of that atom to the electron density map.
+# For Z electrons at occupancy occ: peak = Z × occ × ano_ff(B)  [e/Å³]
+#
+# Target normalisation: σ_fofc_real — RMS of the real 1AHO Fo-Fc map (~0.1 e/Å³).
+# Each flood atom's Z×occ is drawn from Uniform[0, peak_sigma × σ_fofc_real / ano_ff(B)],
+# so its individual peak is at most peak_sigma σ_fofc_real in the (unabsorbed) map.
+#
+# The auto-clip FLOOD_LINE_K_SYM/√N is applied after Z×occ→occ conversion to keep
+# the total SF contribution (and hence Rfree) bounded independently of N.
 
-_H_OF_B_CACHE  = None   # (B_arr, h_arr) precomputed table
-_GT48_MAP_RMS  = None   # rms of gt48 electron density map, cached
+_REAL_FOFC_SIGMA = None   # RMS of real 1AHO Fo-Fc map, cached
 
 
-def _compute_h_of_B_table(obs_mtz_path=None):
-    """Precompute unit-occ O-atom peak heights h(B) over a log-B grid.
+def _real_fofc_sigma(fofc_map_path=None):
+    """RMS of the real 1AHO Fo-Fc map (e/Å³), cached.
 
-    h(B) = (2/V) × Σ_{observed hkl} f_O(stol2) × exp(-B·stol2)
-    where the factor 2 accounts for the Friedel pair not listed in the MTZ.
-    Cached after first call.
+    Default source: 1aho_test/fofc.map (from the real 1AHO diffraction data).
+    This is the natural noise floor for flood water peaks — peaks drawn to be
+    at most peak_sigma × σ_fofc are at most peak_sigma σ above real-data noise.
     """
-    global _H_OF_B_CACHE
-    if _H_OF_B_CACHE is not None:
-        return _H_OF_B_CACHE
-    path = Path(obs_mtz_path) if obs_mtz_path else DEFAULT_OBS_MTZ
-    if not path.exists():
-        # Fallback: analytic Gaussian (no HKL list needed)
-        B_arr = np.logspace(np.log10(0.5), np.log10(300), 200)
-        _H_OF_B_CACHE = (B_arr, np.exp(-B_arr * 0.1))  # rough shape only
-        return _H_OF_B_CACHE
-    mtz   = gemmi.read_mtz_file(str(path))
-    cell  = mtz.cell
-    V     = cell.volume
-    h_idx = np.asarray(mtz.column_with_label('H'),  dtype=np.int32)
-    k_idx = np.asarray(mtz.column_with_label('K'),  dtype=np.int32)
-    l_idx = np.asarray(mtz.column_with_label('L'),  dtype=np.int32)
-    fp    = np.asarray(mtz.column_with_label('FP'), dtype=np.float32)
-    valid = np.isfinite(fp) & (fp > 0)
-    h_idx, k_idx, l_idx = h_idx[valid], k_idx[valid], l_idx[valid]
-    stol2 = np.array([
-        cell.calculate_1_d2([int(h_idx[i]), int(k_idx[i]), int(l_idx[i])]) / 4.0
-        for i in range(len(h_idx))
-    ], dtype=np.float64)
-    # f_O without the overall B factor
-    f_O_no_B = (np.sum(_O_A[:, None] * np.exp(-_O_B[:, None] * stol2[None, :]), axis=0)
-                + _O_C)
-    B_arr = np.logspace(np.log10(0.5), np.log10(300), 200)
-    h_arr = np.array([2.0 * np.sum(f_O_no_B * np.exp(-B * stol2)) / V
-                      for B in B_arr], dtype=np.float64)
-    _H_OF_B_CACHE = (B_arr, h_arr)
-    return _H_OF_B_CACHE
+    global _REAL_FOFC_SIGMA
+    if _REAL_FOFC_SIGMA is not None:
+        return _REAL_FOFC_SIGMA
+    path = Path(fofc_map_path) if fofc_map_path else SCRIPT_DIR / '1aho_test' / 'fofc.map'
+    if path.exists():
+        m = gemmi.read_ccp4_map(str(path))
+        arr = np.array(m.grid, copy=False).ravel()
+        _REAL_FOFC_SIGMA = float(arr.std())
+    else:
+        _REAL_FOFC_SIGMA = 0.10   # fallback: typical 1AHO Fo-Fc sigma (e/Å³)
+    return _REAL_FOFC_SIGMA
 
 
-def _h_of_B(B_values, obs_mtz_path=None):
-    """Return unit-occ peak heights (e/Å³) for the given B factor array."""
-    B_arr, h_arr = _compute_h_of_B_table(obs_mtz_path)
-    return np.interp(np.asarray(B_values, dtype=np.float64),
-                     B_arr, h_arr).astype(np.float32)
+def _ano_ff_peak(B_arr):
+    """Peak density (e/Å³) of a 1-electron pure-Gaussian atom, from B factor.
 
-
-def _gt48_map_rms(gt48_mtz_path=None):
-    """RMS of the gt48 ground-truth electron density map (e/Å³), cached.
-
-    Used as the natural yardstick for flood water peak heights:
-    target peaks are specified as multiples of this RMS.
+    ano_ff(B) = (4π/B)^1.5
+    For Z electrons at occupancy occ: peak = Z × occ × ano_ff(B).
     """
-    global _GT48_MAP_RMS
-    if _GT48_MAP_RMS is not None:
-        return _GT48_MAP_RMS
-    path = Path(gt48_mtz_path) if gt48_mtz_path else DEFAULT_MTZ
-    if not path.exists():
-        _GT48_MAP_RMS = 0.30   # rough fallback (e/Å³)
-        return _GT48_MAP_RMS
-    mtz  = gemmi.read_mtz_file(str(path))
-    grid = mtz.transform_f_phi_to_map('Fgt', 'PHIgt', sample_rate=SAMPLE_RATE)
-    arr  = np.array(grid, copy=False).ravel()
-    _GT48_MAP_RMS = float(np.sqrt(np.mean(arr ** 2)))
-    return _GT48_MAP_RMS
+    B = np.asarray(B_arr, dtype=np.float64)
+    return (4.0 * np.pi / np.maximum(B, 1e-6)) ** 1.5
 
 
 def sample_flood_waters_by_peak(n_flood, b_lo, b_hi, peak_sigma,
-                                seed, obs_mtz_path=None, gt48_mtz_path=None):
-    """Draw B factors log-uniformly then solve occ so each water hits a target peak.
+                                seed, occ_max_clip=None,
+                                obs_mtz_path=None, gt48_mtz_path=None,
+                                fofc_sigma_path=None, z_atom=8):
+    """Draw B factors then solve Z×occ so each water's peak ≤ peak_sigma × σ_fofc.
 
-    For each water i:
-      B_i  ~ LogUniform[b_lo, b_hi]
-      P_i  ~ Uniform[0, peak_sigma × σ_gt48]   (peak amplitude in e/Å³)
-      sign ~ ±1 with equal probability
-      occ_i = sign × P_i / h(B_i)
+    For each flood water i:
+      B_i        ~ LogUniform[b_lo, b_hi]
+      ano_ff_i   = (4π/B_i)^1.5          [e/Å³ per electron at occ=1]
+      z_occ_max  = peak_sigma × σ_fofc / ano_ff_i
+      z_occ_i    ~ Uniform[0, z_occ_max]  [total electrons at this site]
+      sign_i     ~ ±1
+      occ_i      = sign_i × z_occ_i / z_atom
 
-    This decouples the three dials:
-      peak_sigma  → controls amplitude per water (→ Rfree / R-iso)
-      n_flood     → controls fofc SNR; fofc_max/σ ≈ √(3V/N)
-      b range     → controls spatial extent (sharp bump vs diffuse blob)
+    occ_max_clip (default: FLOOD_LINE_K_SYM/√N) limits |occ| to bound Rfree.
+    Peaks are expressed in units of σ_fofc ≈ 0.1 e/Å³ (real 1AHO Fo-Fc noise).
 
-    Note: refmac absorbs part of the signal, so the effective peak in the
-    output Fo-Fc maps will be < peak_sigma × σ_gt48.  Calibrate empirically.
+    z_atom: electron count of the flood atom element (default 8 for oxygen).
     """
-    rng       = np.random.default_rng(seed)
-    sigma_gt  = _gt48_map_rms(gt48_mtz_path)
-    P_max     = float(peak_sigma) * sigma_gt
+    rng         = np.random.default_rng(seed)
+    sigma_fofc  = _real_fofc_sigma(fofc_sigma_path)
 
-    log_bs    = rng.uniform(np.log(b_lo), np.log(b_hi), size=n_flood)
-    B_vals    = np.exp(log_bs).astype(np.float32)
-    h_vals    = _h_of_B(B_vals, obs_mtz_path)
-    P_vals    = rng.uniform(0.0, P_max, size=n_flood).astype(np.float32)
-    signs     = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=n_flood)
-    occs      = signs * P_vals / np.maximum(h_vals, 1e-6)
+    log_bs      = rng.uniform(np.log(b_lo), np.log(b_hi), size=n_flood)
+    B_vals      = np.exp(log_bs).astype(np.float32)
+    ano_ff      = _ano_ff_peak(B_vals).astype(np.float32)    # e/Å³ per electron
+
+    z_occ_max   = (peak_sigma * sigma_fofc) / np.maximum(ano_ff, 1e-9)
+    z_occs      = rng.uniform(0.0, 1.0, size=n_flood).astype(np.float32) * z_occ_max
+    signs       = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=n_flood)
+    occs        = signs * z_occs / float(z_atom)
+
+    if occ_max_clip is not None:
+        occs = np.clip(occs, -float(occ_max_clip), float(occ_max_clip))
     return occs.astype(np.float32), B_vals
 
 
@@ -605,6 +579,7 @@ def generate_sample(
     flood_b_lo=1.0,
     flood_b_hi=15.0,
     flood_peak_sigma=3.0,
+    flood_occ_max_clip=None,
     flood_min_dist=0.0,
     vary_flood=False,
     random_flood=False,
@@ -666,12 +641,15 @@ def generate_sample(
         _occ_hi = flood_occ_hi if flood_occ_hi is not None else flood_occ
         rng_flood = np.random.default_rng(rng_seed + 4)
         if random_flood:
-            # N log-uniform; occ solved per-water to hit a target peak amplitude.
-            # Peak target ~ Uniform[0, flood_peak_sigma × σ_gt48] with random sign.
-            # occ_i = ±P_i / h(B_i)  — decouples Rfree (peak_sigma) from fofc SNR (N).
+            # N log-uniform; occ solved per-water to hit a target peak amplitude,
+            # then clipped to maintain Rfree~11% across all N values.
+            # Auto-clip: occ_rms × √N = FLOOD_LINE_K → clip = FLOOD_LINE_K_SYM/√N
+            # (same calibration as vary_flood but occ distribution shaped by peak_sigma).
+            # --flood-occ-max overrides the auto-clip.
             log_nf  = rng_flood.uniform(np.log(max(FLOOD_NF_MIN, 1)),
                                         np.log(max(FLOOD_NF_MAX, 1)))
             n_flood = int(np.round(np.exp(log_nf)))
+            _clip   = flood_occ_max_clip   # None = no clip (default)
         elif vary_flood:
             # Controlled Rfree ~11%: N random, occ scaled to compensate.
             # NOTE: calibration (FLOOD_LINE_K) was for B=20 Å²; needs recalibration
@@ -696,6 +674,7 @@ def generate_sample(
             flood_occs, flood_bisos = sample_flood_waters_by_peak(
                 n_flood, flood_b_lo, flood_b_hi, flood_peak_sigma,
                 seed=rng_seed + 7,
+                occ_max_clip=_clip,
                 obs_mtz_path=obs_mtz_path, gt48_mtz_path=mtz_path,
             )
             _occ_lo = float(flood_occs.min())
@@ -772,7 +751,8 @@ def generate_sample(
             flood_occ_lo=float(_occ_lo),
             flood_occ_hi=float(_occ_hi),
             flood_peak_sigma=float(flood_peak_sigma) if random_flood else None,
-            flood_sigma_gt48=float(_gt48_map_rms(mtz_path)) if random_flood else None,
+            flood_occ_max_clip=float(_clip) if random_flood else None,
+            flood_sigma_fofc=float(_real_fofc_sigma()) if random_flood else None,
             flood_min_dist=flood_min_dist,
             flood_b_lo=float(flood_b_lo),
             flood_b_hi=float(flood_b_hi),
@@ -815,7 +795,7 @@ def generate_sample(
 
 def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood,
                        flood_occ, flood_occ_lo, flood_occ_hi,
-                       flood_b_lo, flood_b_hi, flood_peak_sigma,
+                       flood_b_lo, flood_b_hi, flood_peak_sigma, flood_occ_max_clip,
                        flood_min_dist, flood_nf_range,
                        vary_flood, random_flood, ncyc, swaps_per_residue,
                        max_array, seed, partition,
@@ -827,6 +807,8 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
     if random_flood:
         flood_args = ['  --random-flood \\',
                       f'  --flood-peak-sigma {flood_peak_sigma} \\']
+        if flood_occ_max_clip is not None:
+            flood_args += [f'  --flood-occ-max {flood_occ_max_clip} \\']
         if flood_nf_range:
             flood_args += [f'  --flood-nf-range {flood_nf_range[0]} {flood_nf_range[1]} \\']
     elif vary_flood:
@@ -930,6 +912,11 @@ def main():
                          ' occ solved per-water to hit target peak amplitude'
                          ' Uniform[0, peak-sigma × σ_gt48] with random sign.'
                          ' Decouples Rfree (peak-sigma), fofc SNR (N), shape (B).')
+    ap.add_argument('--flood-occ-max', type=float, default=None,
+                    help='For --random-flood: clip per-water |occ| to this maximum.'
+                         ' Limits SF contribution of high-B waters that would otherwise'
+                         ' blow up Rfree. Calibrate with occ_rms × √N = 1.0 for Rfree~11%%.'
+                         ' Default: no clip (occ unconstrained).')
     ap.add_argument('--flood-peak-sigma', type=float, default=3.0,
                     help='For --random-flood: target peak amplitude as multiple of'
                          ' gt48 map RMS (σ_gt48). Each water gets peak drawn from'
@@ -963,9 +950,10 @@ def main():
 
     flood_occ_lo = args.flood_occ_range[0] if args.flood_occ_range else None
     flood_occ_hi = args.flood_occ_range[1] if args.flood_occ_range else None
-    flood_b_lo       = args.flood_b_range[0]
-    flood_b_hi       = args.flood_b_range[1]
-    flood_peak_sigma = args.flood_peak_sigma
+    flood_b_lo        = args.flood_b_range[0]
+    flood_b_hi        = args.flood_b_range[1]
+    flood_peak_sigma  = args.flood_peak_sigma
+    flood_occ_max_clip = args.flood_occ_max
     if args.flood_nf_range:
         FLOOD_NF_MIN = args.flood_nf_range[0]
         FLOOD_NF_MAX = args.flood_nf_range[1]
@@ -976,7 +964,7 @@ def main():
             args.nsamples, outdir, pdb_path, mtz_path, obs_mtz_path,
             args.shift_scale, args.n_flood, args.flood_occ,
             flood_occ_lo, flood_occ_hi, flood_b_lo, flood_b_hi,
-            flood_peak_sigma,
+            flood_peak_sigma, flood_occ_max_clip,
             args.flood_min_dist, args.flood_nf_range,
             args.vary_flood, args.random_flood, args.ncyc, args.swaps_per_residue,
             args.max_array, args.seed, args.partition,
@@ -992,6 +980,7 @@ def main():
         flood_occ=args.flood_occ, flood_occ_lo=flood_occ_lo, flood_occ_hi=flood_occ_hi,
         flood_b_lo=flood_b_lo, flood_b_hi=flood_b_hi,
         flood_peak_sigma=flood_peak_sigma,
+        flood_occ_max_clip=flood_occ_max_clip,
         flood_min_dist=args.flood_min_dist,
         vary_flood=args.vary_flood, random_flood=args.random_flood,
         ncyc=args.ncyc, swaps_per_residue=args.swaps_per_residue,

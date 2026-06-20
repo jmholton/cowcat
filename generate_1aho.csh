@@ -50,6 +50,7 @@ set flood_b_hi    = 15.0
 set flood_nf_min     = 700
 set flood_nf_max     = 4000
 set flood_peak_sigma = 3.0
+set flood_occ_max    = ""   # "" = no clip; set to e.g. 0.5 to limit high-B occ
 set flood_min_dist = 0.0
 set vary_flood    = 0
 set random_flood  = 0
@@ -91,6 +92,7 @@ if ( "$random_flood" == "1" ) then
     set flood_args = "--random-flood"
     set flood_args = "$flood_args --flood-nf-range $flood_nf_min $flood_nf_max"
     set flood_args = "$flood_args --flood-peak-sigma $flood_peak_sigma"
+    if ( "$flood_occ_max" != "" ) set flood_args = "$flood_args --flood-occ-max $flood_occ_max"
     set flood_args = "$flood_args --flood-b-range $flood_b_lo $flood_b_hi"
 else if ( "$vary_flood" == "1" ) then
     # N random, occ scaled to target ~11% Rfree (B=20 calibration — needs recalibration)
