@@ -227,6 +227,114 @@ def sample_flood_bfactors(n_flood, b_lo, b_hi, seed):
     return np.exp(log_bs).astype(np.float32)
 
 
+# ── Peak-height-controlled flood water sampling ───────────────────────────────
+# Oxygen IT92 scattering factor: f_O(stol2) = Σ a_i·exp(-b_i·stol2) + c
+# where stol2 = sin²θ/λ² = (1/d)²/4 = s²/4.
+_O_A = np.array([3.0485, 2.2868, 1.5463, 0.8670])
+_O_B = np.array([13.2771, 5.7011, 0.3239, 32.9089])
+_O_C = 0.2508
+
+_H_OF_B_CACHE  = None   # (B_arr, h_arr) precomputed table
+_GT48_MAP_RMS  = None   # rms of gt48 electron density map, cached
+
+
+def _compute_h_of_B_table(obs_mtz_path=None):
+    """Precompute unit-occ O-atom peak heights h(B) over a log-B grid.
+
+    h(B) = (2/V) × Σ_{observed hkl} f_O(stol2) × exp(-B·stol2)
+    where the factor 2 accounts for the Friedel pair not listed in the MTZ.
+    Cached after first call.
+    """
+    global _H_OF_B_CACHE
+    if _H_OF_B_CACHE is not None:
+        return _H_OF_B_CACHE
+    path = Path(obs_mtz_path) if obs_mtz_path else DEFAULT_OBS_MTZ
+    if not path.exists():
+        # Fallback: analytic Gaussian (no HKL list needed)
+        B_arr = np.logspace(np.log10(0.5), np.log10(300), 200)
+        _H_OF_B_CACHE = (B_arr, np.exp(-B_arr * 0.1))  # rough shape only
+        return _H_OF_B_CACHE
+    mtz   = gemmi.read_mtz_file(str(path))
+    cell  = mtz.cell
+    V     = cell.volume
+    h_idx = np.asarray(mtz.column_with_label('H'),  dtype=np.int32)
+    k_idx = np.asarray(mtz.column_with_label('K'),  dtype=np.int32)
+    l_idx = np.asarray(mtz.column_with_label('L'),  dtype=np.int32)
+    fp    = np.asarray(mtz.column_with_label('FP'), dtype=np.float32)
+    valid = np.isfinite(fp) & (fp > 0)
+    h_idx, k_idx, l_idx = h_idx[valid], k_idx[valid], l_idx[valid]
+    stol2 = np.array([
+        cell.calculate_1_d2([int(h_idx[i]), int(k_idx[i]), int(l_idx[i])]) / 4.0
+        for i in range(len(h_idx))
+    ], dtype=np.float64)
+    # f_O without the overall B factor
+    f_O_no_B = (np.sum(_O_A[:, None] * np.exp(-_O_B[:, None] * stol2[None, :]), axis=0)
+                + _O_C)
+    B_arr = np.logspace(np.log10(0.5), np.log10(300), 200)
+    h_arr = np.array([2.0 * np.sum(f_O_no_B * np.exp(-B * stol2)) / V
+                      for B in B_arr], dtype=np.float64)
+    _H_OF_B_CACHE = (B_arr, h_arr)
+    return _H_OF_B_CACHE
+
+
+def _h_of_B(B_values, obs_mtz_path=None):
+    """Return unit-occ peak heights (e/Å³) for the given B factor array."""
+    B_arr, h_arr = _compute_h_of_B_table(obs_mtz_path)
+    return np.interp(np.asarray(B_values, dtype=np.float64),
+                     B_arr, h_arr).astype(np.float32)
+
+
+def _gt48_map_rms(gt48_mtz_path=None):
+    """RMS of the gt48 ground-truth electron density map (e/Å³), cached.
+
+    Used as the natural yardstick for flood water peak heights:
+    target peaks are specified as multiples of this RMS.
+    """
+    global _GT48_MAP_RMS
+    if _GT48_MAP_RMS is not None:
+        return _GT48_MAP_RMS
+    path = Path(gt48_mtz_path) if gt48_mtz_path else DEFAULT_MTZ
+    if not path.exists():
+        _GT48_MAP_RMS = 0.30   # rough fallback (e/Å³)
+        return _GT48_MAP_RMS
+    mtz  = gemmi.read_mtz_file(str(path))
+    grid = mtz.transform_f_phi_to_map('Fgt', 'PHIgt', sample_rate=SAMPLE_RATE)
+    arr  = np.array(grid, copy=False).ravel()
+    _GT48_MAP_RMS = float(np.sqrt(np.mean(arr ** 2)))
+    return _GT48_MAP_RMS
+
+
+def sample_flood_waters_by_peak(n_flood, b_lo, b_hi, peak_sigma,
+                                seed, obs_mtz_path=None, gt48_mtz_path=None):
+    """Draw B factors log-uniformly then solve occ so each water hits a target peak.
+
+    For each water i:
+      B_i  ~ LogUniform[b_lo, b_hi]
+      P_i  ~ Uniform[0, peak_sigma × σ_gt48]   (peak amplitude in e/Å³)
+      sign ~ ±1 with equal probability
+      occ_i = sign × P_i / h(B_i)
+
+    This decouples the three dials:
+      peak_sigma  → controls amplitude per water (→ Rfree / R-iso)
+      n_flood     → controls fofc SNR; fofc_max/σ ≈ √(3V/N)
+      b range     → controls spatial extent (sharp bump vs diffuse blob)
+
+    Note: refmac absorbs part of the signal, so the effective peak in the
+    output Fo-Fc maps will be < peak_sigma × σ_gt48.  Calibrate empirically.
+    """
+    rng       = np.random.default_rng(seed)
+    sigma_gt  = _gt48_map_rms(gt48_mtz_path)
+    P_max     = float(peak_sigma) * sigma_gt
+
+    log_bs    = rng.uniform(np.log(b_lo), np.log(b_hi), size=n_flood)
+    B_vals    = np.exp(log_bs).astype(np.float32)
+    h_vals    = _h_of_B(B_vals, obs_mtz_path)
+    P_vals    = rng.uniform(0.0, P_max, size=n_flood).astype(np.float32)
+    signs     = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=n_flood)
+    occs      = signs * P_vals / np.maximum(h_vals, 1e-6)
+    return occs.astype(np.float32), B_vals
+
+
 def add_flood_chain(st, positions, occ, b_iso=20.0, chain_name='W'):
     """Add flood water atoms to a cloned structure; return the new structure.
 
@@ -496,8 +604,7 @@ def generate_sample(
     flood_occ_hi=None,
     flood_b_lo=1.0,
     flood_b_hi=15.0,
-    flood_occ_amp_lo=0.01,
-    flood_occ_amp_hi=0.5,
+    flood_peak_sigma=3.0,
     flood_min_dist=0.0,
     vary_flood=False,
     random_flood=False,
@@ -559,18 +666,12 @@ def generate_sample(
         _occ_hi = flood_occ_hi if flood_occ_hi is not None else flood_occ
         rng_flood = np.random.default_rng(rng_seed + 4)
         if random_flood:
-            # Fully independent: N, occ amplitude, B each drawn from their ranges.
-            # occ_max is drawn per-sample (log-uniform); per-water occ is then
-            # Uniform[-occ_max, +occ_max]. Covers everything from a few sharp
-            # bumps (small N, large occ, small B) to a diffuse sea (large N, small
-            # occ, large B) with no correlation between parameters.
-            log_nf   = rng_flood.uniform(np.log(max(FLOOD_NF_MIN, 1)),
-                                         np.log(max(FLOOD_NF_MAX, 1)))
-            n_flood  = int(np.round(np.exp(log_nf)))
-            occ_max  = float(np.exp(rng_flood.uniform(np.log(flood_occ_amp_lo),
-                                                       np.log(flood_occ_amp_hi))))
-            _occ_lo  = -occ_max
-            _occ_hi  =  occ_max
+            # N log-uniform; occ solved per-water to hit a target peak amplitude.
+            # Peak target ~ Uniform[0, flood_peak_sigma × σ_gt48] with random sign.
+            # occ_i = ±P_i / h(B_i)  — decouples Rfree (peak_sigma) from fofc SNR (N).
+            log_nf  = rng_flood.uniform(np.log(max(FLOOD_NF_MIN, 1)),
+                                        np.log(max(FLOOD_NF_MAX, 1)))
+            n_flood = int(np.round(np.exp(log_nf)))
         elif vary_flood:
             # Controlled Rfree ~11%: N random, occ scaled to compensate.
             # NOTE: calibration (FLOOD_LINE_K) was for B=20 Å²; needs recalibration
@@ -587,12 +688,21 @@ def generate_sample(
             for res in chain
             for atom in res
         ]
-        flood_pos   = place_flood_waters(
+        flood_pos = place_flood_waters(
             st_jig_r.cell, existing_xyzs, n_flood, None,
             seed=rng_seed + 1, min_dist=flood_min_dist,
         )
-        flood_occs  = sample_flood_occs(n_flood, _occ_lo, _occ_hi, seed=rng_seed + 7)
-        flood_bisos = sample_flood_bfactors(n_flood, flood_b_lo, flood_b_hi, seed=rng_seed + 8)
+        if random_flood:
+            flood_occs, flood_bisos = sample_flood_waters_by_peak(
+                n_flood, flood_b_lo, flood_b_hi, flood_peak_sigma,
+                seed=rng_seed + 7,
+                obs_mtz_path=obs_mtz_path, gt48_mtz_path=mtz_path,
+            )
+            _occ_lo = float(flood_occs.min())
+            _occ_hi = float(flood_occs.max())
+        else:
+            flood_occs  = sample_flood_occs(n_flood, _occ_lo, _occ_hi, seed=rng_seed + 7)
+            flood_bisos = sample_flood_bfactors(n_flood, flood_b_lo, flood_b_hi, seed=rng_seed + 8)
 
         # 4. Build truth_full.pdb from conf_data_truth + structural HOH + flood waters.
         #    Truth reflects swap A's conformer assignment hypothesis.
@@ -661,8 +771,8 @@ def generate_sample(
             flood_mode=('random' if random_flood else 'vary' if vary_flood else 'fixed'),
             flood_occ_lo=float(_occ_lo),
             flood_occ_hi=float(_occ_hi),
-            flood_occ_amp_lo=float(flood_occ_amp_lo),
-            flood_occ_amp_hi=float(flood_occ_amp_hi),
+            flood_peak_sigma=float(flood_peak_sigma) if random_flood else None,
+            flood_sigma_gt48=float(_gt48_map_rms(mtz_path)) if random_flood else None,
             flood_min_dist=flood_min_dist,
             flood_b_lo=float(flood_b_lo),
             flood_b_hi=float(flood_b_hi),
@@ -705,18 +815,18 @@ def generate_sample(
 
 def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood,
                        flood_occ, flood_occ_lo, flood_occ_hi,
-                       flood_b_lo, flood_b_hi, flood_occ_amp_lo, flood_occ_amp_hi,
+                       flood_b_lo, flood_b_hi, flood_peak_sigma,
                        flood_min_dist, flood_nf_range,
                        vary_flood, random_flood, ncyc, swaps_per_residue,
                        max_array, seed, partition,
                        k_conformers=DEFAULT_K_CONFORMERS,
-                       account=None, qos=None, time='00:20:00'):
+                       account=None, qos=None, time=None):
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     me     = Path(__file__).resolve()
 
     if random_flood:
         flood_args = ['  --random-flood \\',
-                      f'  --flood-occ-amp-range {flood_occ_amp_lo} {flood_occ_amp_hi} \\']
+                      f'  --flood-peak-sigma {flood_peak_sigma} \\']
         if flood_nf_range:
             flood_args += [f'  --flood-nf-range {flood_nf_range[0]} {flood_nf_range[1]} \\']
     elif vary_flood:
@@ -749,8 +859,8 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
         '#SBATCH --cpus-per-task=1',
         '#SBATCH --mem=4G',
         f'#SBATCH --partition={partition}',
-        f'#SBATCH --time={time}',
-    ] + ([f'#SBATCH --account={account}'] if account else []) \
+    ] + ([f'#SBATCH --time={time}']    if time    else []) \
+      + ([f'#SBATCH --account={account}'] if account else []) \
       + ([f'#SBATCH --qos={qos}']         if qos     else []) + [
         '#SBATCH --export=ALL',
         '',
@@ -816,16 +926,16 @@ def main():
                          ' NOTE: calibration assumes B=20 Å²; needs recalibration with'
                          ' variable B. Use --random-flood for uncorrelated sampling.')
     ap.add_argument('--random-flood', action='store_true',
-                    help='Fully independent: N log-uniform [nf-min,nf-max],'
-                         ' occ_max log-uniform [occ-amp-lo,occ-amp-hi] per sample'
-                         ' then per-water occ ~ Uniform[-occ_max,+occ_max],'
-                         ' B log-uniform [b-lo,b-hi] per water.'
-                         ' No Rfree targeting.')
-    ap.add_argument('--flood-occ-amp-range', type=float, nargs=2,
-                    metavar=('LO', 'HI'), default=[0.01, 0.5],
-                    help='For --random-flood: per-sample occ amplitude drawn'
-                         ' log-uniformly from [LO, HI]. Per-water occ is then'
-                         ' Uniform[-occ_max, +occ_max]. Default: 0.01 0.5')
+                    help='N log-uniform [nf-min,nf-max]; B log-uniform [b-lo,b-hi];'
+                         ' occ solved per-water to hit target peak amplitude'
+                         ' Uniform[0, peak-sigma × σ_gt48] with random sign.'
+                         ' Decouples Rfree (peak-sigma), fofc SNR (N), shape (B).')
+    ap.add_argument('--flood-peak-sigma', type=float, default=3.0,
+                    help='For --random-flood: target peak amplitude as multiple of'
+                         ' gt48 map RMS (σ_gt48). Each water gets peak drawn from'
+                         ' Uniform[0, flood-peak-sigma × σ_gt48] with random sign.'
+                         ' Refmac absorbs part of the signal — calibrate empirically.'
+                         ' Default: 3.0')
     ap.add_argument('--ncyc',        type=int,   default=DEFAULT_NCYC)
     ap.add_argument('--swaps-per-residue', type=float, default=0.0,
                     help='Expected pairwise conformer swaps per residue in partial model'
@@ -838,8 +948,8 @@ def main():
                     help='SLURM account (e.g. pc_als831)')
     ap.add_argument('--qos',         default=None,
                     help='SLURM QOS (e.g. lr_normal)')
-    ap.add_argument('--time',        default='00:20:00',
-                    help='SLURM walltime per task (default: 00:20:00)')
+    ap.add_argument('--time',        default=None,
+                    help='SLURM walltime per task (omitted by default — no limit)')
     ap.add_argument('--k-conformers', type=int, default=DEFAULT_K_CONFORMERS,
                     help='Number of conformer chains in partial model (default: %d)' % DEFAULT_K_CONFORMERS)
     ap.add_argument('--submit',      action='store_true')
@@ -855,8 +965,7 @@ def main():
     flood_occ_hi = args.flood_occ_range[1] if args.flood_occ_range else None
     flood_b_lo       = args.flood_b_range[0]
     flood_b_hi       = args.flood_b_range[1]
-    flood_occ_amp_lo = args.flood_occ_amp_range[0]
-    flood_occ_amp_hi = args.flood_occ_amp_range[1]
+    flood_peak_sigma = args.flood_peak_sigma
     if args.flood_nf_range:
         FLOOD_NF_MIN = args.flood_nf_range[0]
         FLOOD_NF_MAX = args.flood_nf_range[1]
@@ -867,7 +976,7 @@ def main():
             args.nsamples, outdir, pdb_path, mtz_path, obs_mtz_path,
             args.shift_scale, args.n_flood, args.flood_occ,
             flood_occ_lo, flood_occ_hi, flood_b_lo, flood_b_hi,
-            flood_occ_amp_lo, flood_occ_amp_hi,
+            flood_peak_sigma,
             args.flood_min_dist, args.flood_nf_range,
             args.vary_flood, args.random_flood, args.ncyc, args.swaps_per_residue,
             args.max_array, args.seed, args.partition,
@@ -882,7 +991,7 @@ def main():
         shift_scale=args.shift_scale, n_flood=args.n_flood,
         flood_occ=args.flood_occ, flood_occ_lo=flood_occ_lo, flood_occ_hi=flood_occ_hi,
         flood_b_lo=flood_b_lo, flood_b_hi=flood_b_hi,
-        flood_occ_amp_lo=flood_occ_amp_lo, flood_occ_amp_hi=flood_occ_amp_hi,
+        flood_peak_sigma=flood_peak_sigma,
         flood_min_dist=args.flood_min_dist,
         vary_flood=args.vary_flood, random_flood=args.random_flood,
         ncyc=args.ncyc, swaps_per_residue=args.swaps_per_residue,

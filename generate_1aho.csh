@@ -14,8 +14,7 @@
 #   flood_b_hi     = 15.0    (max flood water B factor, Å²; covers gt48 atom B range)
 #   flood_nf_min   = 700     (vary_flood/random_flood: min n_flood, log-uniform)
 #   flood_nf_max   = 4000    (vary_flood/random_flood: max n_flood)
-#   flood_occ_amp_lo = 0.01  (random_flood: per-sample occ_max lower bound, log-uniform)
-#   flood_occ_amp_hi = 0.5   (random_flood: per-sample occ_max upper bound)
+#   flood_peak_sigma = 3.0   (random_flood: peak target in units of gt48 map RMS)
 #
 # NOTE: use key=value format only (no --flags). Wrong: --flood-nf-range 10 2000
 #       Correct: flood_nf_min=10 flood_nf_max=2000
@@ -50,8 +49,7 @@ set flood_b_lo    = 1.0
 set flood_b_hi    = 15.0
 set flood_nf_min     = 700
 set flood_nf_max     = 4000
-set flood_occ_amp_lo = 0.01
-set flood_occ_amp_hi = 0.5
+set flood_peak_sigma = 3.0
 set flood_min_dist = 0.0
 set vary_flood    = 0
 set random_flood  = 0
@@ -92,7 +90,7 @@ if ( "$random_flood" == "1" ) then
     # N, occ amplitude, B all independent per sample — no Rfree targeting
     set flood_args = "--random-flood"
     set flood_args = "$flood_args --flood-nf-range $flood_nf_min $flood_nf_max"
-    set flood_args = "$flood_args --flood-occ-amp-range $flood_occ_amp_lo $flood_occ_amp_hi"
+    set flood_args = "$flood_args --flood-peak-sigma $flood_peak_sigma"
     set flood_args = "$flood_args --flood-b-range $flood_b_lo $flood_b_hi"
 else if ( "$vary_flood" == "1" ) then
     # N random, occ scaled to target ~11% Rfree (B=20 calibration — needs recalibration)
