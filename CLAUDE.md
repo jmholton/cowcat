@@ -186,13 +186,20 @@ Current loss is **peak-weighted MSE** (α=0.5). Plain MSE returned as metric so 
 
 | checkpoint | R_work | R_free | best_val | ep | arch |
 |---|---|---|---|---|---|
-| **`fno_lr3e4_4gpu_rc/best.pt`** | **0.0687** | **0.1083** | 0.0133 | 27 | FNO+BN, lr=3e-4 — **only model to beat fc** |
+| `1aho_n1000/best.pt` ⚠️ | 0.0658 | 0.1081 | −2.720 (NLL) | 96 | pre-FNO, BN, NLL loss — trained on 1AHO jiggled data (domain-matched) |
+| **`fno_lr3e4_4gpu_rc/best.pt`** | **0.0687** | **0.1083** | 0.0133 | 27 | FNO+BN, lr=3e-4 — **best generalising model** |
+| fc baseline | 0.0840 | 0.1097 | — | — | — |
 | mobius run `best_rfree.pt` | — | 0.1121 | 0.00801 | 12 | FNO no-BN, Möbius ch3, boil+simple data |
 | ssqrt+lr3e4 warm-start (ep 1) | — | 0.1173 | 0.00451 | 1 | FNO no-BN, ssqrt ch3, warm-start strict=False |
 | `fno_4gpu_rc/best.pt` | 0.1010 | 0.1138 | 0.0099 | 40 | FNO+BN, lr=1e-3 |
+| `1aho_n1000v3_4gpu/best.pt` | 0.0930 | 0.1192 | −0.663 (NLL) | 2 | pre-FNO, BN, NLL — barely trained (ep 2) |
 | `fno_noBN_4gpu_rc/latest.pt` | 0.0909 | 0.1192 | 0.0044 | 50 | FNO no-BN, ssqrt ch3 |
+| `simple_1aho_s0_ds2/best.pt` | 0.1082 | 0.1215 | −1.417 (NLL) | 1 | pre-FNO, BN, NLL — O-atom simple data, 1AHO grid |
+| `simple_1aho_s0_bs4/best.pt` | 0.1048 | 0.1217 | −1.343 (NLL) | 3 | pre-FNO, BN, NLL — O-atom simple data, 1AHO grid |
+| `1aho_n1000v2/best.pt` | 0.0990 | 0.1221 | −0.732 (NLL) | 82 | pre-FNO, BN, NLL — warm-start from v1, drifted |
 | `fno_acc4_4gpu_rc/best.pt` | 0.0835 | 0.1247 | 0.0047 | 89 | FNO+BN, accum 4 |
-| fc baseline | 0.0840 | 0.1097 | — | — | — |
+
+⚠️ `1aho_n1000` was trained on jiggled variants of the same protein (domain-matched), but the free-R flagged reflections were never included in any training SFs — R_free is still a legitimate held-out metric. The caveat is generalisation to other proteins, not overfitting to the test set. `fno_lr3e4` is the best model on a structurally unseen protein.
 
 **Key finding:** lower synthetic val loss → higher real-1aho R_free (anti-correlated). `fno_lr3e4` at best_val=0.0133 beats fc; no-BN runs at best_val~0.004 sit ~1% above fc. The epoch with the worst val spike is often the best Rfree checkpoint. Overfitting the synthetic peak distribution is the dominant failure mode. Batch Normalization (BN) regularises usefully despite batch=1.
 
