@@ -187,6 +187,8 @@ def main():
                         help='Output path for predicted difference map (default: predicted_diff.map)')
     parser.add_argument('--base-features', type=int, default=32,
                         help='U-Net base channel count; must match training (default: 32)')
+    parser.add_argument('--bn',          action='store_true',
+                        help='Enable BatchNorm in conv blocks; must match training (default: off)')
     parser.add_argument('--tile', action='store_true',
                         help='Use tiled inference for grids that exceed GPU memory')
     parser.add_argument('--patch', type=int, default=60,
@@ -240,7 +242,7 @@ def main():
     sys.path.insert(0, str(Path(__file__).parent))
     from model import UNet3D
     model = UNet3D(in_channels=4, out_channels=1,
-                   base_features=args.base_features).to(device)
+                   base_features=args.base_features, use_bn=args.bn).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt['model'])
     model.eval()

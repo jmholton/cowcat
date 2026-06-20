@@ -714,6 +714,9 @@ def generate_sample(sample_idx, outdir, seed=None,
             refmac_log = tmpdir / 'refmac.log'
             if refmac_log.exists():
                 shutil.copy2(refmac_log, sample_dir / 'refmac.log')
+            out_pdb = tmpdir / 'refmacout.pdb'
+            if out_pdb.exists():
+                shutil.copy2(out_pdb, sample_dir / 'refmacout.pdb')
 
             mtz_to_ccp4(truth_sf_mtz, 'FC',     'PHIC',    sample_dir / 'truth.map')
             mtz_to_ccp4(out_mtz,      'FWT',    'PHWT',    sample_dir / '2fofc.map')

@@ -29,22 +29,22 @@ import torch.nn.functional as F
 
 
 class _ConvBlock(nn.Module):
-    """Conv3d → ReLU, repeated twice (no normalization).
+    """Conv3d → [BN] → ReLU, repeated twice.
 
-    BatchNorm removed: with batch=1 per rank and no SyncBN, BN's per-rank
-    running stats are noisy and lock in wrong values for eval mode, adding
-    avoidable val variance epoch-to-epoch. Normalization is also at odds
-    with the task — predicting absolute-scale electron density (e/Å³) —
-    where activation amplitudes should pass through unmolested.
+    use_bn=False: [Conv, ReLU, Conv, ReLU]      — keys at .0 .2 (no-BN checkpoints)
+    use_bn=True:  [Conv, BN, ReLU, Conv, BN, ReLU] — keys at .0 .1 .3 .4 (BN checkpoints)
+    Layer indices are kept compatible with existing checkpoints for both cases.
     """
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, use_bn=False):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(in_ch,  out_ch, kernel_size=3, padding=1, padding_mode='circular'),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, padding_mode='circular'),
-            nn.ReLU(inplace=True),
-        )
+        def _half(c_in, c_out):
+            layers = [nn.Conv3d(c_in, c_out, 3, padding=1,
+                                padding_mode='circular', bias=not use_bn)]
+            if use_bn:
+                layers.append(nn.BatchNorm3d(c_out))
+            layers.append(nn.ReLU(inplace=True))
+            return layers
+        self.net = nn.Sequential(*_half(in_ch, out_ch), *_half(out_ch, out_ch))
 
     def forward(self, x):
         return self.net(x)
@@ -137,24 +137,25 @@ class FNOBlock3d(nn.Module):
 
 
 class UNet3D(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, base_features=32):
+    def __init__(self, in_channels=3, out_channels=1, base_features=32, use_bn=False):
         super().__init__()
         f = base_features
+        bn = use_bn
 
         # ── Encoder ───────────────────────────────────────────────────────────
-        self.enc1 = _ConvBlock(in_channels, f)       # → f
-        self.enc2 = _ConvBlock(f,           f * 2)   # → 2f
-        self.enc3 = _ConvBlock(f * 2,       f * 4)   # → 4f
+        self.enc1 = _ConvBlock(in_channels, f,           use_bn=bn)  # → f
+        self.enc2 = _ConvBlock(f,           f * 2,       use_bn=bn)  # → 2f
+        self.enc3 = _ConvBlock(f * 2,       f * 4,       use_bn=bn)  # → 4f
         self.pool = nn.MaxPool3d(2)
 
         # ── Bottleneck ────────────────────────────────────────────────────────
-        self.bottleneck = _ConvBlock(f * 4, f * 8)   # → 8f
+        self.bottleneck = _ConvBlock(f * 4, f * 8,       use_bn=bn)  # → 8f
 
         # ── Decoder ───────────────────────────────────────────────────────────
         # after cat with skip: channels are (up + skip)
-        self.dec3 = _ConvBlock(f * 8 + f * 4, f * 4)
-        self.dec2 = _ConvBlock(f * 4 + f * 2, f * 2)
-        self.dec1 = _ConvBlock(f * 2 + f,     f)
+        self.dec3 = _ConvBlock(f * 8 + f * 4, f * 4,    use_bn=bn)
+        self.dec2 = _ConvBlock(f * 4 + f * 2, f * 2,    use_bn=bn)
+        self.dec1 = _ConvBlock(f * 2 + f,     f,         use_bn=bn)
 
         # ── Map + log-variance head (2 channels) ──────────────────────────────
         # channel 0: z-normalised mean prediction

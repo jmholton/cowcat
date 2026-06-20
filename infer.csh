@@ -40,6 +40,7 @@ set crossp_raw      = 0    # 1 → pass --crossp-raw to infer.py (for *_rawcross
 set crossp_unitratio = 0   # 1 → pass --crossp-unitratio to infer.py (for *_unitratio-trained models)
 set mobius           = 0   # 1 → pass --mobius to infer.py (for *_mobius-trained models)
 set softsign         = 0   # 1 → pass --softsign to infer.py (for *_softsign-trained models)
+set bn               = 0   # 1 → pass --bn to infer.py (for models trained with BatchNorm)
 
 # read command line: key=value pairs
 foreach Arg ( $* )
@@ -78,6 +79,7 @@ if ( "$crossp_raw" == "1" )       set infer_extra = "$infer_extra --crossp-raw"
 if ( "$crossp_unitratio" == "1" ) set infer_extra = "$infer_extra --crossp-unitratio"
 if ( "$mobius" == "1" )           set infer_extra = "$infer_extra --mobius"
 if ( "$softsign" == "1" )         set infer_extra = "$infer_extra --softsign"
+if ( "$bn" == "1" )               set infer_extra = "$infer_extra --bn"
 
 echo "================================================================"
 echo "inference gamut"

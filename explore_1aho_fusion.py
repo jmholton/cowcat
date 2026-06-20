@@ -782,11 +782,14 @@ def _write_chain_pdb(chain_name, occ, conf_data, ref_chain_data,
 
 
 def write_full_conf_pdb(conf_data, chain_names, st_for_hoh,
-                        flood_pos, flood_occ, cell, spacegroup_hm, out_pdb):
+                        flood_pos, flood_occ, cell, spacegroup_hm, out_pdb,
+                        flood_biso=20.0):
     """Write truth PDB: all protein conformers from conf_data + HOH + flood waters.
 
     Each conformer chain gets occ = 1/n_chains.  HOH-only chains are copied
     verbatim from st_for_hoh.  Flood waters are written as chain W.
+    flood_occ and flood_biso may each be a scalar or a 1-D array (one per water).
+    flood_occ may be negative.
     """
     n = len(chain_names)
     occ_each = 1.0 / n
@@ -841,11 +844,16 @@ def write_full_conf_pdb(conf_data, chain_names, st_for_hoh,
                 )
                 serial += 1
 
+    import numpy as _np
+    _occ_arr  = (flood_occ  if hasattr(flood_occ,  '__len__')
+                 else _np.full(len(flood_pos), flood_occ))
+    _biso_arr = (flood_biso if hasattr(flood_biso, '__len__')
+                 else _np.full(len(flood_pos), flood_biso))
     for i, (x, y, z) in enumerate(flood_pos):
         lines.append(
             f'HETATM{serial:5d}  O   HOH W{i+1:4d}    '
             f'{x:8.3f}{y:8.3f}{z:8.3f}'
-            f'{flood_occ:6.2f}{20.0:6.2f}'
+            f'{_occ_arr[i]:6.2f}{_biso_arr[i]:6.2f}'
             f'           O\n'
         )
         serial += 1

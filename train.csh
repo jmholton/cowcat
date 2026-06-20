@@ -25,6 +25,7 @@ set train_resume     = ""
 set crossp_unitratio = 0
 set mobius           = 0
 set softsign         = 0
+set bn               = 0
 
 # read the command line to update variables and other settings
 foreach Arg ( $* )
@@ -71,6 +72,7 @@ if ("$lr_min" != "")             set extra = "$extra --lr-min $lr_min"
 if ("$crossp_unitratio" == "1") set extra = "$extra --crossp-unitratio"
 if ("$mobius" == "1")           set extra = "$extra --mobius"
 if ("$softsign" == "1")         set extra = "$extra --softsign"
+if ("$bn" == "1")               set extra = "$extra --bn"
 
 sbatch --partition=gpu --gres=gpu:$nGPUs --ntasks=1 --cpus-per-task=8 \
     --job-name=train_$name \

@@ -116,6 +116,8 @@ def main():
                         help='Fraction of data held out for validation')
     parser.add_argument('--base-features', type=int, default=32,
                         help='U-Net base channel count (default: 32)')
+    parser.add_argument('--bn',          action='store_true',
+                        help='Enable BatchNorm in conv blocks (default: off)')
     parser.add_argument('--alpha',       type=float, default=0.5,
                         help='Peak-weight coefficient in loss: '
                              'mean((1+alpha*|y|)*(pred-y)^2) (default: 0.5)')
@@ -217,7 +219,7 @@ def main():
     # ── Model ─────────────────────────────────────────────────────────────────
     in_channels = 4
     model = UNet3D(in_channels=in_channels, out_channels=1,
-                   base_features=args.base_features).to(device)
+                   base_features=args.base_features, use_bn=args.bn).to(device)
     raw_model = model
     if is_ddp:
         # scale_head (params 30-31) has no gradient under MSE loss — pred_log_scale
