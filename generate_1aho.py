@@ -724,6 +724,7 @@ def generate_sample(
         shutil.copy2(truth_pdb,     sample_dir / 'truth_full.pdb')
         shutil.copy2(starthere_pdb, sample_dir / 'partial.pdb')
         shutil.copy2(tmpdir / 'refmac.log', sample_dir / 'refmac.log')
+        shutil.copy2(fobs_mtz,      sample_dir / 'refme.mtz')
         if out_mtz:
             shutil.copy2(out_mtz, sample_dir / 'refmacout.mtz')
         out_pdb = tmpdir / 'refmacout.pdb'
