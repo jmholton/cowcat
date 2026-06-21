@@ -751,7 +751,7 @@ def generate_sample(
             flood_occ_lo=float(_occ_lo),
             flood_occ_hi=float(_occ_hi),
             flood_peak_sigma=float(flood_peak_sigma) if random_flood else None,
-            flood_occ_max_clip=float(_clip) if random_flood else None,
+            flood_occ_max_clip=(float(_clip) if _clip is not None else None) if random_flood else None,
             flood_sigma_fofc=float(_real_fofc_sigma()) if random_flood else None,
             flood_min_dist=flood_min_dist,
             flood_b_lo=float(flood_b_lo),
