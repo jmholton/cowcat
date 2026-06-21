@@ -103,17 +103,15 @@ def _reference_wilson_b(obs_mtz_path=None):
 
 DEFAULT_K_CONFORMERS = 32
 
-# Flood water calibration: occ_rms * sqrt(n_flood) = FLOOD_LINE_K gives Rfree ~11%
-# Grid fit: Rfree = 0.0129 * occ*sqrt(nf) + 0.0417  (R²=0.989)
-# For constant positive occ: occ_rms = occ, so occ * sqrt(n_flood) = 3.50
-# For Uniform[-occ_max, +occ_max]: occ_rms = occ_max/sqrt(3), so
-#   occ_max * sqrt(n_flood) = FLOOD_LINE_K * sqrt(3) = FLOOD_LINE_K_SYM
-# *** NEEDS RECALIBRATION: the grid fit above assumed B=20 Å² for all flood waters.
-# With variable B (log-uniform [b_lo, b_hi]), the actual SF contribution changes.
-# Low-B waters scatter more at high resolution; high-B waters contribute mainly at
-# low resolution. Run measure_flood_riso.py on a test batch to re-derive FLOOD_LINE_K. ***
-FLOOD_LINE_K     = 3.50              # occ_rms * sqrt(n_flood) → Rfree ~11% (B=20 assumed)
-FLOOD_LINE_K_SYM = 3.50 * 3**0.5   # = 6.06: occ_max for Uniform[-occ_max,+occ_max]
+# Flood water calibration for --vary-flood (occ_max = FLOOD_LINE_K_SYM/sqrt(N), B log-uniform):
+#   Vary_flood flood line (derived analytically, verified against ft17):
+#     Rfree = 0.02367 * FLOOD_LINE_K + 0.0374   (B∈[5,80], shift_scale=0)
+#   Derivation: C_rf from random_flood ft7-11 (Rfree=0.00533*k+0.0374, k=occ_rms*sqrt(N));
+#   vary_flood sigma_ΔF = Z/sqrt(3) * sqrt(E_B[ano_ff(B)^2]) * FLOOD_LINE_K = 6.38 * K.
+#   occ_rms = 0.204 analytically from ano_ff (B∈[5,80], peak_sigma=5, Z=8).
+# For Uniform[-occ_max,+occ_max]: occ_max * sqrt(N) = FLOOD_LINE_K * sqrt(3) = FLOOD_LINE_K_SYM
+FLOOD_LINE_K     = 3.07             # → Rfree ~11% (B∈[5,80], shift_scale=0)
+FLOOD_LINE_K_SYM = 3.07 * 3**0.5  # = 5.31
 FLOOD_NF_MIN    = 700    # log-uniform sampling range for --vary-flood
 FLOOD_NF_MAX    = 4000
 DEFAULT_N_FLOOD   = 1764   # used only when neither --vary-flood nor --random-flood is set

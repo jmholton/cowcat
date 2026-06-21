@@ -95,9 +95,10 @@ if ( "$random_flood" == "1" ) then
     if ( "$flood_occ_max" != "" ) set flood_args = "$flood_args --flood-occ-max $flood_occ_max"
     set flood_args = "$flood_args --flood-b-range $flood_b_lo $flood_b_hi"
 else if ( "$vary_flood" == "1" ) then
-    # N random, occ scaled to target ~11% Rfree (B=20 calibration — needs recalibration)
+    # N random, occ scaled to target ~11% Rfree (calibrated ft7-11, shift_scale=0, B[5,80])
     set flood_args = "--vary-flood --flood-nf-range $flood_nf_min $flood_nf_max"
     set flood_args = "$flood_args --flood-b-range $flood_b_lo $flood_b_hi"
+    set flood_args = "$flood_args --flood-min-dist $flood_min_dist"
 endif
 
 # ── build account/qos args ────────────────────────────────────────────────────
@@ -132,5 +133,34 @@ ccp4-python generate_1aho.py --submit \
     --partition $partition \
     --max-array $max_array \
     $cluster_args
+
+exit
+
+ generate_1aho.csh \
+      outdir=data/data_1aho_floodtest17 \
+      nsamples=50 \
+      shift_scale=0.0 \
+      swaps_per_res=50 \
+      vary_flood=1 \
+      flood_b_lo=5 \
+      flood_b_hi=80 \
+      flood_nf_min=700 \
+      flood_nf_max=4000 \
+      flood_min_dist=0.5
+
+
+
+ generate_1aho.csh \
+      outdir=data/data_1aho_f0 \
+      nsamples=1000 \
+      shift_scale=0.0 \
+      swaps_per_res=50 \
+      vary_flood=1 \
+      flood_b_lo=5 \
+      flood_b_hi=80 \
+      flood_nf_min=700 \
+      flood_nf_max=4000 \
+      flood_min_dist=0.5
+
 
 
