@@ -52,8 +52,9 @@ set flood_nf_max     = 4000
 set flood_peak_sigma = 3.0
 set flood_occ_max    = ""   # "" = no clip; set to e.g. 0.5 to limit high-B occ
 set flood_min_dist = 0.0
-set vary_flood    = 0
-set random_flood  = 0
+set vary_flood         = 0
+set random_flood       = 0
+set flood_rfree_target = ""   # "" = use hardcoded FLOOD_LINE_K; set e.g. 0.11 to compute K analytically
 set ncyc          = 10
 set k_conformers  = 32
 set seed          = 0
@@ -95,10 +96,11 @@ if ( "$random_flood" == "1" ) then
     if ( "$flood_occ_max" != "" ) set flood_args = "$flood_args --flood-occ-max $flood_occ_max"
     set flood_args = "$flood_args --flood-b-range $flood_b_lo $flood_b_hi"
 else if ( "$vary_flood" == "1" ) then
-    # N random, occ scaled to target ~11% Rfree (calibrated ft7-11, shift_scale=0, B[5,80])
+    # N random, occ scaled to target Rfree (calibrated ft7-11, shift_scale=0, B[5,80])
     set flood_args = "--vary-flood --flood-nf-range $flood_nf_min $flood_nf_max"
     set flood_args = "$flood_args --flood-b-range $flood_b_lo $flood_b_hi"
     set flood_args = "$flood_args --flood-min-dist $flood_min_dist"
+    if ( "$flood_rfree_target" != "" ) set flood_args = "$flood_args --flood-rfree-target $flood_rfree_target"
 endif
 
 # ── build account/qos args ────────────────────────────────────────────────────

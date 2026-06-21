@@ -105,13 +105,27 @@ DEFAULT_K_CONFORMERS = 32
 
 # Flood water calibration for --vary-flood (occ_max = FLOOD_LINE_K_SYM/sqrt(N), B log-uniform):
 #   Vary_flood flood line (derived analytically, verified against ft17):
-#     Rfree = 0.02367 * FLOOD_LINE_K + 0.0374   (B∈[5,80], shift_scale=0)
-#   Derivation: C_rf from random_flood ft7-11 (Rfree=0.00533*k+0.0374, k=occ_rms*sqrt(N));
-#   vary_flood sigma_ΔF = Z/sqrt(3) * sqrt(E_B[ano_ff(B)^2]) * FLOOD_LINE_K = 6.38 * K.
-#   occ_rms = 0.204 analytically from ano_ff (B∈[5,80], peak_sigma=5, Z=8).
+#     Rfree = _VARY_FLOOD_SLOPE(b_lo,b_hi) * FLOOD_LINE_K + floor
+#     slope = _C_RF * Z * sqrt(E_B[ano_ff(B)^2] / 3)
+#     E_B[ano_ff^2] = (4pi)^3 * (b_lo^-3 - b_hi^-3) / (3*ln(b_hi/b_lo))
+#   _C_RF = 0.003710 from random_flood ft7-11; floor = 0.0374 (shift_scale=0 intercept).
+#   Use --flood-rfree-target to set the target Rfree; FLOOD_LINE_K is computed at runtime.
 # For Uniform[-occ_max,+occ_max]: occ_max * sqrt(N) = FLOOD_LINE_K * sqrt(3) = FLOOD_LINE_K_SYM
-FLOOD_LINE_K     = 3.07             # → Rfree ~11% (B∈[5,80], shift_scale=0)
-FLOOD_LINE_K_SYM = 3.07 * 3**0.5  # = 5.31
+_C_RF        = 0.003710  # Rfree per unit sigma_ΔF; from random_flood ft7-11 calibration
+FLOOD_FLOOR  = 0.0374    # Rfree floor (shift_scale=0, k_conformers=32)
+FLOOD_LINE_K     = 3.07             # → Rfree ~11% (B∈[5,80], shift_scale=0, k=32)
+FLOOD_LINE_K_SYM = 3.07 * 3**0.5  # = 5.31; overridden at runtime by --flood-rfree-target
+
+
+def _vary_flood_k(b_lo, b_hi, rfree_target, floor=None):
+    """Compute FLOOD_LINE_K for vary_flood to hit rfree_target.
+    Rfree = slope * K + floor  where slope = _C_RF * Z * sqrt(E_B[ano_ff^2]/3)."""
+    if floor is None:
+        floor = FLOOD_FLOOR
+    E_inv_B3  = (b_lo**-3 - b_hi**-3) / (3.0 * np.log(b_hi / b_lo))
+    E_ano_ff2 = (4.0 * np.pi)**3 * E_inv_B3
+    slope     = _C_RF * 8.0 * np.sqrt(E_ano_ff2 / 3.0)
+    return (rfree_target - floor) / slope
 FLOOD_NF_MIN    = 700    # log-uniform sampling range for --vary-flood
 FLOOD_NF_MAX    = 4000
 DEFAULT_N_FLOOD   = 1764   # used only when neither --vary-flood nor --random-flood is set
@@ -581,6 +595,8 @@ def generate_sample(
     flood_min_dist=0.0,
     vary_flood=False,
     random_flood=False,
+    flood_rfree_target=None,
+    flood_floor=FLOOD_FLOOR,
     ncyc=DEFAULT_NCYC,
     swaps_per_residue=0.0,
     seed=None,
@@ -650,11 +666,14 @@ def generate_sample(
             _clip   = flood_occ_max_clip   # None = no clip (default)
         elif vary_flood:
             # Controlled Rfree ~11%: N random, occ scaled to compensate.
-            # NOTE: calibration (FLOOD_LINE_K) was for B=20 Å²; needs recalibration
-            # with variable B. Use measure_flood_riso.py to re-derive.
             log_nf  = rng_flood.uniform(np.log(FLOOD_NF_MIN), np.log(FLOOD_NF_MAX))
             n_flood = int(np.round(np.exp(log_nf)))
-            mid = FLOOD_LINE_K_SYM / np.sqrt(n_flood)
+            if flood_rfree_target is not None:
+                k_sym = _vary_flood_k(flood_b_lo, flood_b_hi,
+                                      flood_rfree_target, flood_floor) * 3**0.5
+            else:
+                k_sym = FLOOD_LINE_K_SYM
+            mid = k_sym / np.sqrt(n_flood)
             _occ_lo = -mid
             _occ_hi =  mid
 
@@ -799,6 +818,7 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
                        vary_flood, random_flood, ncyc, swaps_per_residue,
                        max_array, seed, partition,
                        k_conformers=DEFAULT_K_CONFORMERS,
+                       flood_rfree_target=None, flood_floor=FLOOD_FLOOR,
                        account=None, qos=None, time=None):
     script = SCRIPT_DIR / f'_slurm_{outdir.name}.sh'
     me     = Path(__file__).resolve()
@@ -814,6 +834,10 @@ def submit_slurm_array(nsamples, outdir, pdb, mtz, obs_mtz, shift_scale, n_flood
         flood_args = ['  --vary-flood \\']
         if flood_nf_range:
             flood_args += [f'  --flood-nf-range {flood_nf_range[0]} {flood_nf_range[1]} \\']
+        if flood_rfree_target is not None:
+            flood_args += [f'  --flood-rfree-target {flood_rfree_target} \\']
+            if flood_floor != FLOOD_FLOOR:
+                flood_args += [f'  --flood-floor {flood_floor} \\']
     elif flood_occ_lo is not None or flood_occ_hi is not None:
         lo = flood_occ_lo if flood_occ_lo is not None else flood_occ
         hi = flood_occ_hi if flood_occ_hi is not None else flood_occ
@@ -903,9 +927,16 @@ def main():
                     help='Min distance from existing atoms when placing flood waters.'
                          ' 0 = everywhere (default). Old default was 2.0 Å.')
     ap.add_argument('--vary-flood',  action='store_true',
-                    help='N log-uniform [nf-min,nf-max]; occ scaled to hit ~11%% Rfree.'
-                         ' NOTE: calibration assumes B=20 Å²; needs recalibration with'
-                         ' variable B. Use --random-flood for uncorrelated sampling.')
+                    help='N log-uniform [nf-min,nf-max]; occ scaled to hit target Rfree.'
+                         ' Use --flood-rfree-target to set the target (default 0.11).'
+                         ' FLOOD_LINE_K is computed analytically from --flood-b-range.')
+    ap.add_argument('--flood-rfree-target', type=float, default=None, metavar='RFREE',
+                    help='For --vary-flood: target Rfree (default: use hardcoded FLOOD_LINE_K=3.07).'
+                         ' FLOOD_LINE_K is derived analytically: K=(target-floor)/slope,'
+                         ' slope=_C_RF*Z*sqrt(E_B[ano_ff^2]/3) from --flood-b-range.')
+    ap.add_argument('--flood-floor', type=float, default=FLOOD_FLOOR, metavar='RFREE',
+                    help=f'For --vary-flood with --flood-rfree-target: Rfree floor'
+                         f' (default {FLOOD_FLOOR}, calibrated shift_scale=0, k=32).')
     ap.add_argument('--random-flood', action='store_true',
                     help='N log-uniform [nf-min,nf-max]; B log-uniform [b-lo,b-hi];'
                          ' occ solved per-water to hit target peak amplitude'
@@ -968,6 +999,7 @@ def main():
             args.vary_flood, args.random_flood, args.ncyc, args.swaps_per_residue,
             args.max_array, args.seed, args.partition,
             k_conformers=args.k_conformers,
+            flood_rfree_target=args.flood_rfree_target, flood_floor=args.flood_floor,
             account=args.account, qos=args.qos, time=args.time,
         )
         return
@@ -982,6 +1014,7 @@ def main():
         flood_occ_max_clip=flood_occ_max_clip,
         flood_min_dist=args.flood_min_dist,
         vary_flood=args.vary_flood, random_flood=args.random_flood,
+        flood_rfree_target=args.flood_rfree_target, flood_floor=args.flood_floor,
         ncyc=args.ncyc, swaps_per_residue=args.swaps_per_residue,
         seed=args.seed, debug=args.debug,
     )
