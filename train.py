@@ -128,6 +128,9 @@ def main():
     parser.add_argument('--pretrain',    default=None,
                         help='Path to checkpoint to load model weights only '
                              '(optimizer/scheduler reset — for curriculum transfer)')
+    parser.add_argument('--pretrain-strict', action='store_true', default=False,
+                        help='Use strict=True when loading --pretrain checkpoint '
+                             '(default: strict=False, silently drops mismatched keys)')
     parser.add_argument('--accum-steps', type=int, default=1,
                         help='Gradient accumulation steps (default: 1). Effective '
                              'batch size = batch-size * accum-steps.')
@@ -262,8 +265,12 @@ def main():
     elif args.pretrain and os.path.exists(args.pretrain):
         ckpt = torch.load(args.pretrain, map_location=device)
         sd   = ckpt['model']
-        raw_model.load_state_dict(sd)
+        strict = getattr(args, 'pretrain_strict', False)
+        incompatible = raw_model.load_state_dict(sd, strict=strict)
         if is_rank0:
+            if not strict and (incompatible.missing_keys or incompatible.unexpected_keys):
+                print(f'  missing keys (random init): {len(incompatible.missing_keys)}  '
+                      f'unexpected keys (ignored): {len(incompatible.unexpected_keys)}')
             print(f'Loaded pretrained weights (best_val={ckpt.get("best_val", float("inf")):.5f}), '
                   f'optimizer reset')
 
