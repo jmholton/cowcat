@@ -749,7 +749,7 @@ def select_chains_maximin(chain_names, conf_data, k):
 
 def _write_chain_pdb(chain_name, occ, conf_data, ref_chain_data,
                      cell, spacegroup_hm, outpath):
-    """Write one conformer chain as a PDB with chain_id = altloc = chain_name."""
+    """Write one conformer chain as a PDB with chain_id='A' and altloc=chain_name."""
     lines = [f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
              f"{cell.alpha:7.2f}{cell.beta:7.2f}{cell.gamma:7.2f}"
              f" {spacegroup_hm:<11s}1\n"]
@@ -770,7 +770,7 @@ def _write_chain_pdb(chain_name, occ, conf_data, ref_chain_data,
             name4 = f' {aname:<3s}' if len(elem) == 1 and len(aname) < 4 else f'{aname:<4s}'
             lines.append(
                 f'{rec}{serial:5d} {name4}{chain_name}'
-                f'{resname:<3s} {chain_name:1s}'
+                f'{resname:<3s} A'
                 f'{seqnum:4d}{icode:1s}   '
                 f'{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}'
                 f'{occ:6.2f}{atom.b_iso:6.2f}'
@@ -1692,6 +1692,10 @@ def generate_occ_groups(pdb_path):
         return ('\n'.join(lines) + '\n').encode()
 
     # Single-chain altloc format: group MC and SC altlocs per residue.
+    # If mc_alts == sc_alts (whole-conformer alternates, as in the 1AHO pipeline),
+    # use one group per altloc covering all atoms so MC and SC share the same occ.
+    # If they differ (generate_protein style with independent MC/SC disorder),
+    # emit two separate complete groups.
     for chain in st[0]:
         for res in chain:
             resnum = res.seqid.num
@@ -1702,17 +1706,32 @@ def generate_occ_groups(pdb_path):
                 if atom.altloc != '\x00':
                     target = mc_alts if atom.name in MAINCHAIN_ATOMS else sc_alts
                     target.add(atom.altloc)
-            for alt_set in (sorted(mc_alts), sorted(sc_alts)):
-                if len(alt_set) < 2:
-                    continue
+            all_alts = mc_alts | sc_alts
+            if len(all_alts) < 2:
+                continue
+            if mc_alts == sc_alts:
+                # Whole-conformer alternates: one group per altloc, all atoms together.
                 group_ids = []
-                for alt in alt_set:
+                for alt in sorted(all_alts):
                     lines.append(f'occupancy group id {gid} chain {chain.name}'
                                  f' residue {res_id} alt {alt}')
                     group_ids.append(gid)
                     gid += 1
                 lines.append('occupancy group alts complete ' +
                               ' '.join(map(str, group_ids)))
+            else:
+                # Independent MC/SC disorder: emit separate complete groups.
+                for alt_set in (sorted(mc_alts), sorted(sc_alts)):
+                    if len(alt_set) < 2:
+                        continue
+                    group_ids = []
+                    for alt in alt_set:
+                        lines.append(f'occupancy group id {gid} chain {chain.name}'
+                                     f' residue {res_id} alt {alt}')
+                        group_ids.append(gid)
+                        gid += 1
+                    lines.append('occupancy group alts complete ' +
+                                 ' '.join(map(str, group_ids)))
     return ('\n'.join(lines) + '\n').encode()
 
 
