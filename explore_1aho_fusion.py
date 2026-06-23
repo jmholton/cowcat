@@ -748,8 +748,15 @@ def select_chains_maximin(chain_names, conf_data, k):
 
 
 def _write_chain_pdb(chain_name, occ, conf_data, ref_chain_data,
-                     cell, spacegroup_hm, outpath):
-    """Write one conformer chain as a PDB with chain_id='A' and altloc=chain_name."""
+                     cell, spacegroup_hm, outpath, altloc=None):
+    """Write one conformer chain as a PDB with chain_id='A' and altloc=altloc.
+
+    altloc defaults to chain_name if not given.  Always pass an uppercase letter
+    to avoid gemmi case-folding collisions (gemmi normalises lowercase altlocs to
+    uppercase on read/write, so 'e' and 'E' would merge into the same group).
+    """
+    if altloc is None:
+        altloc = chain_name
     lines = [f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
              f"{cell.alpha:7.2f}{cell.beta:7.2f}{cell.gamma:7.2f}"
              f" {spacegroup_hm:<11s}1\n"]
@@ -769,7 +776,7 @@ def _write_chain_pdb(chain_name, occ, conf_data, ref_chain_data,
             elem = atom.element.name.upper()
             name4 = f' {aname:<3s}' if len(elem) == 1 and len(aname) < 4 else f'{aname:<4s}'
             lines.append(
-                f'{rec}{serial:5d} {name4}{chain_name}'
+                f'{rec}{serial:5d} {name4}{altloc}'
                 f'{resname:<3s} A'
                 f'{seqnum:4d}{icode:1s}   '
                 f'{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}'
@@ -869,12 +876,17 @@ def build_starthere_pdb(chain_names, conf_data, st_orig, k, ref_pdb, out_pdb, wo
     """
     selected, occs = select_chains_maximin(chain_names, conf_data, k)
     ref_chain_data = conf_data[chain_names[0]]
+    # Use sequential uppercase letters as altloc identifiers to avoid gemmi
+    # case-folding collisions: gemmi normalises lowercase altlocs to uppercase
+    # on read/write, so selecting both 'E' and 'e' would merge them.
+    _UPPERCASE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
     all_lines = []
     cryst_written = False
-    for cn, occ in zip(selected, occs):
-        p = Path(workdir) / f'_chain_{cn}.pdb'
+    for i, (cn, occ) in enumerate(zip(selected, occs)):
+        altloc = _UPPERCASE[i % len(_UPPERCASE)]
+        p = Path(workdir) / f'_chain_{altloc}.pdb'
         _write_chain_pdb(cn, occ, conf_data, ref_chain_data,
-                         st_orig.cell, st_orig.spacegroup_hm, p)
+                         st_orig.cell, st_orig.spacegroup_hm, p, altloc=altloc)
         for line in p.read_text().splitlines(keepends=True):
             if line.startswith('CRYST1'):
                 if not cryst_written:
