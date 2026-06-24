@@ -567,8 +567,15 @@ def run_refmac_sample(starthere_pdb, fobs_mtz, ncyc, tmpdir, suffix=''):
 # Map writing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def mtz_to_ccp4(mtz_path, f_col, phi_col, out_path):
+def mtz_to_ccp4(mtz_path, f_col, phi_col, out_path, zero_free_col=None):
     mtz  = gemmi.read_mtz_file(str(mtz_path))
+    if zero_free_col is not None:
+        labels = mtz.column_labels()
+        if zero_free_col in labels and f_col in labels:
+            arr = np.array(mtz)
+            arr[arr[:, labels.index(zero_free_col)].astype(np.int32) == 0,
+                labels.index(f_col)] = 0.0
+            mtz.set_data(arr)
     grid = mtz.transform_f_phi_to_map(f_col, phi_col, sample_rate=SAMPLE_RATE)
     ccp4 = gemmi.Ccp4Map()
     ccp4.grid = grid
@@ -734,7 +741,7 @@ def generate_sample(
         sample_dir.mkdir(parents=True, exist_ok=True)
         mtz_to_ccp4(truth_mtz,  'FC',     'PHIC',     sample_dir / 'truth.map')
         if out_mtz:
-            mtz_to_ccp4(out_mtz, 'FWT',    'PHWT',     sample_dir / '2fofc.map')
+            mtz_to_ccp4(out_mtz, 'FWT',    'PHWT',     sample_dir / '2fofc.map', zero_free_col='FreeR_flag')
             mtz_to_ccp4(out_mtz, 'DELFWT', 'PHDELWT',  sample_dir / 'fofc.map')
             mtz_to_ccp4(out_mtz, 'FC',     'PHIC',     sample_dir / 'fc.map')
         t = _t('maps', t)
