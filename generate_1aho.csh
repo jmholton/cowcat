@@ -152,17 +152,18 @@ exit
 
 
 
- generate_1aho.csh \
+ ./generate_1aho.csh \
       outdir=data/data_1aho_f0 \
       nsamples=1000 \
       shift_scale=0.0 \
       swaps_per_res=50 \
-      vary_flood=1 \
+      k_conformers=8 \
+      vary_flood=1 flood_rfree_target=0.08 \
       flood_b_lo=5 \
       flood_b_hi=80 \
       flood_nf_min=700 \
       flood_nf_max=4000 \
-      flood_min_dist=0.5
+      flood_min_dist=1.0
 
 
 
